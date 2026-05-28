@@ -1,0 +1,11 @@
+# Rust
+/target
+**/target
+Cargo.lock.orig
+
+# private per-user agent overrides
+*.local.md
+
+# editor / OS
+.DS_Store
+*.swp
