@@ -7,13 +7,20 @@
 mod ipmi;
 
 use crate::ipmi::Ipmi;
-use protocol::{Applied, Curve, CurveCache, Found, FoundEntry, Inputs, Reading, Request, Response};
+use protocol::{
+    Applied, Curve, CurveCache, Damper, Detected, Event, FoundEntry, Inputs, Reading, Request,
+    StdinReader,
+};
 use serde_json::json;
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::Write;
+use std::time::Duration;
 use tracing::{error, info};
 
 const CURVE_PATH_DEFAULT: &str = "/opt/aiolos/etc/asrock16-2t.curve.json";
+
+/// Poll step for the signal-aware stdin reader: a termination signal is noticed within ~this long.
+const STEP: Duration = Duration::from_millis(200);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -25,11 +32,18 @@ fn main() {
         .with_target(false)
         .init();
 
+    // Every long-running mode restores the board to BMC auto on SIGTERM/SIGINT (self-sufficient
+    // shutdown — never depends on the parent killing us). The handler only sets a flag; the run
+    // loop performs the release in normal code.
+    protocol::install_shutdown_handlers();
+
     let mode = std::env::args().nth(1).unwrap_or_else(|| "detect".into());
     match mode.as_str() {
         "detect" => detect_loop(),
         "run" => run_loop(&std::env::args().nth(2).expect("run requires <ID>")),
         "query" => query_mode(),
+        // Uniform one-shot fail-safe (same verb across all anemoi, called by `aiolos restore`).
+        "restore" => restore_mode(),
         other => {
             eprintln!("unknown mode: {other}");
             std::process::exit(1);
@@ -60,35 +74,52 @@ fn query_mode() {
     }
 }
 
+/// One-shot fail-safe: hand the board fans back to BMC auto and exit. Invoked by `aiolos restore`
+/// (which systemd's ExecStopPost calls) so the fans are never stranded in manual if aiolos died
+/// without a graceful shutdown (hard crash / SIGKILL). Idempotent — safe to run when already auto.
+fn restore_mode() {
+    match Ipmi::open() {
+        Ok(mut ipmi) => match ipmi.release_auto() {
+            Ok(()) => info!("fans released to BMC auto"),
+            Err(e) => {
+                eprintln!("release FAILED: {e}");
+                std::process::exit(2);
+            }
+        },
+        Err(e) => {
+            eprintln!("open /dev/ipmi0 FAILED: {e}");
+            std::process::exit(3);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // detect
 // ---------------------------------------------------------------------------
 
 fn detect_loop() {
-    let stdin = std::io::stdin();
-    let mut lock = stdin.lock();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match lock.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                error!(error=%e, "stdin read error");
-                break;
-            }
+    // detect holds no device, so a signal/EOF just exits cleanly (nothing to restore).
+    let mut stdin = match StdinReader::new() {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error=%e, "stdin setup failed");
+            return;
         }
+    };
+    // A signal/EOF ends `next_event` with a non-`Line` event -> the while-let exits the loop.
+    while let Event::Line(line) = stdin.next_event(STEP) {
         match Request::from_line(line.trim()) {
-            Ok(Request::Detect) => emit(Response::Found(Found {
-                found: vec![FoundEntry {
+            Ok(Request::Detect) => emit_line(
+                Detected::ok(vec![FoundEntry {
                     id: "asrock16-2t".into(),
                     kind: "board".into(),
                     name: "ROME2D16-2T".into(),
                     extra: Default::default(),
-                }],
-            })),
+                }])
+                .to_line(),
+            ),
             Ok(Request::Shutdown) => {
-                emit(Response::Applied(Applied::ok_empty()));
+                emit_line(Applied::ok_empty().to_line());
                 break;
             }
             Ok(Request::Apply { .. }) => eprintln!("unexpected apply in detect mode"),
@@ -108,6 +139,7 @@ fn run_loop(_id: &str) {
     }
 
     let mut restore = FanRestore::new();
+    let mut damper = Damper::default();
     let mut ipmi = match Ipmi::open() {
         Ok(i) => Some(i),
         Err(e) => {
@@ -116,123 +148,130 @@ fn run_loop(_id: &str) {
         }
     };
 
-    let stdin = std::io::stdin();
-    let mut lock = stdin.lock();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match lock.read_line(&mut line) {
-            Ok(0) => {
-                restore.restore();
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                error!(error=%e, "stdin read error");
-                restore.restore();
-                break;
-            }
+    let mut stdin = match StdinReader::new() {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error=%e, "stdin setup failed — restoring + exiting");
+            restore.restore();
+            return;
         }
+    };
+    loop {
+        let line = match stdin.next_event(STEP) {
+            Event::Line(l) => l,
+            // SIGTERM/SIGINT or parent gone (EOF): release to BMC auto, then exit. Self-sufficient.
+            Event::Shutdown => {
+                info!("termination signal — releasing to BMC auto and exiting");
+                restore.restore();
+                break;
+            }
+            Event::Eof => {
+                restore.restore();
+                break;
+            }
+        };
         match Request::from_line(line.trim()) {
             Ok(Request::Apply { inputs }) => {
-                // Re-read the curve every tick (live tuning; last-good on partial writes).
+                // Re-read the curve + sensitivity every tick (live tuning; last-good on partial writes).
                 if curves.reload() {
-                    info!(path=%curves.path(), "curve reloaded");
+                    info!(path=%curves.path(), alpha = curves.alpha(), "config reloaded");
                 }
-                emit(Response::Applied(apply_tick(
-                    &mut ipmi,
-                    inputs.as_ref(),
-                    curves.curve(),
-                )));
+                damper.set_alpha(curves.alpha()); // live sensitivity knob
+                emit_line(
+                    apply_tick(&mut ipmi, inputs.as_ref(), curves.curve(), &mut damper).to_line(),
+                );
             }
             Ok(Request::Shutdown) => {
                 restore.restore();
-                emit(Response::Applied(Applied::ok_empty()));
+                emit_line(Applied::ok_empty().to_line());
                 break;
             }
             Ok(Request::Detect) => eprintln!("unexpected detect in run mode"),
             Err(e) => {
                 eprintln!("malformed request: {e}");
-                emit(Response::Applied(Applied::error(format!("malformed: {e}"))));
+                emit_line(Applied::error(format!("malformed: {e}")).to_line());
             }
         }
     }
 }
 
-fn apply_tick(ipmi: &mut Option<Ipmi>, inputs: Option<&Inputs>, curve: &Curve) -> Applied {
+fn apply_tick(
+    ipmi: &mut Option<Ipmi>,
+    inputs: Option<&Inputs>,
+    curve: &Curve,
+    damper: &mut Damper,
+) -> Applied {
     let gpu_temps = input_temps(inputs);
     let cpu_temps = read_cpu_temps();
     let gpu_max = gpu_temps.iter().copied().max();
     let cpu_max = cpu_temps.iter().map(|(_, t)| *t).max();
-    let driving = [gpu_max, cpu_max].into_iter().flatten().max();
+    let raw_driving = [gpu_max, cpu_max].into_iter().flatten().max();
 
     let Some(ipmi) = ipmi.as_mut() else {
-        return Applied::error("ipmi device unavailable");
+        // Can't open /dev/ipmi0 at all → declare fatal; supervisor retries on a long backoff.
+        return Applied::fatal("/dev/ipmi0 unavailable");
     };
 
-    match decide(driving, curve) {
-        FanAction::ReleaseAuto => {
-            // Cannot determine a temperature (or no curve): relinquish to BMC auto (decision 9).
-            info!(gpu_max = ?gpu_max, cpu_max = ?cpu_max, "decision: temperature indeterminable -> release to BMC auto");
-            match ipmi.release_auto() {
-                Ok(()) => Applied::error("temperature indeterminable — released to BMC auto"),
-                Err(e) => Applied::error(format!("temp indeterminable; release failed: {e}")),
-            }
-        }
-        FanAction::SetDuty(pct) => {
-            if let Err(e) = ipmi.set_all_fans(pct) {
-                return Applied::error(format!("set fans: {e}"));
-            }
-            let duty = ipmi.query_duty().unwrap_or_default();
-            info!(
-                gpu_max = ?gpu_max,
-                cpu_max = ?cpu_max,
-                driving = driving.unwrap_or(-1),
-                commanded_pct = pct,
-                readback = ?&duty[..8.min(duty.len())],
-                "decision: set all board fans",
-            );
-
-            let mut readings = Vec::new();
-            if let Some(g) = gpu_max {
-                readings.push(Reading::new("temp", "GPU", json!({ "temp": g })));
-            }
-            for (label, t) in &cpu_temps {
-                readings.push(Reading::new("temp", label.clone(), json!({ "temp": t })));
-            }
-            readings.push(Reading::new(
-                "driving",
-                "driving",
-                json!({ "temp": driving.unwrap_or(0), "pct": pct }),
-            ));
-            for i in 0..8 {
-                // Report the 0xda read-back duty when available (verifies the set took); else the
-                // commanded value.
-                let pwm = duty.get(i).map(|b| *b as i64).unwrap_or(pct as i64);
-                readings.push(Reading::new(
-                    "fan",
-                    format!("FAN{}", i + 1),
-                    json!({ "pwm": pwm }),
-                ));
-            }
-            Applied::ok(readings)
-        }
+    // Without a valid temperature or a usable curve we cannot control safely: release to BMC auto
+    // rather than hold manual control while blind (decision 9). Reset the damper so control
+    // re-seeds cleanly when temperature returns.
+    if !should_control(raw_driving, curve) {
+        damper.reset();
+        info!(gpu_max = ?gpu_max, cpu_max = ?cpu_max, curve_empty = curve.is_empty(),
+              "decision: cannot control (no temp or empty curve) -> release to BMC auto");
+        return match ipmi.release_auto() {
+            Ok(()) => Applied::error("indeterminable temp/curve — released to BMC auto"),
+            Err(e) => Applied::error(format!("release failed: {e}")),
+        };
     }
+    let raw = raw_driving.expect("should_control guarantees Some");
+
+    // EMA-smooth the driving temp, evaluate the curve, then deadband the duty so sensor jitter
+    // (noisy CPU Tctl, bursty GPU temp) doesn't make the fans hunt.
+    let smoothed = damper.smooth(raw);
+    let target = curve.eval(smoothed).clamp(0, 100);
+    let pct = damper.deadband(target);
+
+    if let Err(e) = ipmi.set_all_fans(pct) {
+        return Applied::error(format!("set fans: {e}"));
+    }
+
+    info!(
+        gpu_max = ?gpu_max,
+        cpu_max = ?cpu_max,
+        raw_driving = raw,
+        smoothed_driving = smoothed,
+        commanded_pct = pct,
+        "decision: set all board fans",
+    );
+
+    let mut readings = Vec::new();
+    if let Some(g) = gpu_max {
+        readings.push(Reading::new("temp", "GPU", json!({ "temp": g })));
+    }
+    for (label, t) in &cpu_temps {
+        readings.push(Reading::new("temp", label.clone(), json!({ "temp": t })));
+    }
+    readings.push(Reading::new(
+        "driving",
+        "driving",
+        json!({ "temp": smoothed, "raw": raw, "pct": pct }),
+    ));
+    for i in 0..8 {
+        // Report the commanded duty (authoritative). The immediate 0xda readback is one BMC cycle
+        // stale, so it is no longer used here (see SOW-0001 decision 12).
+        readings.push(Reading::new(
+            "fan",
+            format!("FAN{}", i + 1),
+            json!({ "pwm": pct }),
+        ));
+    }
+    Applied::ok(readings)
 }
 
-#[derive(Debug, PartialEq)]
-enum FanAction {
-    SetDuty(i32),
-    ReleaseAuto,
-}
-
-/// Decide the fan action. Without a valid temperature or a usable curve we cannot control safely,
-/// so we release to BMC auto rather than hold manual control while blind.
-fn decide(driving: Option<i32>, curve: &Curve) -> FanAction {
-    match driving {
-        Some(t) if !curve.is_empty() => FanAction::SetDuty(curve.eval(t)),
-        _ => FanAction::ReleaseAuto,
-    }
+/// True when we can control safely (a valid driving temp AND a usable curve); false -> release.
+fn should_control(driving: Option<i32>, curve: &Curve) -> bool {
+    driving.is_some() && !curve.is_empty()
 }
 
 /// Extract every temperature reading from routed peer inputs (uninterpreted relay; we pick the
@@ -320,15 +359,21 @@ impl FanRestore {
         if !self.armed {
             return;
         }
-        self.armed = false;
-        match Ipmi::open() {
-            Ok(mut i) => match i.release_auto() {
-                Ok(()) => info!("released BMC auto control"),
-                Err(e) => eprintln!("WARNING: BMC release failed: {e}"),
-            },
-            Err(e) => eprintln!("WARNING: cannot open /dev/ipmi0 to release: {e}"),
+        let result = (|| -> anyhow::Result<()> { Ipmi::open()?.release_auto() })();
+        match &result {
+            Ok(()) => info!("released BMC auto control"),
+            Err(e) => eprintln!("WARNING: BMC release failed (will retry on drop): {e}"),
         }
+        // R8: disarm ONLY on a successful release, so a failed release is retried by `Drop`.
+        self.armed = still_armed_after(result.is_ok());
     }
+}
+
+/// New `armed` state after a restore attempt: stays armed (true) until a release SUCCEEDS, so a
+/// failed release is retried later by `Drop` — we never give up trying to hand the fans back to the
+/// BMC. [R8]
+fn still_armed_after(released_ok: bool) -> bool {
+    !released_ok
 }
 
 impl Drop for FanRestore {
@@ -341,8 +386,8 @@ impl Drop for FanRestore {
     }
 }
 
-fn emit(resp: Response) {
-    let line = resp.to_line().unwrap_or_else(|_| {
+fn emit_line(line: serde_json::Result<String>) {
+    let line = line.unwrap_or_else(|_| {
         r#"{"status":"error","error":"internal serialization error"}"#.to_string()
     });
     let mut out = std::io::stdout();
@@ -361,20 +406,33 @@ mod tests {
     }
 
     #[test]
-    fn decide_release_when_no_temp() {
-        assert_eq!(decide(None, &curve_080()), FanAction::ReleaseAuto);
+    fn release_when_no_temp() {
+        assert!(!should_control(None, &curve_080()));
     }
 
     #[test]
-    fn decide_release_when_curve_empty() {
+    fn release_when_curve_empty() {
         let empty = Curve::from_json(&serde_json::Map::new());
-        assert_eq!(decide(Some(50), &empty), FanAction::ReleaseAuto);
+        assert!(!should_control(Some(50), &empty));
     }
 
     #[test]
-    fn decide_setduty_interpolates() {
-        assert_eq!(decide(Some(40), &curve_080()), FanAction::SetDuty(50));
-        assert_eq!(decide(Some(80), &curve_080()), FanAction::SetDuty(100));
+    fn control_when_temp_and_curve_present() {
+        assert!(should_control(Some(40), &curve_080()));
+        assert!(should_control(Some(80), &curve_080()));
+    }
+
+    #[test]
+    fn fan_restore_stays_armed_until_release_succeeds() {
+        // R8: a failed release must keep the guard armed so Drop retries; success disarms.
+        assert!(
+            still_armed_after(false),
+            "a failed release must stay armed for a Drop retry"
+        );
+        assert!(
+            !still_armed_after(true),
+            "a successful release must disarm (no redundant retry)"
+        );
     }
 
     #[test]

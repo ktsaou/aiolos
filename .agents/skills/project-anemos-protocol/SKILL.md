@@ -23,9 +23,19 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
   byte on stdout desyncs the stream — this is the #1 conformance bug.
 - **Strict half-duplex.** aiolos writes one request, reads exactly one response line before the
   next. A module never writes to stdout unsolicited (sole exception: one `hello` line at startup).
-- **Messages:** `detect → {found:[{id,type,name,…}]}`; `apply{inputs?} → {status,readings:[…]}`
-  or `{status:"error",error}`; `shutdown → {status:"ok"}`. `id`s from `detect` MUST be stable
-  across re-detect and device drop/return (e.g. GPU UUID, never NVML index).
+- **Messages:** `detect → {status,found:[{id,type,name,…}]}`; `apply{inputs?} →
+  {status,readings:[…]}`; `shutdown → {status:"ok"}`. `id`s from `detect` MUST be stable across
+  re-detect and device drop/return (e.g. GPU UUID, never NVML index).
+- **Status taxonomy (every detect/apply reply):** `status` ∈ {`ok`,`error`,`fatal`}.
+  `ok` = did the job (`found`/`readings` authoritative; empty is real; an `error` field = non-fatal
+  warning). `error` = transient fault, could NOT do the job (NOT "no devices") → supervisor keeps
+  instances + retries. `fatal` = cannot work on this host → supervisor surfaces + long-backoff retry.
+- **Report faults EXPLICITLY, never by exiting/empty/silence.** A module that crashes, returns an
+  empty `found`, or goes quiet to signal a problem forces the supervisor to decide blind — that is a
+  bug. Say what's wrong with `status:error`/`fatal` + a reason. (Crash/timeout is only the
+  orchestrator's last-resort backstop, surfaced as "unresponsive/crashed".)
+- **Init device libraries ONCE per process** (NVML/IPMI open fds); re-initialising every detect
+  cycle leaks fds → EMFILE → the module silently stops working.
 - **`inputs` shape:** when present, `apply.inputs` maps each peer instance `id` to **that peer's
   full readings array** (e.g. `{"GPU-…":[{"type":"temp","label":"GPU","temp":63}, …]}`). aiolos
   relays them verbatim and uninterpreted — the consumer selects what it needs (typically the
@@ -34,17 +44,28 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
 - **`hello` is consumed by aiolos:** a module MAY emit one `hello` line at startup; the
   orchestrator skips a leading `hello` on both streams, so it never desyncs. Emitting it is
   optional (the shipped modules don't).
-- **Fail-safe:** on `shutdown` OR **stdin EOF**, a `run` instance MUST restore its device to
-  firmware/auto-safe and exit. EOF covers aiolos dying. The controlled state must be more
-  aggressive/safe than the device default so "module dies → firmware reclaims" is the safe direction.
+- **Fail-safe (three equivalent triggers):** on `shutdown`, **stdin EOF**, OR **SIGTERM/SIGINT**, a
+  `run` instance MUST restore its device to firmware/auto-safe and exit. EOF covers aiolos dying;
+  the signal covers a direct kill / system stop. The controlled state must be more aggressive/safe
+  than the device default so "module dies → firmware reclaims" is the safe direction.
+- **Signal self-restore:** a module is self-sufficient — it catches SIGTERM/SIGINT and restores
+  itself; it never relies on the parent killing it. The handler is async-signal-safe (sets a flag
+  only); the restore runs in normal code (NVML/IPMI allocate + lock → unsafe in a handler). Read
+  stdin non-blocking + `poll(2)` in short steps checking the flag (std blocking reads swallow
+  `EINTR`). Use `protocol::StdinReader` + `protocol::install_shutdown_handlers` (they do exactly
+  this) rather than hand-rolling.
+- **`restore` one-shot:** every module implements `<module> restore` — restore ALL its devices and
+  exit, idempotently. Verb is uniform across anemoi so `aiolos restore` (systemd ExecStopPost) can
+  call it without naming modules.
 - **Timeout:** aiolos kills a module that doesn't answer within `timeout` (< heartbeat). Modules
   must never assume they won't be `SIGKILL`ed mid-operation.
 
 ## Best Practices
 - Read stdin line-by-line with a generous buffer; parse with serde_json into typed structs.
 - Flush stdout after every response line (line-buffered or explicit flush).
-- Put the device-restore in a single function called from both the `shutdown` handler and the
-  EOF path (and, where the OS allows, a fatal-signal handler).
+- Put the device-restore in a single function called from ALL of: the `shutdown` handler, the EOF
+  path, the SIGTERM/SIGINT path, and the `restore` one-shot. Never restore inside the signal handler
+  itself (set a flag; restore in normal code).
 - Keep `apply` work bounded so it always returns within `timeout`.
 
 ## Bad Practices
@@ -58,13 +79,16 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
 ## Workflow Checklist
 1. Re-read `aiolos-protocol.spec.md`.
 2. Confirm stdout carries only JSON; route all logs to stderr.
-3. Implement/verify detect (stable ids), apply (within timeout), shutdown + EOF (device restore).
+3. Implement/verify detect (stable ids), apply (within timeout), shutdown + EOF + SIGTERM (device
+   restore), and the `restore` one-shot. Use `protocol::StdinReader` + `install_shutdown_handlers`.
 4. Test with a one-line stdin → one-line stdout harness and with the orchestrator's mock/timeout.
 
 ## Validation Checklist
 - Golden request→response lines round-trip; malformed input is rejected without crashing.
 - A `SIGKILL` mid-apply leaves the device safe (or auto-reclaimed by firmware).
-- shutdown and stdin-EOF both restore the device (verified by reading device state after exit).
+- shutdown, stdin-EOF, AND SIGTERM each restore the device (verified by reading device state after
+  exit; the integration suite holds stdin open and SIGTERMs to prove the signal path specifically).
+- `<module> restore` returns the device to safe/auto and is idempotent.
 - No non-JSON ever appears on stdout (grep the captured stream).
 
 ## Evidence

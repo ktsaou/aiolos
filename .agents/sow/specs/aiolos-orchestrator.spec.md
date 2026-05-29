@@ -28,10 +28,17 @@ asrock16-2t  input=nvidia
 
 ## Lifecycle
 1. **Start:** read registry → spawn one `detect` process per module.
-2. **Detect/reconcile** (every `detect_every`, default 10 s): send `detect` to each detect
-   process → diff returned `id`s against running `run` instances → spawn new `run <id>`, kill
-   vanished ones. Handles devices appearing/dropping (e.g. a GPU falling off the bus and
-   returning).
+2. **Detect/reconcile** (every `detect_every`, default 10 s): send `detect`; react to the module's
+   declared `status` (it is never inferred from empty/exit/silence):
+   - `ok` → `found` is authoritative; diff against running instances → spawn new `run <id>`, shut
+     down vanished ones (empty `found` legitimately tears all down).
+   - `error` → keep the current instances (a transient fault is NOT "no devices"), surface the
+     reason, recycle the detect process, retry next cycle.
+   - `fatal` → keep instances, surface loudly, retry only on a long backoff (~300 s).
+   - **unresponsive/crashed** (no reply / dead detect process) — backstop only: recycle it, keep
+     instances (last good `found` is retained so reconcile never tears down on a detect outage).
+   A `detect` process that exits is respawned. NVML/IPMI handles are initialised once per process
+   (re-initialising per cycle leaks fds → EMFILE).
 3. **Heartbeat** (every `tick`, default 3 s): for every `run` instance, write `apply` (with any
    routed `inputs`), then collect one response within `timeout` (default 2 s). **Fan-out then
    collect** — write to all, then collect all replies under one shared deadline; no instance waits
@@ -40,11 +47,31 @@ asrock16-2t  input=nvidia
    is `SIGKILL`ed at the deadline — it can never wedge the instance thread (the isolation
    guarantee). A response line larger than 256 KiB is treated as a protocol violation and killed.
    A leading optional `hello` line is consumed/skipped.
-4. **Timeout/exit:** missed deadline or process exit → `SIGKILL` if needed, respawn within a
-   detect/reconcile step (sub-`detect_every`) with per-id crash-loop backoff. The module's own
-   shutdown/EOF path performs the device-safe restore. When an instance is removed (vanished or
-   dead) its blackboard entry is pruned, so stale readings are never relayed as `inputs`.
+4. **apply result handling:** `ok` → store readings (+ blackboard). `error` → keep the instance,
+   surface the reason, retry next tick. `fatal` (module-declared) → respawn on a **long backoff**.
+   Missed deadline / process exit / protocol violation → `SIGKILL` if needed and respawn with per-id
+   crash-loop backoff (backstop). The module's own shutdown/EOF path performs the device-safe
+   restore. When an instance is removed (vanished or dead) its blackboard entry is pruned, so stale
+   readings are never relayed as `inputs`.
 5. **Shutdown (SIGTERM):** close every instance's stdin → modules restore + exit → reap → exit.
+   Modules ALSO self-restore on the SIGTERM they receive directly (see below), so shutdown is
+   robust even without the orchestrator's orchestration.
+6. **Supervisor watchdog:** each module's supervisor runs in its own thread; if one dies (panics),
+   the main loop respawns it (backoff-bounded, never gives up). A dying supervisor's `Drop` shuts
+   down and deregisters its own instances first (when not in a global shutdown), so the replacement
+   re-detects from a clean slate — no orphaned or duplicated instances on a device.
+
+### Process kill discipline (devices must never be stranded in manual)
+- **KillMode is the systemd default (`control-group`).** On stop, SIGTERM reaches the orchestrator
+  AND every module at once; each module catches it and self-restores (protocol spec: signal
+  self-restore). The unit names no modules and assumes nothing about the configured set.
+- **Instance teardown escalates, never SIGKILL-first:** close stdin (EOF → module restores) →
+  grace → `SIGTERM` (module's handler restores) → grace → `SIGKILL` only as an absolute last resort
+  for a wedged child.
+- **`aiolos restore` (one-shot):** reads the registry and runs every configured module's uniform
+  `restore` one-shot (concurrent, per-module time-bounded). Wired to systemd `ExecStopPost` as the
+  belt-and-suspenders for a hard kill (SIGKILL/crash/OOM) where modules could not self-restore.
+  Keeps the unit config-agnostic (no module names in the unit file).
 
 ## Data routing (blackboard)
 The orchestrator keeps each instance's last `readings`. For a module configured `input=X`, it
@@ -75,6 +102,10 @@ harmless to others — orphaned, siblings keep ticking.)
 ## Acceptance criteria
 - Spawns/reconciles modules from the registry; routes `input=` data correctly.
 - A module that hangs is killed within ~`timeout` and respawned; siblings keep ticking on time.
-- SIGTERM cleanly shuts all modules down (each restores its device).
+- SIGTERM cleanly shuts all modules down (each restores its device — via both the orchestrator's
+  stdin-close and the module's own signal handler).
+- A supervisor thread that panics is respawned (backoff-bounded) with no orphaned/duplicate
+  instances; the device keeps being regulated or falls back to firmware in the interim.
+- `aiolos restore` returns every configured module's device to firmware/BMC auto (ExecStopPost net).
 - Status page reflects live readings, per-instance health, and recent errors.
 - Idle RSS is single-digit MB; binary is low-MB.

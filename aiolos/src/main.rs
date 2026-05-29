@@ -14,13 +14,28 @@ use anyhow::Result;
 use config::Config;
 use instance::{InstanceCmd, TickResult, TickStatus};
 use protocol::{Inputs, Reading};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+/// Bound on each module's one-shot `restore` in `aiolos restore` (a wedged BMC/NVML can't hang us).
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Minimum gap between respawns of a module's supervisor thread (avoids a tight crash loop).
+const SUPERVISOR_RESPAWN_BACKOFF: Duration = Duration::from_secs(5);
+
+/// A supervisor thread plus what the watchdog needs to respawn it if it dies.
+struct SupervisorHandle {
+    entry: registry::RegistryEntry,
+    handle: thread::JoinHandle<()>,
+    respawns: u32,
+    last_spawn: Instant,
+}
 
 /// Set by the SIGTERM/SIGINT handler; polled by the main loop and supervisors.
 pub static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
@@ -40,6 +55,15 @@ fn main() -> Result<()> {
         .init();
 
     let cfg = Config::load()?;
+
+    // `aiolos restore`: config-agnostic fail-safe used by systemd's ExecStopPost. aiolos reads its
+    // OWN registry and runs each configured module's uniform `restore` one-shot, so the unit file
+    // never has to name modules. Belt-and-suspenders for a hard kill where modules couldn't
+    // self-restore on signal/EOF.
+    if std::env::args().nth(1).as_deref() == Some("restore") {
+        return run_restore(&cfg);
+    }
+
     info!(
         tick_s = cfg.tick.as_secs(),
         timeout_s = cfg.timeout.as_secs(),
@@ -72,15 +96,22 @@ fn main() -> Result<()> {
         .map(|e| (e.module_name.clone(), e.input.clone()))
         .collect();
 
-    // Supervisor per module.
-    for entry in &cfg.registry {
-        module::run_module(
-            entry.clone(),
-            Arc::clone(&state),
-            cfg.bin_dir.clone(),
-            cfg.detect_every,
-        );
-    }
+    // Supervisor per module, tracked so the watchdog can respawn one whose thread dies (panics).
+    let mut supervisors: Vec<SupervisorHandle> = cfg
+        .registry
+        .iter()
+        .map(|entry| SupervisorHandle {
+            entry: entry.clone(),
+            handle: module::run_module(
+                entry.clone(),
+                Arc::clone(&state),
+                cfg.bin_dir.clone(),
+                cfg.detect_every,
+            ),
+            respawns: 0,
+            last_spawn: Instant::now(),
+        })
+        .collect();
 
     let tick = cfg.tick;
     let timeout = cfg.timeout;
@@ -93,6 +124,10 @@ fn main() -> Result<()> {
             graceful_shutdown(&state);
             break;
         }
+
+        // Watchdog: if a supervisor thread died (panicked), respawn it (its Drop already cleaned up
+        // its instances, so the fresh supervisor re-detects from a clean slate). Backoff-bounded.
+        respawn_dead_supervisors(&mut supervisors, &state, &cfg);
 
         let now = Instant::now();
         if now < next_tick {
@@ -107,6 +142,101 @@ fn main() -> Result<()> {
     }
 
     info!("aiolos exiting");
+    Ok(())
+}
+
+/// Watchdog gating (pure, so it is unit-testable): respawn a supervisor only when it has finished,
+/// the backoff has elapsed, and we are not shutting down. A live supervisor thread only returns on
+/// the shutdown flag, so `finished && !shutting_down` means it panicked.
+fn should_respawn(finished: bool, since_last_spawn: Duration, shutting_down: bool) -> bool {
+    finished && !shutting_down && since_last_spawn >= SUPERVISOR_RESPAWN_BACKOFF
+}
+
+/// Respawn any supervisor whose thread has finished while we are NOT shutting down (a supervisor
+/// only returns on the shutdown flag, so finishing otherwise means it panicked). Backoff-bounded so
+/// a supervisor that panics on startup can't spin. Never gives up (decision 15): it keeps retrying.
+fn respawn_dead_supervisors(
+    supervisors: &mut [SupervisorHandle],
+    state: &Arc<RwLock<AppState>>,
+    cfg: &Config,
+) {
+    let shutting_down = SHUTDOWN_FLAG.load(Ordering::Acquire);
+    for s in supervisors.iter_mut() {
+        if !should_respawn(
+            s.handle.is_finished(),
+            s.last_spawn.elapsed(),
+            shutting_down,
+        ) {
+            continue;
+        }
+        s.respawns += 1;
+        warn!(module = %s.entry.module_name, respawns = s.respawns, "supervisor thread died — respawning");
+        s.handle = module::run_module(
+            s.entry.clone(),
+            Arc::clone(state),
+            cfg.bin_dir.clone(),
+            cfg.detect_every,
+        );
+        s.last_spawn = Instant::now();
+    }
+}
+
+/// `aiolos restore`: run every configured module's `restore` one-shot to hand its device back to
+/// firmware/BMC auto. Reads the registry from config (agnostic of which modules exist), dedupes by
+/// module binary, runs them concurrently, and waits with a shared bound so a wedged device can't
+/// hang us. Best-effort: failures are logged, not fatal (this is a safety net).
+fn run_restore(cfg: &Config) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut children = Vec::new();
+    for entry in &cfg.registry {
+        if !seen.insert(entry.module_name.clone()) {
+            continue; // one restore per distinct module binary
+        }
+        let bin = cfg.bin_dir.join(&entry.module_name);
+        match Command::new(&bin)
+            .arg("restore")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()) // module logs flow to our journal
+            .spawn()
+        {
+            Ok(child) => {
+                info!(module = %entry.module_name, "restore one-shot spawned");
+                children.push((entry.module_name.clone(), child));
+            }
+            Err(e) => warn!(module = %entry.module_name, error = %e, "restore spawn failed"),
+        }
+    }
+
+    let deadline = Instant::now() + RESTORE_TIMEOUT;
+    for (name, mut child) in children {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        info!(module = %name, "restored");
+                    } else {
+                        warn!(module = %name, ?status, "restore exited non-zero");
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        warn!(module = %name, "restore timed out — killing");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    warn!(module = %name, error = %e, "restore wait failed");
+                    break;
+                }
+            }
+        }
+    }
+    info!("restore complete");
     Ok(())
 }
 
@@ -292,6 +422,15 @@ pub struct AppState {
     pub instances: HashMap<String, InstanceEntry>,
     /// Last good readings per instance key (`module:id`); pruned when an instance is removed.
     pub blackboard: HashMap<String, Vec<Reading>>,
+    /// Per-module detect health (status + last declared error), for the status page.
+    pub modules: HashMap<String, ModuleHealth>,
+}
+
+/// A module's last detect outcome, as declared by the module (ok/error/fatal/unresponsive/…).
+#[derive(Clone, Default)]
+pub struct ModuleHealth {
+    pub detect_status: String,
+    pub detect_error: Option<String>,
 }
 
 pub struct InstanceEntry {
@@ -327,4 +466,22 @@ fn install_signal_handlers() {
 extern "C" fn handle_signal(_sig: i32) {
     // async-signal-safe: only a relaxed atomic store.
     SHUTDOWN_FLAG.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_respawns_only_a_dead_supervisor_after_backoff() {
+        let past = SUPERVISOR_RESPAWN_BACKOFF + Duration::from_secs(1);
+        // Dead, backoff elapsed, not shutting down -> respawn.
+        assert!(should_respawn(true, past, false));
+        // Still alive -> never respawn.
+        assert!(!should_respawn(false, past, false));
+        // Dead but inside the backoff window -> wait (no tight crash loop).
+        assert!(!should_respawn(true, Duration::from_secs(0), false));
+        // Shutting down -> a finished thread is expected; never respawn.
+        assert!(!should_respawn(true, past, true));
+    }
 }

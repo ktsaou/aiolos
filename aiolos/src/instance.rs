@@ -8,7 +8,7 @@
 //! the instance thread (which would otherwise defeat the isolation guarantee).
 
 use anyhow::Result;
-use protocol::{Inputs, Request, Response};
+use protocol::{Applied, Inputs, Request};
 use std::ffi::c_void;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -22,6 +22,9 @@ use tracing::{debug, warn};
 /// Generous for any legitimate readings list; bounds memory against a stdout flood.
 const MAX_LINE: usize = 256 * 1024;
 
+/// How long Drop waits for a child to restore its device + exit (via stdin EOF) before SIGKILL.
+const DROP_GRACE: Duration = Duration::from_secs(2);
+
 // ---------------------------------------------------------------------------
 // Tick result
 // ---------------------------------------------------------------------------
@@ -30,13 +33,16 @@ const MAX_LINE: usize = 256 * 1024;
 pub enum TickStatus {
     /// Module replied `status:ok`.
     Ok,
-    /// Module replied `status:error` (transient; instance kept — detect reconciles real loss).
+    /// Module replied `status:error` (transient; instance kept — it will retry next tick).
     Error,
-    /// No response within the deadline; the child was SIGKILLed.
+    /// Module replied `status:fatal` (it declares it cannot work) — worker exits; supervisor
+    /// respawns on a LONG backoff (decision 15).
+    Fatal,
+    /// No response within the deadline; the child was SIGKILLed (backstop — unresponsive).
     Timeout,
-    /// The child exited / stdin broke (EOF).
+    /// The child exited / stdin broke (EOF) (backstop — crashed).
     Dead,
-    /// Malformed or unexpected response; the child was SIGKILLed.
+    /// Malformed or unexpected response; the child was SIGKILLed (backstop).
     Protocol,
 }
 
@@ -45,14 +51,21 @@ impl TickStatus {
     pub fn is_fatal(self) -> bool {
         matches!(
             self,
-            TickStatus::Timeout | TickStatus::Dead | TickStatus::Protocol
+            TickStatus::Fatal | TickStatus::Timeout | TickStatus::Dead | TickStatus::Protocol
         )
+    }
+
+    /// A module-declared fatal (it said so) vs an inferred death (timeout/crash) — the supervisor
+    /// applies a long backoff to declared fatals.
+    pub fn is_declared_fatal(self) -> bool {
+        matches!(self, TickStatus::Fatal)
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             TickStatus::Ok => "ok",
             TickStatus::Error => "error",
+            TickStatus::Fatal => "fatal",
             TickStatus::Timeout => "timeout",
             TickStatus::Dead => "dead",
             TickStatus::Protocol => "protocol_error",
@@ -161,37 +174,33 @@ impl Instance {
 
         loop {
             match self.reader.read_line_deadline(deadline, MAX_LINE) {
-                ReadOutcome::Line(s) => match Response::from_line(&s) {
-                    Ok(Response::Hello(h)) => {
-                        debug!(module=%self.module_name, id=%self.id, name=%h.hello.name, "hello");
+                ReadOutcome::Line(s) => {
+                    if protocol::is_hello(&s) {
+                        debug!(module=%self.module_name, id=%self.id, "hello");
                         continue; // skip optional hello, keep reading within the deadline
                     }
-                    Ok(Response::Applied(ap)) => {
-                        let status = match ap.status {
-                            protocol::Status::Ok => TickStatus::Ok,
-                            protocol::Status::Error => TickStatus::Error,
-                        };
-                        return TickResult {
-                            status,
-                            error: ap.error,
-                            readings: ap.readings.unwrap_or_default(),
-                        };
+                    match Applied::from_line(&s) {
+                        Ok(ap) => {
+                            let status = match ap.status {
+                                protocol::Status::Ok => TickStatus::Ok,
+                                protocol::Status::Error => TickStatus::Error,
+                                protocol::Status::Fatal => TickStatus::Fatal,
+                            };
+                            return TickResult {
+                                status,
+                                error: ap.error,
+                                readings: ap.readings.unwrap_or_default(),
+                            };
+                        }
+                        Err(e) => {
+                            self.kill();
+                            return TickResult::simple(
+                                TickStatus::Protocol,
+                                Some(format!("parse: {e}")),
+                            );
+                        }
                     }
-                    Ok(Response::Found(_)) => {
-                        self.kill();
-                        return TickResult::simple(
-                            TickStatus::Protocol,
-                            Some("unexpected 'found' in run mode".into()),
-                        );
-                    }
-                    Err(e) => {
-                        self.kill();
-                        return TickResult::simple(
-                            TickStatus::Protocol,
-                            Some(format!("parse: {e}")),
-                        );
-                    }
-                },
+                }
                 ReadOutcome::Eof => return TickResult::simple(TickStatus::Dead, None),
                 ReadOutcome::Timeout => {
                     warn!(module=%self.module_name, id=%self.id, "apply timeout — SIGKILL");
@@ -226,6 +235,24 @@ impl Instance {
         self.wait_until(deadline);
     }
 
+    /// Poll for the child's exit up to `grace`; return true if it exited. Never kills (caller
+    /// decides how to escalate).
+    fn wait_grace(&mut self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return true, // already reaped / gone
+            }
+        }
+    }
+
     fn wait_until(&mut self, deadline: Instant) {
         loop {
             match self.child.try_wait() {
@@ -251,8 +278,24 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        // Universal reaper: guarantees no zombie regardless of exit path (timeout/dead/shutdown/
-        // panic). kill is harmless if the child already exited; wait reaps the zombie.
+        // Graceful escalation — never an outright SIGKILL (that would strand the device in manual):
+        //   1. close stdin -> the child sees EOF and runs its device-restore (BMC auto / firmware)
+        //   2. if it overstays, SIGTERM -> the child's signal handler ALSO restores + exits
+        //   3. SIGKILL only as an absolute last resort for a wedged child
+        // Already-dead paths (killed in tick(), or self-exited) return from try_wait immediately.
+        self.stdin = None; // (1) EOF
+        if self.wait_grace(DROP_GRACE) {
+            return;
+        }
+        // (2) SIGTERM: the module catches it and restores (same fail-safe as EOF).
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        if self.wait_grace(DROP_GRACE) {
+            return;
+        }
+        // (3) Last resort: a wedged child that honoured neither EOF nor SIGTERM.
+        warn!(module=%self.module_name, id=%self.id, "child ignored EOF + SIGTERM — SIGKILL (device may be stranded)");
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

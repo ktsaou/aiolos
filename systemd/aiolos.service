@@ -9,6 +9,18 @@ ExecStart=/opt/aiolos/bin/aiolos
 # aiolos and the anemoi require root: /dev/ipmi0 is root-only and NVML fan control needs root.
 User=root
 
+# KillMode is the systemd DEFAULT (control-group): on stop, SIGTERM reaches aiolos AND every module
+# at once. Each module catches it and restores its own device (BMC auto / firmware) before exiting
+# — modules are self-sufficient and do not depend on aiolos orchestrating their shutdown. The unit
+# therefore stays simple and makes no assumption about which modules are configured.
+
+# Belt-and-suspenders fail-safe for a HARD kill (SIGKILL / crash / OOM), where modules are killed
+# before they can self-restore: aiolos reads its OWN registry and runs each configured module's
+# `restore` one-shot. Routing through aiolos keeps this unit agnostic of the module set (no module
+# names here). `-` ignores its exit status; aiolos bounds each module's restore internally so a
+# wedged BMC/NVML cannot hang the stop. Idempotent.
+ExecStopPost=-/opt/aiolos/bin/aiolos restore
+
 # aiolos logs to stderr (tracing). Capture both streams in the journal — do NOT send to /dev/null.
 StandardOutput=journal
 StandardError=journal

@@ -160,6 +160,14 @@ thermal mass, and it keeps every instance independent within a tick (no ordering
 5. **aiolos shutdown (SIGTERM):** close every instance's stdin → each restores its device →
    reap → exit.
 
+**Supervision is error-driven, not inference-driven.** Modules declare faults explicitly via the
+response `status` (`ok`/`error`/`fatal`) with a reason; the orchestrator reacts to the declared
+status and surfaces it (per-module detect health + per-instance status on the status page). It does
+NOT infer faults from empty data, a module exiting, or silence — those would make the supervisor
+decide blind. Crash/timeout detection (step 4) is only a last-resort backstop for a module too
+broken to report; an `error` keeps existing instances (a transient fault ≠ "no devices"), a `fatal`
+retries on a long backoff (never permanently abandoned). See the protocol/orchestrator specs.
+
 **Isolation guarantee:** each `run` instance is a separate process. A wedged syscall in one
 cannot block aiolos or siblings; the worst case is that instance missing a tick and being
 restarted. (A true uninterruptible-D-state hang is unkillable by anyone, but remains harmless to
@@ -254,12 +262,18 @@ The protocol is language-agnostic; any anemos may be written in any language lat
 
 ---
 
-## 13. Config — curves
+## 13. Config — curves + smoothing
 
-`etc/<anemos>.curve.json` — temperature → duty %, linear-interpolated, clamped, hold-outside:
+`etc/<anemos>.curve.json` — temperature → duty %, linear-interpolated, clamped, hold-outside, plus
+an optional `"sensitivity"` knob (EMA α, 0–1) for noise smoothing. Default (both modules):
 ```json
-{"30": 40, "55": 60, "65": 80, "75": 100}
+{"35": 35, "80": 100, "sensitivity": 0.5}
 ```
+- **Floor 35% / ceiling 100%:** below 35 °C → 35%, above 80 °C → 100%. The curve NEVER yields below
+  35% — a wrong/low sensor reading can't stop or minimise the fans in manual mode.
+- **`sensitivity`** (EMA α): lower = smoother / less reactive to noisy spikes; higher = more
+  responsive. Live-reloaded each tick (no restart). A single bad reading is diluted to ≈ α·Δ.
+- The file is re-read every tick, so curve and sensitivity edits take effect on the next tick.
 
 ---
 

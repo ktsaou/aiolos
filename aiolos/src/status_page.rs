@@ -74,7 +74,16 @@ fn handle(mut conn: TcpStream, state: &Arc<RwLock<AppState>>) -> Result<()> {
 #[derive(Serialize)]
 struct StatusJson<'a> {
     tick: u64,
+    modules: Vec<ModuleJson<'a>>,
     instances: Vec<InstanceJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct ModuleJson<'a> {
+    module: &'a str,
+    detect_status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detect_error: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +107,16 @@ fn render_json(state: &Arc<RwLock<AppState>>) -> String {
         Err(_) => return r#"{"error":"state lock poisoned"}"#.to_string(),
     };
     let tick = s.tick_count;
+    let mut modules: Vec<ModuleJson> = s
+        .modules
+        .iter()
+        .map(|(name, h)| ModuleJson {
+            module: name,
+            detect_status: &h.detect_status,
+            detect_error: h.detect_error.as_deref(),
+        })
+        .collect();
+    modules.sort_by(|a, b| a.module.cmp(b.module));
     let mut instances: Vec<InstanceJson> = s
         .instances
         .values()
@@ -116,8 +135,12 @@ fn render_json(state: &Arc<RwLock<AppState>>) -> String {
         .collect();
     instances.sort_by(|a, b| (a.module, a.id).cmp(&(b.module, b.id)));
 
-    serde_json::to_string_pretty(&StatusJson { tick, instances })
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string_pretty(&StatusJson {
+        tick,
+        modules,
+        instances,
+    })
+    .unwrap_or_else(|_| "{}".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +189,23 @@ fn render_html(state: &Arc<RwLock<AppState>>) -> String {
         rows.push_str("<tr><td colspan=\"9\"><em>no instances (detecting…)</em></td></tr>");
     }
 
+    // Per-module detect health.
+    let mut modules: Vec<_> = s.modules.iter().collect();
+    modules.sort_by(|a, b| a.0.cmp(b.0));
+    let mut modrows = String::new();
+    for (name, h) in &modules {
+        modrows.push_str(&format!(
+            "<tr class=\"{cls}\"><td>{module}</td><td>{status}</td><td>{err}</td></tr>",
+            cls = status_class(&h.detect_status),
+            module = esc(name),
+            status = esc(&h.detect_status),
+            err = esc(h.detect_error.as_deref().unwrap_or("")),
+        ));
+    }
+    if modules.is_empty() {
+        modrows.push_str("<tr><td colspan=\"3\"><em>—</em></td></tr>");
+    }
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -182,6 +222,12 @@ fn render_html(state: &Arc<RwLock<AppState>>) -> String {
 </style></head><body>
 <h1>aiolos status</h1>
 <div class="meta">tick {tick} · {count} instance(s) · auto-refresh 3s · <a href="/status.json">JSON</a></div>
+<h2 style="font-size:1rem">modules (detect)</h2>
+<table>
+<tr><th>module</th><th>detect status</th><th>detect error</th></tr>
+{modrows}
+</table>
+<h2 style="font-size:1rem;margin-top:1rem">instances</h2>
 <table>
 <tr><th>module</th><th>id</th><th>name</th><th>status</th><th>error</th><th>restarts</th>
 <th>age (ticks)</th><th>readings</th><th>stderr tail</th></tr>
@@ -190,6 +236,7 @@ fn render_html(state: &Arc<RwLock<AppState>>) -> String {
 </body></html>"#,
         tick = s.tick_count,
         count = instances.len(),
+        modrows = modrows,
         rows = rows,
     )
 }
@@ -212,10 +259,7 @@ fn format_reading(r: &Reading) -> String {
 fn status_class(status: &str) -> &'static str {
     match status {
         "ok" => "ok",
-        "error" => "error",
-        "timeout" => "timeout",
-        "dead" => "dead",
-        "protocol_error" => "protocol_error",
+        "error" | "fatal" | "timeout" | "dead" | "protocol_error" | "unresponsive" => "error",
         _ => "",
     }
 }

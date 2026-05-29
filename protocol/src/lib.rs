@@ -9,7 +9,11 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 mod curve;
+mod damper;
+mod stdio;
 pub use curve::{Curve, CurveCache};
+pub use damper::Damper;
+pub use stdio::{install_shutdown_handlers, shutdown_requested, Event, StdinReader};
 
 /// Current wire protocol version (the `proto` field of `hello`).
 pub const PROTO_VERSION: u32 = 1;
@@ -82,16 +86,33 @@ impl Reading {
 // Responses: module → aiolos
 // ---------------------------------------------------------------------------
 
-/// Any line a module may emit on stdout. `hello` is the only unsolicited line (optional, at
-/// startup); `found` answers `detect`; `applied` answers `apply`/`shutdown`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Response {
-    Hello(Hello),
-    Found(Found),
-    Applied(Applied),
+/// Outcome a module declares on every `detect`/`apply` (and the supervisor reacts to EXPLICITLY —
+/// it never infers faults from empty data, exits, or silence):
+/// - `ok`     — the module did its job; `found`/`readings` are authoritative (empty is real). An
+///   accompanying `error` is a non-fatal warning ("done, with errors").
+/// - `error`  — transient: it could NOT do its job this time (NOT "no devices"). Keep going, retry.
+/// - `fatal`  — it cannot work on this host (wrong hw, missing capability). Retried only on a long
+///   backoff; surfaced/alerted. Never inferred — the module says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    #[default]
+    Ok,
+    Error,
+    Fatal,
 }
 
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Ok => "ok",
+            Status::Error => "error",
+            Status::Fatal => "fatal",
+        }
+    }
+}
+
+/// Optional one-line greeting a module may emit once at startup (the only unsolicited line).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
     pub hello: HelloBody,
@@ -104,9 +125,67 @@ pub struct HelloBody {
     pub modes: Vec<String>,
 }
 
+impl Hello {
+    pub fn to_line(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+    pub fn from_line(line: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(line)
+    }
+}
+
+/// True if a line is an optional `hello` (so the orchestrator can skip it before the real reply).
+pub fn is_hello(line: &str) -> bool {
+    serde_json::from_str::<Hello>(line).is_ok()
+}
+
+/// Response to `detect`. `found` is meaningful only when `status == ok`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Found {
+pub struct Detected {
+    #[serde(default)]
+    pub status: Status,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub found: Vec<FoundEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Detected {
+    pub fn ok(found: Vec<FoundEntry>) -> Self {
+        Detected {
+            status: Status::Ok,
+            found,
+            error: None,
+        }
+    }
+    /// `ok` with a non-fatal warning ("done, with errors").
+    pub fn ok_warn(found: Vec<FoundEntry>, msg: impl Into<String>) -> Self {
+        Detected {
+            status: Status::Ok,
+            found,
+            error: Some(msg.into()),
+        }
+    }
+    pub fn error(msg: impl Into<String>) -> Self {
+        Detected {
+            status: Status::Error,
+            found: Vec::new(),
+            error: Some(msg.into()),
+        }
+    }
+    pub fn fatal(msg: impl Into<String>) -> Self {
+        Detected {
+            status: Status::Fatal,
+            found: Vec::new(),
+            error: Some(msg.into()),
+        }
+    }
+    pub fn to_line(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+    pub fn from_line(line: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(line)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +199,7 @@ pub struct FoundEntry {
     pub extra: Map<String, Value>,
 }
 
+/// Response to `apply` (and `shutdown`). `readings` is meaningful only when `status == ok`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Applied {
     pub status: Status,
@@ -153,21 +233,15 @@ impl Applied {
             readings: None,
         }
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Ok,
-    Error,
-}
+    pub fn fatal(msg: impl Into<String>) -> Self {
+        Applied {
+            status: Status::Fatal,
+            error: Some(msg.into()),
+            readings: None,
+        }
+    }
 
-// ---------------------------------------------------------------------------
-// Line (de)serialization
-// ---------------------------------------------------------------------------
-
-impl Request {
-    /// Serialize to a single JSON line (no trailing newline — the caller adds `\n`).
     pub fn to_line(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
     }
@@ -176,7 +250,12 @@ impl Request {
     }
 }
 
-impl Response {
+// ---------------------------------------------------------------------------
+// Line (de)serialization
+// ---------------------------------------------------------------------------
+
+impl Request {
+    /// Serialize to a single JSON line (no trailing newline — the caller adds `\n`).
     pub fn to_line(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
     }
@@ -227,46 +306,63 @@ mod tests {
     }
 
     #[test]
-    fn found_response_round_trip() {
-        let line = r#"{"found":[{"id":"GPU-uuid-1234","type":"GPU","name":"NVIDIA RTX 6000"}]}"#;
-        let resp = Response::from_line(line).unwrap();
-        assert!(matches!(resp, Response::Found(_)));
-        assert_eq!(resp.to_line().unwrap(), line);
+    fn detect_ok_round_trip() {
+        let line = r#"{"status":"ok","found":[{"id":"GPU-uuid-1234","type":"GPU","name":"NVIDIA RTX 6000"}]}"#;
+        let d = Detected::from_line(line).unwrap();
+        assert_eq!(d.status, Status::Ok);
+        assert_eq!(d.found.len(), 1);
+        assert_eq!(d.to_line().unwrap(), line);
     }
 
     #[test]
-    fn ok_response_round_trip() {
-        let line = r#"{"status":"ok","readings":[{"type":"temp","label":"GPU","temp":63}]}"#;
-        let resp = Response::from_line(line).unwrap();
-        assert!(matches!(resp, Response::Applied(_)));
-        assert_eq!(resp.to_line().unwrap(), line);
+    fn detect_status_defaults_ok_for_legacy_found() {
+        // A bare `{"found":[...]}` (no status) is accepted as ok (back-compat / lenient).
+        let d = Detected::from_line(r#"{"found":[]}"#).unwrap();
+        assert_eq!(d.status, Status::Ok);
+        assert!(d.found.is_empty());
     }
 
     #[test]
-    fn error_response_round_trip() {
-        let line = r#"{"status":"error","error":"gpu lost"}"#;
-        let resp = Response::from_line(line).unwrap();
-        assert!(matches!(resp, Response::Applied(_)));
-        assert_eq!(resp.to_line().unwrap(), line);
+    fn detect_error_and_fatal() {
+        let e = Detected::error("NVML init failed");
+        assert_eq!(e.status, Status::Error);
+        assert_eq!(
+            e.to_line().unwrap(),
+            r#"{"status":"error","error":"NVML init failed"}"#
+        );
+        let f = Detected::fatal("no /dev/ipmi0");
+        assert_eq!(f.status, Status::Fatal);
+        assert_eq!(Detected::from_line(&f.to_line().unwrap()).unwrap(), f);
     }
 
     #[test]
-    fn hello_response_parses_and_is_distinct() {
-        let line = r#"{"hello":{"proto":1,"name":"nvidia","modes":["detect","run"]}}"#;
-        let resp = Response::from_line(line).unwrap();
-        let Response::Hello(h) = &resp else {
-            panic!("expected Hello, got {resp:?}");
-        };
+    fn apply_ok_error_fatal_round_trip() {
+        for line in [
+            r#"{"status":"ok","readings":[{"type":"temp","label":"GPU","temp":63}]}"#,
+            r#"{"status":"error","error":"gpu lost"}"#,
+            r#"{"status":"fatal","error":"device unsupported"}"#,
+        ] {
+            let a = Applied::from_line(line).unwrap();
+            assert_eq!(a.to_line().unwrap(), line);
+        }
+    }
+
+    #[test]
+    fn hello_detection_is_distinct() {
+        let hello = r#"{"hello":{"proto":1,"name":"nvidia","modes":["detect","run"]}}"#;
+        assert!(is_hello(hello));
+        // Real responses are NOT mistaken for hello.
+        assert!(!is_hello(r#"{"status":"ok","found":[]}"#));
+        assert!(!is_hello(r#"{"status":"error","error":"x"}"#));
+        let h = Hello::from_line(hello).unwrap();
         assert_eq!(h.hello.proto, PROTO_VERSION);
-        assert_eq!(resp.to_line().unwrap(), line);
     }
 
     #[test]
     fn malformed_line_is_error_not_panic() {
         assert!(Request::from_line("not json").is_err());
-        assert!(Response::from_line("{").is_err());
-        // An object that matches no response variant is rejected.
-        assert!(Response::from_line(r#"{"unexpected":true}"#).is_err());
+        assert!(Applied::from_line("{").is_err());
+        assert!(Detected::from_line("{").is_err());
     }
 
     #[test]

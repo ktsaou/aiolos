@@ -55,6 +55,8 @@ impl Curve {
 pub struct CurveCache {
     path: String,
     curve: Curve,
+    /// EMA "sensitivity" knob, read from the same file's optional `"sensitivity"` key.
+    alpha: f64,
 }
 
 impl CurveCache {
@@ -64,31 +66,48 @@ impl CurveCache {
         let mut c = CurveCache {
             path: path.into(),
             curve: Curve::default(),
+            alpha: crate::damper::DEFAULT_EMA_ALPHA,
         };
         c.reload();
         c
     }
 
-    /// Re-read the file. Updates the active curve only on a successful, non-empty parse; otherwise
-    /// (missing / partial write / invalid JSON / empty object) keeps the last-good curve so an
-    /// in-progress edit never blips the fans. Returns true iff the active curve changed.
+    /// Re-read the file (curve + optional `"sensitivity"` α). Updates the active curve only on a
+    /// successful, non-empty parse; otherwise (missing / partial write / invalid JSON / empty
+    /// object) keeps the last-good values so an in-progress edit never blips the fans. Returns true
+    /// iff the curve or the sensitivity changed.
     pub fn reload(&mut self) -> bool {
-        let parsed = fs::read_to_string(&self.path)
+        let Some(map) = fs::read_to_string(&self.path)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
             .and_then(|v| v.as_object().cloned())
-            .map(|m| Curve::from_json(&m));
-        if let Some(c) = parsed {
-            if !c.is_empty() && c != self.curve {
-                self.curve = c;
-                return true;
-            }
+        else {
+            return false;
+        };
+        let curve = Curve::from_json(&map);
+        if curve.is_empty() {
+            return false; // partial write / not yet valid — keep last good
         }
-        false
+        // Optional sensitivity (EMA α); non-numeric/out-of-range falls back to the current value.
+        let alpha = map
+            .get("sensitivity")
+            .and_then(|v| v.as_f64())
+            .filter(|a| *a > 0.0 && *a <= 1.0)
+            .unwrap_or(self.alpha);
+
+        let changed = curve != self.curve || (alpha - self.alpha).abs() > f64::EPSILON;
+        self.curve = curve;
+        self.alpha = alpha;
+        changed
     }
 
     pub fn curve(&self) -> &Curve {
         &self.curve
+    }
+
+    /// Current EMA "sensitivity" (α) from the config (default if unset).
+    pub fn alpha(&self) -> f64 {
+        self.alpha
     }
 
     pub fn path(&self) -> &str {
@@ -127,5 +146,48 @@ mod tests {
         let mut cc = CurveCache::new("/nonexistent/aiolos-test.curve.json");
         assert!(cc.curve().is_empty());
         assert!(!cc.reload());
+    }
+
+    fn floor_curve() -> Curve {
+        // The production default: floor 35%, ceiling 100%, linear between.
+        let v: Value = serde_json::from_str(r#"{"35":35,"80":100,"sensitivity":0.4}"#).unwrap();
+        Curve::from_json(v.as_object().unwrap())
+    }
+
+    #[test]
+    fn floor_curve_never_below_35_or_above_100() {
+        let c = floor_curve();
+        // SAFETY: no temperature — including absurd/wrong-low readings — ever yields < 35%.
+        for t in -100..200 {
+            let p = c.eval(t);
+            assert!((35..=100).contains(&p), "eval({t}) = {p} escaped [35,100]");
+        }
+        assert_eq!(c.eval(35), 35);
+        assert_eq!(c.eval(80), 100);
+        assert!(c.eval(57) > 35 && c.eval(57) < 100); // interpolates between
+    }
+
+    #[test]
+    fn sensitivity_key_is_not_a_curve_point() {
+        // "sensitivity" must not be parsed as a temperature point.
+        let c = floor_curve();
+        assert_eq!(c.points.len(), 2);
+    }
+
+    #[test]
+    fn cache_parses_sensitivity_and_curve() {
+        // Write a temp config with a sensitivity, confirm both curve and alpha load.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("aiolos-curvecache-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"35":35,"80":100,"sensitivity":0.3}"#).unwrap();
+        let cc = CurveCache::new(path.to_str().unwrap());
+        assert!(!cc.curve().is_empty());
+        assert_eq!(cc.curve().eval(35), 35);
+        assert!((cc.alpha() - 0.3).abs() < 1e-9);
+        // Flat curve with no sensitivity -> default alpha.
+        std::fs::write(&path, r#"{"35":35,"80":100}"#).unwrap();
+        let cc2 = CurveCache::new(path.to_str().unwrap());
+        assert!((cc2.alpha() - crate::damper::DEFAULT_EMA_ALPHA).abs() < 1e-9);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -15,9 +15,11 @@ power capping, an alerting reactor, a different board's fans, …).
 Do not use for: changing the orchestrator core, or the protocol itself (that's a spec change).
 
 ## What a module IS
-- A single executable installed at `/opt/aiolos/bin/<name>`, launched by aiolos in two modes:
+- A single executable installed at `/opt/aiolos/bin/<name>`, launched by aiolos in three modes:
   - `<name> detect` — long-running; answers `{"cmd":"detect"}` with the IDs it manages.
   - `<name> run <ID>` — long-running, bound to one ID; answers `apply`/`shutdown`.
+  - `<name> restore` — one-shot; restore ALL devices it manages to safe/auto, then exit
+    (idempotent). Verb is uniform across anemoi so `aiolos restore` can call it agnostically.
 - It owns ALL device knowledge. aiolos only spawns it, ticks it, routes data, and renders status.
 
 ## Mandatory Knowledge (the contract — see project-anemos-protocol)
@@ -25,7 +27,11 @@ Do not use for: changing the orchestrator core, or the protocol itself (that's a
 - `detect` → `{"found":[{"id":"<stable>","type":"…","name":"…"}]}` (ids stable across re-detect).
 - `apply` (maybe with `inputs` if wired via `input=`) → `{"status":"ok","readings":[{type,label,…}]}`
   or `{"status":"error","error":"…"}`, within `timeout`.
-- `shutdown` OR stdin EOF → **restore the device to its safe/firmware/auto state, then exit.**
+- `shutdown` OR stdin EOF OR **SIGTERM/SIGINT** → **restore the device to its safe/firmware/auto
+  state, then exit.** The module is self-sufficient: it catches the signal itself (async-signal-safe
+  flag → restore in normal code), never relying on the parent to kill it. In Rust, use
+  `protocol::StdinReader` + `protocol::install_shutdown_handlers` (non-blocking stdin + poll that
+  wakes on the signal). Also implement the `restore` one-shot.
 - The module's controlled state must be more aggressive/safe than the device default.
 
 ## Workflow Checklist
@@ -34,8 +40,10 @@ Do not use for: changing the orchestrator core, or the protocol itself (that's a
    readings, IPMI/API/sysfs access, **fail-safe**, config/curve, acceptance criteria). Model it on
    `anemos-nvidia.spec.md` / `anemos-asrock16-2t.spec.md`.
 3. **Open a SOW** from `.agents/sow/SOW.template.md` for the work (it's non-trivial).
-4. **Implement the two modes** over the protocol. Put device-restore in one function called from
-   the shutdown handler AND the EOF path (and a fatal-signal handler where the OS allows).
+4. **Implement the three modes** over the protocol. Put device-restore in ONE function called from
+   the shutdown handler, the EOF path, the SIGTERM/SIGINT path, and the `restore` one-shot. The
+   signal handler only sets a flag; the restore runs in normal code (device libs aren't
+   async-signal-safe). In Rust, `protocol::StdinReader::next_event` returns `Line`/`Shutdown`/`Eof`.
 5. **Config**: device IDs stable; curves/params in `/opt/aiolos/etc/<name>.*` (e.g. a JSON
    temp→duty curve). No secrets/IPs in committed defaults — operator config or `*.local.md`.
 6. **Register** it in `/opt/aiolos/etc/aiolos.conf` (one line; add `input=<other>` if it consumes
@@ -66,6 +74,7 @@ case "$mode" in
       esac
     done
     restore; exit 0 ;;                     # stdin EOF (aiolos died) -> RESTORE then exit
+  restore) restore; exit 0 ;;              # one-shot fail-safe (called by `aiolos restore`)
 esac
 ```
 (Rust modules: parse with serde_json into typed structs; same control flow. NVML →
@@ -81,7 +90,9 @@ esac
 ## Validation Checklist
 - `printf '{"cmd":"detect"}\n' | <name> detect` → one valid `found` line.
 - `printf '{"cmd":"apply"}\n' | <name> run <id>` → one valid `readings` line within timeout.
-- Closing stdin (EOF) restores the device (verify by reading device state after exit).
+- Closing stdin (EOF), sending SIGTERM (with stdin held open), and `shutdown` each restore the
+  device (verify by reading device state after exit).
+- `<name> restore` returns the device to safe/auto and is idempotent.
 - `SIGKILL` mid-run leaves the device safe (firmware reclaims where hardware allows).
 - Run under the orchestrator with the mock-timeout test: confirm it doesn't stall siblings.
 - Spec + registry updated; no secrets in committed config.

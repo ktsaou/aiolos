@@ -7,11 +7,15 @@
 mod nvml;
 
 use crate::nvml::Gpu;
-use protocol::{Applied, CurveCache, Found, Request, Response};
-use std::io::{BufRead, Write};
+use protocol::{Applied, CurveCache, Event, Request, StdinReader};
+use std::io::Write;
+use std::time::Duration;
 use tracing::{error, info};
 
 const CURVE_PATH_DEFAULT: &str = "/opt/aiolos/etc/nvidia.curve.json";
+
+/// Poll step for the signal-aware stdin reader: a termination signal is noticed within ~this long.
+const STEP: Duration = Duration::from_millis(200);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -23,14 +27,31 @@ fn main() {
         .with_target(false)
         .init();
 
+    // Every long-running mode restores firmware fan control on SIGTERM/SIGINT (self-sufficient
+    // shutdown — never depends on the parent killing us). The handler only sets a flag; the run
+    // loop performs the restore in normal code (NVML is not safe to call from a signal handler).
+    protocol::install_shutdown_handlers();
+
     let mode = std::env::args().nth(1).unwrap_or_else(|| "detect".into());
     match mode.as_str() {
         "detect" => detect_loop(),
         "run" => run_loop(&std::env::args().nth(2).expect("run requires <ID>")),
+        // Uniform one-shot fail-safe (same verb across all anemoi, called by `aiolos restore`).
+        "restore" => restore_mode(),
         other => {
             eprintln!("unknown mode: {other}");
             std::process::exit(1);
         }
+    }
+}
+
+/// One-shot fail-safe: restore every GPU's fans to firmware default and exit. Invoked by
+/// `aiolos restore` (which systemd's ExecStopPost calls) so NVML manual fan control is never left
+/// persisting if aiolos died without a graceful shutdown (hard crash / SIGKILL). Idempotent.
+fn restore_mode() {
+    if let Err(e) = nvml::restore_all() {
+        eprintln!("restore FAILED: {e}");
+        std::process::exit(2);
     }
 }
 
@@ -39,25 +60,30 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn detect_loop() {
-    let stdin = std::io::stdin();
-    let mut lock = stdin.lock();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match lock.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                error!(error=%e, "stdin read error");
-                break;
-            }
+    // One NVML handle held for the process lifetime (no per-cycle re-init -> no fd leak). On a
+    // fault the Detector reports an explicit `status:error` (it never exits or returns a bogus
+    // empty); the supervisor reacts to the declared error.
+    let mut detector = nvml::Detector::new();
+    // detect holds no device, so a signal/EOF just exits cleanly (nothing to restore).
+    let mut stdin = match StdinReader::new() {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error=%e, "stdin setup failed");
+            return;
         }
+    };
+    // A signal/EOF ends `next_event` with a non-`Line` event -> the while-let exits the loop.
+    while let Event::Line(line) = stdin.next_event(STEP) {
         match Request::from_line(line.trim()) {
-            Ok(Request::Detect) => emit(Response::Found(Found {
-                found: nvml::enumerate(),
-            })),
+            Ok(Request::Detect) => {
+                let d = detector.detect();
+                if let Some(err) = &d.error {
+                    error!(status=%d.status.as_str(), error=%err, "detect");
+                }
+                emit_line(d.to_line());
+            }
             Ok(Request::Shutdown) => {
-                emit(Response::Applied(Applied::ok_empty()));
+                emit_line(Applied::ok_empty().to_line());
                 break;
             }
             Ok(Request::Apply { .. }) => eprintln!("unexpected apply in detect mode"),
@@ -84,23 +110,28 @@ fn run_loop(id: &str) {
         }
     };
 
-    let stdin = std::io::stdin();
-    let mut lock = stdin.lock();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match lock.read_line(&mut line) {
-            Ok(0) => {
-                restore(&mut gpu);
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                error!(error=%e, "stdin read error");
-                restore(&mut gpu);
-                break;
-            }
+    let mut stdin = match StdinReader::new() {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error=%e, "stdin setup failed — restoring + exiting");
+            restore(&mut gpu);
+            return;
         }
+    };
+    loop {
+        let line = match stdin.next_event(STEP) {
+            Event::Line(l) => l,
+            // SIGTERM/SIGINT or parent gone (EOF): restore firmware fan control, then exit.
+            Event::Shutdown => {
+                info!("termination signal — restoring firmware fan control and exiting");
+                restore(&mut gpu);
+                break;
+            }
+            Event::Eof => {
+                restore(&mut gpu);
+                break;
+            }
+        };
         match Request::from_line(line.trim()) {
             Ok(Request::Apply { .. }) => {
                 // Re-read the curve every tick (live tuning; last-good on partial writes).
@@ -108,23 +139,31 @@ fn run_loop(id: &str) {
                     info!(path=%curves.path(), "curve reloaded");
                 }
                 let applied = match gpu.as_mut() {
-                    Some(g) => match g.read_and_control(curves.curve()) {
+                    Some(g) => match g.read_and_control(curves.curve(), curves.alpha()) {
                         Ok(readings) => Applied::ok(readings),
-                        Err(e) => Applied::error(e.to_string()),
+                        Err(e) => {
+                            // A failed tick must never leave the GPU in manual-but-unregulated state
+                            // (e.g. a temp-read failure after a prior manual set). Revert to firmware
+                            // so the onboard controller keeps the GPU cool until we recover.
+                            let _ = g.restore_fans();
+                            Applied::error(e.to_string())
+                        }
                     },
-                    None => Applied::error("NVML unavailable"),
+                    // Couldn't open NVML for this GPU: declare fatal so the supervisor retries on a
+                    // long backoff (re-running Gpu::open) instead of limping every tick.
+                    None => Applied::fatal("NVML unavailable for this GPU"),
                 };
-                emit(Response::Applied(applied));
+                emit_line(applied.to_line());
             }
             Ok(Request::Shutdown) => {
                 restore(&mut gpu);
-                emit(Response::Applied(Applied::ok_empty()));
+                emit_line(Applied::ok_empty().to_line());
                 break;
             }
             Ok(Request::Detect) => eprintln!("unexpected detect in run mode"),
             Err(e) => {
                 eprintln!("malformed request: {e}");
-                emit(Response::Applied(Applied::error(format!("malformed: {e}"))));
+                emit_line(Applied::error(format!("malformed: {e}")).to_line());
             }
         }
     }
@@ -146,8 +185,8 @@ fn curve_path() -> String {
         .unwrap_or_else(|_| CURVE_PATH_DEFAULT.to_string())
 }
 
-fn emit(resp: Response) {
-    let line = resp.to_line().unwrap_or_else(|_| {
+fn emit_line(line: serde_json::Result<String>) {
+    let line = line.unwrap_or_else(|_| {
         r#"{"status":"error","error":"internal serialization error"}"#.to_string()
     });
     let mut out = std::io::stdout();

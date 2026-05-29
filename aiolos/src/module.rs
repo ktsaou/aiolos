@@ -8,8 +8,8 @@ use crate::instance::{
     set_nonblocking, write_line_deadline, Instance, InstanceCmd, LineReader, ReadOutcome,
 };
 use crate::registry::RegistryEntry;
-use crate::{AppState, InstanceEntry, StderrTail, ACTIVE_INSTANCES, SHUTDOWN_FLAG};
-use protocol::{FoundEntry, Request, Response};
+use crate::{AppState, InstanceEntry, ModuleHealth, StderrTail, ACTIVE_INSTANCES, SHUTDOWN_FLAG};
+use protocol::{Detected, FoundEntry, Request, Status};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -25,6 +25,8 @@ const DETECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const TAIL_CAP: usize = 50;
 const MAX_DETECT_LINE: usize = 64 * 1024;
+/// Long backoff applied after a module declares `fatal` (decision 15: never give up, retry slowly).
+const FATAL_BACKOFF: Duration = Duration::from_secs(300);
 
 /// Spawn a supervisor thread for one registry entry.
 pub fn run_module(
@@ -58,6 +60,14 @@ struct DetectProc {
     reader: LineReader,
 }
 
+/// Result of one detect round-trip (computed while the detect proc is borrowed, then acted on).
+enum DetectOutcome {
+    /// A parsed (or parse-failed) module reply.
+    Reply(serde_json::Result<Detected>),
+    /// The module didn't answer (timeout/EOF/IO) — backstop path.
+    ReadFail,
+}
+
 struct Supervisor {
     module_name: String,
     state: Arc<RwLock<AppState>>,
@@ -74,9 +84,8 @@ struct Supervisor {
 
 impl Supervisor {
     fn run(&mut self) {
-        let _ = self.run_detect(); // initial; logged on failure
+        let mut detect_next = Instant::now() + self.run_detect(); // initial detect
         self.reconcile();
-        let mut last_detect = Instant::now();
 
         loop {
             if SHUTDOWN_FLAG.load(Ordering::Acquire) {
@@ -90,9 +99,8 @@ impl Supervisor {
             }
 
             self.reap_dead();
-            if last_detect.elapsed() >= self.detect_every {
-                let _ = self.run_detect();
-                last_detect = Instant::now();
+            if Instant::now() >= detect_next {
+                detect_next = Instant::now() + self.run_detect();
             }
             self.reconcile();
         }
@@ -130,53 +138,100 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Run one detect round-trip; on success update `last_found`. Kills+drops the detect proc on
-    /// any I/O error/timeout so it respawns next call.
-    fn run_detect(&mut self) -> anyhow::Result<()> {
+    /// Run one detect round-trip and react to the module's DECLARED status (never inferring faults
+    /// from empty/exit/silence). Returns how long until the next detect attempt: `detect_every`
+    /// normally, or `FATAL_BACKOFF` after a declared `fatal`. On `error`/unresponsive it keeps
+    /// `last_found` unchanged so `reconcile` does NOT tear down healthy instances.
+    fn run_detect(&mut self) -> Duration {
         if let Err(e) = self.ensure_detect_proc() {
-            warn!(module=%self.module_name, error=%e, "detect spawn failed");
-            return Err(e);
+            self.set_health("error", Some(format!("detect spawn failed: {e}")));
+            warn!(module=%self.module_name, error=%e, "detect spawn failed — keeping instances");
+            return self.detect_every;
         }
         let deadline = Instant::now() + DETECT_TIMEOUT;
-        let p = self.detect_proc.as_mut().unwrap();
 
-        if let Ok(line) = Request::Detect.to_line() {
-            match write_line_deadline(p.stdin_fd, &line, deadline) {
-                Ok(true) => {}
-                _ => {
-                    self.kill_detect();
-                    return Err(anyhow::anyhow!("detect write failed/timeout"));
+        // Write the request using a copied fd (no live mut borrow of detect_proc during self calls).
+        let stdin_fd = self.detect_proc.as_ref().unwrap().stdin_fd;
+        let line = Request::Detect.to_line().unwrap_or_default();
+        let wrote = matches!(write_line_deadline(stdin_fd, &line, deadline), Ok(true));
+
+        let outcome = if !wrote {
+            DetectOutcome::ReadFail
+        } else {
+            let p = self.detect_proc.as_mut().unwrap();
+            loop {
+                match p.reader.read_line_deadline(deadline, MAX_DETECT_LINE) {
+                    ReadOutcome::Line(s) => {
+                        if protocol::is_hello(&s) {
+                            continue; // skip optional hello
+                        }
+                        break DetectOutcome::Reply(Detected::from_line(&s));
+                    }
+                    ReadOutcome::Eof | ReadOutcome::Timeout | ReadOutcome::TooLong => {
+                        break DetectOutcome::ReadFail
+                    }
+                    ReadOutcome::Io(_) => break DetectOutcome::ReadFail,
                 }
             }
+        };
+        // detect_proc borrow has ended; safe to mutate self below.
+
+        match outcome {
+            // Backstop only: the module was too broken to even answer. Recycle + surface as
+            // "unresponsive"; keep instances (last_found unchanged).
+            DetectOutcome::ReadFail => {
+                self.kill_detect();
+                self.set_health(
+                    "unresponsive",
+                    Some("detect did not reply (timeout/EOF)".into()),
+                );
+                warn!(module=%self.module_name, "detect unresponsive — recycling; keeping instances");
+                self.detect_every
+            }
+            DetectOutcome::Reply(Err(e)) => {
+                self.kill_detect();
+                self.set_health("protocol_error", Some(format!("detect parse: {e}")));
+                warn!(module=%self.module_name, error=%e, "detect protocol error — recycling; keeping instances");
+                self.detect_every
+            }
+            DetectOutcome::Reply(Ok(d)) => match d.status {
+                Status::Ok => {
+                    if let Some(w) = &d.error {
+                        warn!(module=%self.module_name, warning=%w, "detect ok with warnings");
+                    }
+                    self.set_health("ok", d.error.clone());
+                    self.last_found = d.found; // authoritative — empty legitimately means none
+                    self.detect_every
+                }
+                // Declared transient failure: keep instances, surface the reason, recycle the proc.
+                Status::Error => {
+                    let msg = d.error.unwrap_or_else(|| "detect error".into());
+                    self.set_health("error", Some(msg.clone()));
+                    warn!(module=%self.module_name, error=%msg, "detect reported error — keeping instances, recycling proc");
+                    self.kill_detect();
+                    self.detect_every
+                }
+                // Declared fatal: keep instances, surface loudly, retry only on a long backoff.
+                Status::Fatal => {
+                    let msg = d.error.unwrap_or_else(|| "detect fatal".into());
+                    self.set_health("fatal", Some(msg.clone()));
+                    error!(module=%self.module_name, error=%msg, "detect reported FATAL — long backoff, keeping instances");
+                    FATAL_BACKOFF
+                }
+            },
         }
+    }
 
-        loop {
-            match p.reader.read_line_deadline(deadline, MAX_DETECT_LINE) {
-                ReadOutcome::Line(s) => match Response::from_line(&s) {
-                    Ok(Response::Hello(_)) => continue, // skip optional hello
-                    Ok(Response::Found(f)) => {
-                        self.last_found = f.found;
-                        return Ok(());
-                    }
-                    Ok(Response::Applied(_)) => {
-                        warn!(module=%self.module_name, "unexpected 'applied' in detect");
-                        return Ok(()); // keep last_found
-                    }
-                    Err(e) => {
-                        self.kill_detect();
-                        return Err(anyhow::anyhow!("detect parse: {e}"));
-                    }
+    /// Record this module's detect health for the status page.
+    fn set_health(&self, status: &str, error: Option<String>) {
+        if let Ok(mut s) = self.state.write() {
+            s.modules.insert(
+                self.module_name.clone(),
+                ModuleHealth {
+                    detect_status: status.to_string(),
+                    detect_error: error,
                 },
-                ReadOutcome::Eof | ReadOutcome::Timeout | ReadOutcome::TooLong => {
-                    warn!(module=%self.module_name, "detect read failed — respawning");
-                    self.kill_detect();
-                    return Err(anyhow::anyhow!("detect read failed"));
-                }
-                ReadOutcome::Io(e) => {
-                    self.kill_detect();
-                    return Err(anyhow::anyhow!("detect io: {e}"));
-                }
-            }
+            );
         }
     }
 
@@ -254,6 +309,12 @@ impl Supervisor {
         e.1 = Instant::now();
     }
 
+    /// Jump straight to the long backoff (~`FATAL_BACKOFF`) for a module-DECLARED fatal — retry
+    /// slowly forever (decision 15), don't crash-loop. (2^9 capped to the 300s ceiling.)
+    fn record_fatal(&mut self, id: &str) {
+        self.backoff.insert(id.to_string(), (9, Instant::now()));
+    }
+
     // ----- reap ---------------------------------------------------------------
 
     fn reap_dead(&mut self) {
@@ -264,10 +325,23 @@ impl Supervisor {
             .map(|(id, _)| id.clone())
             .collect();
         for id in dead {
-            warn!(module=%self.module_name, id=%id, "instance worker exited — will respawn (backoff)");
+            // Was the last tick a module-declared fatal? If so, apply the long backoff; otherwise
+            // it crashed/timed out (backstop) → normal escalating backoff.
+            let key = self.key(&id);
+            let was_fatal = self
+                .state
+                .read()
+                .ok()
+                .and_then(|s| s.instances.get(&key).map(|e| e.last_status == "fatal"))
+                .unwrap_or(false);
+            warn!(module=%self.module_name, id=%id, fatal=was_fatal, "instance worker exited — will respawn (backoff)");
             self.running.remove(&id);
             self.remove_instance_state(&id);
-            self.record_failure(&id);
+            if was_fatal {
+                self.record_fatal(&id);
+            } else {
+                self.record_failure(&id);
+            }
         }
     }
 
@@ -347,6 +421,23 @@ impl Supervisor {
 impl Drop for Supervisor {
     fn drop(&mut self) {
         self.kill_detect();
+        // If we're being dropped via a PANIC unwind (not a global shutdown), hand our run instances
+        // off cleanly: tell each to restore + exit and deregister it from shared state. This runs
+        // before the thread's `is_finished()` flips true, so main's watchdog (R7) can respawn a
+        // fresh supervisor from a clean slate — no orphaned or duplicated instances on the device.
+        // During a normal global shutdown, main drives instance shutdown instead, so we skip this.
+        if !SHUTDOWN_FLAG.load(Ordering::Acquire) {
+            let ids: Vec<String> = self.running.keys().cloned().collect();
+            if !ids.is_empty() {
+                warn!(module=%self.module_name, instances=ids.len(), "supervisor dropping (panic?) — shutting its instances down for clean respawn");
+            }
+            for id in ids {
+                if let Some((tx, _)) = self.running.remove(&id) {
+                    let _ = tx.send(InstanceCmd::Shutdown);
+                }
+                self.remove_instance_state(&id);
+            }
+        }
     }
 }
 

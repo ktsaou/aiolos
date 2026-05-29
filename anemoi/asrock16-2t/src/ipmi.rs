@@ -88,6 +88,8 @@ const _: () = assert!(IPMICTL_RECEIVE_MSG_TRUNC == 0xC030_690B);
 pub struct Ipmi {
     file: File,
     msgid: libc::c_long,
+    /// Whether we currently hold manual fan control (so we claim ONCE, not every tick).
+    claimed: bool,
 }
 
 impl Ipmi {
@@ -97,7 +99,11 @@ impl Ipmi {
             .write(true)
             .open("/dev/ipmi0")
             .context("opening /dev/ipmi0 (needs root + ipmi_devintf)")?;
-        Ok(Ipmi { file, msgid: 0 })
+        Ok(Ipmi {
+            file,
+            msgid: 0,
+            claimed: false,
+        })
     }
 
     /// Send one raw command, wait for its reply, verify the completion code, return response data
@@ -203,29 +209,82 @@ impl Ipmi {
         }
     }
 
-    /// Claim all 16 fans to manual control.
+    /// Claim all 16 fans to manual control. Idempotent on the BMC; we track it so we only send it
+    /// when needed (not every tick — re-claiming every tick is needless IPMI traffic).
     pub fn claim_manual(&mut self) -> Result<()> {
         self.raw(NETFN_OEM, CMD_FAN_MODE, &claim_payload())?;
+        self.claimed = true;
         Ok(())
     }
 
     /// Release all fans back to BMC auto control (the fail-safe).
     pub fn release_auto(&mut self) -> Result<()> {
         self.raw(NETFN_OEM, CMD_FAN_MODE, &release_payload())?;
+        self.claimed = false;
         Ok(())
     }
 
-    /// Claim manual then set every fan's duty to `pct` (clamped non-zero to avoid the 0xcc trap).
+    /// Claim (if needed) and set every fan's duty to `pct`. On a persistent set failure this
+    /// RELEASES to BMC auto rather than leaving the board claimed-manual without a fresh duty
+    /// (which would freeze the fans with no regulation). Policy lives in `regulate` (unit-tested).
     pub fn set_all_fans(&mut self, pct: i32) -> Result<()> {
-        self.claim_manual()?;
-        self.raw(NETFN_OEM, CMD_SET_DUTY, &duty_payload(pct))?;
-        Ok(())
+        regulate(self, pct)
+    }
+
+    fn write_duty(&mut self, pct: i32) -> Result<()> {
+        self.raw(NETFN_OEM, CMD_SET_DUTY, &duty_payload(pct))
+            .map(|_| ())
     }
 
     /// Query the current per-fan duty (0xda). Returns the raw 16 bytes (percent each).
     pub fn query_duty(&mut self) -> Result<Vec<u8>> {
         self.raw(NETFN_OEM, CMD_QUERY_DUTY, &[])
     }
+}
+
+// ---- fan-control policy (trait-based so it is unit-testable without hardware) ----
+
+/// Minimal fan-bus operations the regulation policy needs.
+pub trait FanBus {
+    fn is_claimed(&self) -> bool;
+    fn claim(&mut self) -> Result<()>;
+    fn set_duty(&mut self, pct: i32) -> Result<()>;
+    fn release(&mut self) -> Result<()>;
+}
+
+impl FanBus for Ipmi {
+    fn is_claimed(&self) -> bool {
+        self.claimed
+    }
+    fn claim(&mut self) -> Result<()> {
+        self.claim_manual()
+    }
+    fn set_duty(&mut self, pct: i32) -> Result<()> {
+        self.write_duty(pct)
+    }
+    fn release(&mut self) -> Result<()> {
+        self.release_auto()
+    }
+}
+
+/// Claim-if-needed → set duty → re-claim+retry once on failure; if a duty still can't be set,
+/// **release to BMC auto** so the board is never left claimed-manual without a fresh duty (which
+/// would freeze the fans with no thermal regulation).
+pub fn regulate<B: FanBus>(bus: &mut B, pct: i32) -> Result<()> {
+    if !bus.is_claimed() {
+        bus.claim()?; // claim failed -> nothing claimed -> safe to propagate
+    }
+    if let Err(first) = bus.set_duty(pct) {
+        if let Err(reclaim) = bus.claim() {
+            let _ = bus.release(); // can't regulate -> hand back to BMC auto
+            bail!("set failed ({first}); re-claim failed ({reclaim}); released to BMC auto");
+        }
+        if let Err(second) = bus.set_duty(pct) {
+            let _ = bus.release(); // still can't set a duty -> never hold manual frozen
+            bail!("set failed twice ({first}; {second}); released to BMC auto");
+        }
+    }
+    Ok(())
 }
 
 // ---- pure payload builders (unit-testable without the device) --------------
@@ -288,5 +347,70 @@ mod tests {
     fn ioctl_numbers_match_verified_values() {
         assert_eq!(IPMICTL_SEND_COMMAND, 0x8028_690D);
         assert_eq!(IPMICTL_RECEIVE_MSG_TRUNC, 0xC030_690B);
+    }
+
+    /// A mock fan bus for testing the `regulate` policy without /dev/ipmi0.
+    struct MockBus {
+        claimed: bool,
+        fail_set: bool,
+        claims: u32,
+        sets: u32,
+        releases: u32,
+    }
+    impl MockBus {
+        fn new(fail_set: bool) -> Self {
+            MockBus {
+                claimed: false,
+                fail_set,
+                claims: 0,
+                sets: 0,
+                releases: 0,
+            }
+        }
+    }
+    impl FanBus for MockBus {
+        fn is_claimed(&self) -> bool {
+            self.claimed
+        }
+        fn claim(&mut self) -> Result<()> {
+            self.claims += 1;
+            self.claimed = true;
+            Ok(())
+        }
+        fn set_duty(&mut self, _pct: i32) -> Result<()> {
+            self.sets += 1;
+            if self.fail_set {
+                bail!("mock set failure");
+            }
+            Ok(())
+        }
+        fn release(&mut self) -> Result<()> {
+            self.releases += 1;
+            self.claimed = false;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn regulate_ok_claims_then_sets_without_release() {
+        let mut b = MockBus::new(false);
+        assert!(regulate(&mut b, 50).is_ok());
+        assert!(b.claimed && b.claims == 1 && b.sets == 1 && b.releases == 0);
+    }
+
+    #[test]
+    fn regulate_releases_to_auto_when_duty_cannot_be_set() {
+        // The R2 safety guarantee: a persistent set failure must NOT leave the board claimed-manual
+        // (fans frozen) — it must release to BMC auto.
+        let mut b = MockBus::new(true);
+        assert!(regulate(&mut b, 50).is_err());
+        assert!(
+            b.releases >= 1,
+            "must release to BMC auto when it cannot set a duty"
+        );
+        assert!(
+            !b.claimed,
+            "must never be left claimed-manual without a fresh duty"
+        );
     }
 }

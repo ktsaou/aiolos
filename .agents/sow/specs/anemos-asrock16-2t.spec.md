@@ -46,24 +46,37 @@ bytes are non-zero.** Partial-manual or any zero byte → `0xcc invalid data fie
 partial application). Bytes 0–7 = FAN1..FAN8; bytes 8–15 are unused tach slots (set non-zero
 anyway). Manual mode without a valid duty drops a fan to its ~10–20% minimum.
 
+## Modes
+`detect` · `run <board>` · `restore` (one-shot: release all fans to BMC auto and exit; idempotent;
+called by `aiolos restore`).
+
 ## Fail-safe (critical — whole-system cooling)
 While claimed, BMC auto control is OFF for **all** fans including the CPU Noctuas. The module
 releases (`0x3a 0xd8` ×16 `0x00`) so the BMC reclaims auto control on:
-- `shutdown` or stdin EOF (primary triggers; via an RAII guard that also fires on panic), AND
+- `shutdown`, stdin EOF, OR `SIGTERM`/`SIGINT` (the module catches the signal itself — it does not
+  rely on the parent to kill it; via an RAII guard that also fires on panic), AND
 - **whenever the temperature is indeterminable** — all sensor reads fail AND no GPU `inputs`, or
   the curve is missing/empty. The module then reports `status:error` rather than holding manual
-  control while blind (**user decision SOW-0001 #9**: never run manual fans without a temperature).
+  control while blind (**user decision SOW-0001 #9**: never run manual fans without a temperature),
+  AND
+- **whenever a duty cannot be set** — if `0xd6` persistently fails (even after re-claim), the module
+  releases to BMC auto rather than holding manual-but-frozen (never leave the fans claimed without a
+  fresh duty).
 
-The RAII restore opens a fresh `/dev/ipmi0` handle (independent of the main loop), so it works
-even if the main path failed. Because the kernel can't auto-release on `SIGKILL`, the
-orchestrator's graceful stdin-close (EOF) path is the primary trigger. HW thermal throttle
-(~90s °C) is the hardware backstop.
+The RAII restore opens a fresh `/dev/ipmi0` handle (independent of the main loop), so it works even
+if the main path failed, and it disarms only on a SUCCESSFUL release (a failed release is retried on
+drop). Because the kernel can't auto-release on `SIGKILL`, `aiolos restore` (systemd ExecStopPost) is
+the net for a hard kill. HW thermal throttle (~90 °C) is the hardware backstop.
 
 ## Config — `/opt/aiolos/etc/asrock16-2t.curve.json`
-Driving °C → fan %:
+Driving °C → fan %, linear-interpolated, clamped, hold-outside, plus a `sensitivity` key (the live
+EMA α, not a curve point):
 ```json
-{"40":40,"55":60,"65":80,"75":100}
+{"35":35,"80":100,"sensitivity":0.5}
 ```
+Default (decision SOW-0001 #16): ≤35 °C → 35 %, ≥80 °C → 100 %, linear between — a **35 % floor** so
+a wrong low reading can never stop/minimise the fans. `sensitivity` (0.5 default) is reloaded every
+tick. (Per-fan/per-zone curves remain a possible future extension; the shipped model is uniform.)
 
 ## Implementation note (language/binding)
 Rust, IPMI via raw `/dev/ipmi0` ioctl — zero extra deps (user decision SOW-0001 #6). The Linux
@@ -80,5 +93,7 @@ asserts, and the two ioctl numbers are asserted against the values above. CPU te
 - `detect` → one board ID.
 - Receives GPU temps via `inputs`; computes max with its own sensors.
 - Sets all fans via the verified all-manual + non-zero sequence; `0xda` readback matches.
-- shutdown/EOF releases to BMC auto; verified by `0xda` + observing fans return to auto.
+- shutdown/EOF/SIGTERM each release to BMC auto; verified by `0xda` + observing fans return to auto.
+- A persistent duty-set failure releases to BMC auto (never holds manual-but-frozen).
+- `asrock16-2t restore` releases to BMC auto and is idempotent.
 - Never leaves fans claimed-but-undutied (the ~10–20% minimum trap).

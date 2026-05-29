@@ -258,3 +258,108 @@ fn detect_set_change_adds_and_removes() {
 
     assert!(h.shutdown(Duration::from_secs(6)));
 }
+
+#[test]
+fn detect_error_keeps_instances() {
+    // Module detects "a" (instance spawns), then after ~1.5s its detect reports status:error.
+    // A declared error is NOT "no devices" — the running instance must be PRESERVED, not torn down.
+    let mut h = Harness::start(
+        &["dev"],
+        &[
+            ("MOCK_DEV_IDS", "a"),
+            ("MOCK_DEV_SWITCH_MS", "1500"),
+            ("MOCK_DEV_AFTER", "error"),
+        ],
+        &[],
+    );
+
+    // Instance spawns and ticks a few times (past the 1.5s switch into detect-error).
+    assert!(
+        wait_until(Duration::from_secs(10), || h.marker_len("dev-a.applies")
+            >= 3),
+        "instance never ticked"
+    );
+
+    // While detect is returning error, the instance must keep ticking and never be shut down.
+    let before = h.marker_len("dev-a.applies");
+    assert!(
+        wait_until(Duration::from_secs(8), || h.marker_len("dev-a.applies")
+            > before + 1),
+        "instance stopped ticking under detect error (it was wrongly torn down)"
+    );
+    assert!(
+        !h.marker_exists("dev-a.restored"),
+        "instance was shut down on a declared detect error (must be preserved)"
+    );
+
+    assert!(h.shutdown(Duration::from_secs(6)));
+}
+
+#[test]
+fn module_self_restores_on_sigterm() {
+    // Decision 17: a module must catch SIGTERM and restore its device ITSELF — not depend on the
+    // parent. Spawn the mock in `run` mode with stdin held OPEN (so EOF can never be the trigger),
+    // SIGTERM it, and assert it wrote `.signaled` + `.restored`. This exercises the real
+    // protocol::StdinReader signal path used by the production modules.
+    let uniq = UNIQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("aiolos-sig-{}-{}", std::process::id(), uniq));
+    fs::create_dir_all(&dir).unwrap();
+
+    let mut child = Command::new(MOCK)
+        .arg("run")
+        .arg("sigid")
+        .env("MOCK_MOCK_WORKDIR", &dir) // module name = argv0 file name = "mock"
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mock");
+    let _stdin = child.stdin.take().expect("piped stdin"); // hold open -> the module never sees EOF
+
+    let started = dir.join("mock-sigid.starts");
+    assert!(
+        wait_until(Duration::from_secs(5), || started.exists()),
+        "mock run instance did not start"
+    );
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+
+    let restored = dir.join("mock-sigid.restored");
+    let signaled = dir.join("mock-sigid.signaled");
+    assert!(
+        wait_until(Duration::from_secs(5), || restored.exists()),
+        "module did not restore its device on SIGTERM (stdin was open, so only the signal path can)"
+    );
+    assert!(
+        signaled.exists(),
+        "restore ran but not via the signal path (expected the SIGTERM-triggered branch)"
+    );
+
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn alive_module_drop_restores_device_via_eof() {
+    // R1: a module that is ALIVE but stops being regulated (here: it declares apply `fatal`, so the
+    // worker exits and drops the Instance) must still get a chance to restore its device. The
+    // device-restore runs on stdin EOF — so Instance::Drop must close stdin and let the child
+    // restore, NOT SIGKILL it outright. The mock writes `.restored` on EOF/shutdown.
+    let mut h = Harness::start(&["ff"], &[("MOCK_FF_BEHAVIOR", "fatal")], &[]);
+
+    // It starts and takes a tick (which returns fatal -> worker exits -> Instance dropped).
+    assert!(
+        wait_until(Duration::from_secs(8), || h
+            .marker_exists("ff-thing0.starts")),
+        "module never started"
+    );
+    // The drop path must let the child restore its device (EOF), not SIGKILL it.
+    assert!(
+        wait_until(Duration::from_secs(8), || h.marker_exists("ff-thing0.restored")),
+        "device was NOT restored on drop of an alive module (SIGKILL-without-EOF strands it manual)"
+    );
+
+    assert!(h.shutdown(Duration::from_secs(6)));
+}

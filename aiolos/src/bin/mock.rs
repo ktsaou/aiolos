@@ -13,16 +13,19 @@
 //! Side-effect markers (under WORKDIR), used by tests instead of HTTP (no port binding):
 //!   <mod>-<id>.starts     appended on each run-process startup (respawn count)
 //!   <mod>-<id>.applies    appended on each apply (tick count)
-//!   <mod>-<id>.restored   created on graceful shutdown OR stdin EOF (fail-safe path ran)
+//!   <mod>-<id>.restored   created on graceful shutdown OR stdin EOF OR a signal (fail-safe ran)
+//!   <mod>-<id>.signaled   created when the restore was triggered by SIGTERM/SIGINT (decision 17)
 //!   <mod>-<id>.lastinput  overwritten each apply with the max routed input temp (or -1)
 
-use protocol::{Applied, Found, FoundEntry, Inputs, Reading, Request, Response};
+use protocol::{Applied, Detected, Event, FoundEntry, Inputs, Reading, Request, StdinReader};
 use serde_json::json;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn main() {
+    // Use the real module signal-restore path so the integration tests exercise it (decision 17).
+    protocol::install_shutdown_handlers();
     let module = module_name();
     let mode = std::env::args().nth(1).unwrap_or_else(|| "detect".into());
     match mode.as_str() {
@@ -45,6 +48,8 @@ fn detect_loop(module: &str) {
     let switch_ms: u64 = envk(module, "SWITCH_MS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // After SWITCH_MS, switch detect behaviour: ok (default, using IDS2 if set), or error/fatal.
+    let after = envk(module, "AFTER").unwrap_or_else(|| "ok".into());
 
     let stdin = std::io::stdin();
     let mut lock = stdin.lock();
@@ -58,26 +63,32 @@ fn detect_loop(module: &str) {
         }
         match Request::from_line(line.trim()) {
             Ok(Request::Detect) => {
-                let ids = match (&ids2, switch_ms) {
-                    (Some(i2), ms) if ms > 0 && start.elapsed() >= Duration::from_millis(ms) => {
-                        i2.clone()
-                    }
-                    _ => ids1.clone(),
+                let switched = switch_ms > 0 && start.elapsed() >= Duration::from_millis(switch_ms);
+                let d = if switched && after == "error" {
+                    Detected::error("mock detect error")
+                } else if switched && after == "fatal" {
+                    Detected::fatal("mock detect fatal")
+                } else {
+                    let ids = match (&ids2, switched) {
+                        (Some(i2), true) => i2.clone(),
+                        _ => ids1.clone(),
+                    };
+                    let found = ids
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|id| FoundEntry {
+                            id: id.to_string(),
+                            kind: "MOCK".into(),
+                            name: format!("mock {id}"),
+                            extra: Default::default(),
+                        })
+                        .collect();
+                    Detected::ok(found)
                 };
-                let found = ids
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(|id| FoundEntry {
-                        id: id.to_string(),
-                        kind: "MOCK".into(),
-                        name: format!("mock {id}"),
-                        extra: Default::default(),
-                    })
-                    .collect();
-                emit(Response::Found(Found { found }));
+                emit_line(d.to_line());
             }
             Ok(Request::Shutdown) => {
-                emit(Response::Applied(Applied::ok_empty()));
+                emit_line(Applied::ok_empty().to_line());
                 break;
             }
             _ => eprintln!("mock detect: unexpected request"),
@@ -92,22 +103,27 @@ fn run_loop(module: &str, id: &str) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
 
-    let stdin = std::io::stdin();
-    let mut lock = stdin.lock();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match lock.read_line(&mut line) {
-            Ok(0) => {
-                restore(module, id);
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                restore(module, id);
-                break;
-            }
+    let mut stdin = match StdinReader::new() {
+        Ok(s) => s,
+        Err(_) => {
+            restore(module, id);
+            return;
         }
+    };
+    loop {
+        let line = match stdin.next_event(Duration::from_millis(100)) {
+            Event::Line(l) => l,
+            // SIGTERM/SIGINT: prove self-restore on a signal (no EOF needed).
+            Event::Shutdown => {
+                append_marker(module, id, "signaled");
+                restore(module, id);
+                break;
+            }
+            Event::Eof => {
+                restore(module, id);
+                break;
+            }
+        };
         match Request::from_line(line.trim()) {
             Ok(Request::Apply { inputs }) => {
                 append_marker(module, id, "applies");
@@ -128,7 +144,8 @@ fn run_loop(module: &str, id: &str) {
                             std::thread::sleep(Duration::from_secs(60));
                         }
                     }
-                    "error" => emit(Response::Applied(Applied::error("mock error"))),
+                    "error" => emit_line(Applied::error("mock error").to_line()),
+                    "fatal" => emit_line(Applied::fatal("mock fatal").to_line()),
                     "exit" => std::process::exit(0),
                     _ => {
                         let mut readings =
@@ -140,17 +157,17 @@ fn run_loop(module: &str, id: &str) {
                                 json!({ "temp": m, "in_temp": m }),
                             ));
                         }
-                        emit(Response::Applied(Applied::ok(readings)));
+                        emit_line(Applied::ok(readings).to_line());
                     }
                 }
             }
             Ok(Request::Shutdown) => {
                 restore(module, id);
-                emit(Response::Applied(Applied::ok_empty()));
+                emit_line(Applied::ok_empty().to_line());
                 break;
             }
             Ok(Request::Detect) => eprintln!("mock run: unexpected detect"),
-            Err(e) => emit(Response::Applied(Applied::error(format!("malformed: {e}")))),
+            Err(e) => emit_line(Applied::error(format!("malformed: {e}")).to_line()),
         }
     }
 }
@@ -217,10 +234,9 @@ fn write_marker(module: &str, id: &str, suffix: &str, content: &str) {
     }
 }
 
-fn emit(resp: Response) {
-    let line = resp
-        .to_line()
-        .unwrap_or_else(|_| r#"{"status":"error","error":"mock serialize"}"#.to_string());
+fn emit_line(line: serde_json::Result<String>) {
+    let line =
+        line.unwrap_or_else(|_| r#"{"status":"error","error":"mock serialize"}"#.to_string());
     let mut out = std::io::stdout();
     let _ = out.write_all(line.as_bytes());
     let _ = out.write_all(b"\n");

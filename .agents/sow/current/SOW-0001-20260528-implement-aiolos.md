@@ -92,6 +92,34 @@ Confirmed decisions (recorded before gate fill):
     pending research — `nvml-wrapper` vs raw FFI, modeled on the working C `nvfd`), asrock via the
     correct `/dev/ipmi0` raw ioctl ABI (decision 6). The SOW-0002 mock-anemos + orchestrator
     integration tests are built as part of this work (no-hardware subset).
+12. Fan-output damping (user-confirmed 2026-05-29, after the on-hardware "wave"): **EMA smoothing
+    of the driving temperature + a duty deadband**, in BOTH modules, via a shared `protocol::Damper`.
+    Root cause of the wave (confirmed by aiolos logs + GLM/MiMo/MiniMax review consensus): noisy
+    CPU `Tctl` (and bursty GPU temp) fed through a steep curve with no smoothing → duty hunts every
+    tick. NOT a caching bug (H1 rejected) and NOT an active BMC fight (H2 rejected by the logs:
+    `0xda readback == exactly the previous tick's command` = read-after-write latency, not an
+    override). Also: claim manual ONCE (sticky, self-healing on error) instead of every tick; report
+    the **commanded** duty (the immediate `0xda` readback is one cycle stale). Added a dedicated
+    journal namespace (`LogNamespace=aiolos`) and per-tick decision/routing logging.
+14. Explicit module error reporting (user-confirmed 2026-05-29 — supersedes the fail-stop +
+    empty-strike approach, which the user rightly rejected: inferring faults from exit/silence or
+    empty data is fragile and leaves the supervisor deciding blind). **Protocol change:** `detect`
+    and `apply` carry an explicit `status` ∈ {`ok`,`error`,`fatal`} + optional `error` reason.
+    `ok` = did its job (`found`/`readings` authoritative; empty is real; an `error` field alongside
+    = non-fatal warning / "done with errors"). `error` = transient, couldn't do the job (NOT "no
+    devices") → supervisor keeps existing instances, surfaces the reason, retries with backoff.
+    `fatal` = cannot work on this host → see decision 15. Modules MUST report errors explicitly,
+    never by exiting/returning empty. Crash/timeout detection remains ONLY as a last-resort
+    backstop (a module too broken to report), surfaced as "unresponsive/crashed". Removed: nvidia
+    fail-stop exit + the empty-strike heuristic. Scope: BOTH detect and apply.
+15. `fatal` handling (user-confirmed 2026-05-29): **long-backoff retry** — never permanently give
+    up. The supervisor keeps surfacing the fatal error and retries on a long backoff (minutes) in
+    case the condition clears (driver reload, device appears); it does not tear down or hammer.
+13. Curves (user-confirmed 2026-05-29): nvidia and asrock use the **same** curve so the board
+    tracks the hottest GPU (modulo one-tick lag + CPU max). Reset both to `{"0":0,"80":100}`;
+    live-tunable (per-tick reload works). The board ≠ hottest-GPU mismatch was (a) a live edit that
+    diverged the asrock curve to `{"0":0,"90":100}` and (b) the structural one-tick-stale +
+    `max(GPU,CPU)` routing — both expected, not bugs.
 11. NVML binding (research-confirmed 2026-05-29): **`nvml-wrapper` 0.12.1** — all needed methods
     present since 0.11.0 (`set_fan_speed`, `set_default_fan_speed`, `fan_speed`, `fan_speed_rpm`,
     `num_fans`, `temperature`, `uuid`, `name`); Blackwell + CUDA 13.0 supported; loads
@@ -191,6 +219,151 @@ Confirmed decisions (recorded before gate fill):
   - **Boot enablement intentionally NOT changed** (pending user decision): `aiolos` active but
     `disabled`; `nvfd` inactive but still `enabled` → a reboot currently falls back to `nvfd`
     (a safe soak posture). Full cutover = enable aiolos + disable nvfd.
+
+## Bug — FD leak in nvidia detect (found in soak, 2026-05-29)
+Symptom: after ~hours, GPU fans stopped tracking the curve (GPU1 77°C @ 48%); user asked "is
+aiolos not running?". aiolos WAS running, but the journal showed the nvidia **detect** process
+repeatedly logging `NVML init failed during detect: libnvidia-ml.so.1: cannot open shared object
+file: Too many open files` (EMFILE).
+Root cause (a bug I introduced in this rebuild): `nvidia::enumerate()` called `Nvml::init()` on
+**every detect cycle (10s)**; NVML opens `/dev/nvidia*` fds that are not all released on shutdown,
+so the detect process leaked fds until EMFILE. Then detect returned empty → reconcile dropped both
+GPU `run` instances (vanished) → GPU fan control fell back to firmware (safe but lazy) →
+undercooled vs intent. asrock simultaneously lost its routed GPU temps (`gpu_max=None`).
+Not caught by unit tests or the short on-hardware validation — it only manifests after hours.
+Fixes (three layers; user rejected "just raise `LimitNOFILE`" — a ceiling only delays a leak):
+1. **No leak:** nvidia detect inits NVML ONCE (`nvml::init()`) and holds it; never re-inits per
+   cycle. Verified: detect-process fd count flat (58→58 across 2+ cycles); no further EMFILE.
+2. **Module fail-stop:** the detect process now EXITS on an NVML fault (`init()`/`enumerate()`
+   error) instead of replying `{"found":[]}`. A module that answers with valid-but-wrong data
+   defeats supervision (the orchestrator can't tell "empty=broken" from "empty=no devices"); by
+   exiting, it triggers the supervisor's restart path. `enumerate()` returns `Err` on an NVML fault
+   vs `Ok([])` for a genuinely GPU-less host.
+3. **Generic supervisor resilience (orchestrator, module-agnostic):** if a `detect` returns empty
+   while that module still has running instances, the supervisor **recycles the detect process**
+   and keeps the instances, requiring `EMPTY_STRIKE_LIMIT=2` consecutive empties before believing
+   the devices are gone. Also: a failed/dead detect leaves `last_found` unchanged, so reconcile
+   does not tear down healthy instances during a detect outage.
+Removed the `LimitNOFILE` band-aid. asrock holds one `/dev/ipmi0` handle for life (no analogous
+leak); run instances init NVML once each (fine).
+Verified live: `kill -9` of the detect process → supervisor respawned it (~14s) while the GPU run
+instances stayed `ok`/`restarts=0` and kept controlling.
+Lesson: (a) long-running resource leaks evade short tests — **soak testing is essential** (why
+aiolos is correctly NOT boot-enabled yet, with nvfd as boot fallback); (b) **a module must
+fail-stop on unrecoverable faults** so the supervisor can restart it — limping along with valid
+but wrong output is worse than crashing; (c) raising an fd ceiling is not a defense. The research
+even flagged per-detect NVML re-init; I wrongly judged its cost "negligible" and missed the leak.
+
+## Smoothing + curve floor (2026-05-29, decision 16)
+User reviewed EMA behaviour on a real read-spike and judged it acceptable → **keep EMA** (it is not
+the wrong tool; the earlier asymmetric/SMA/median proposals were not adopted). Changes:
+- **Curve floor:** default curves are now `{"35":35,"80":100}` (≤35°C→35%, ≥80°C→100%, linear),
+  so manual mode **never commands below 35%** — a wrong *low* reading can't stop/minimise the fans.
+  (Old `{"0":0,"80":100}` was the bug.)
+- **Sensitivity knob:** the EMA α is now a live-tunable `"sensitivity"` key in each module's curve
+  file (default 0.5; lower = smoother/less spike-sensitive, higher = more responsive), reloaded each
+  tick via `CurveCache` and applied with `Damper::set_alpha` (no fan blip on tune).
+- Safety unit tests: curve never <35% / >100% for any temp (incl. absurd lows); single-spike
+  dilution ≈ α·Δ; sensitivity parse + α clamp. Deployed + verified on hardware (idle GPUs at the
+  35% floor; sensitivity 0.5 loaded from config).
+- Honest caveat (kept as a known property, not a blocker): symmetric EMA still lags a *sustained*
+  rise by a few ticks; the 35% floor + aggressive curve bound the risk. An instant-up/average-down
+  variant remains available if ever desired.
+
+## Rework — explicit error-reporting protocol (2026-05-29, decisions 14/15)
+Replaced the fail-stop/empty-strike approach (rightly rejected by the user as fragile inference)
+with explicit module error reporting:
+- Protocol: `Status` = {ok,error,fatal}; new `Detected{status,found,error}` for detect; `Applied`
+  gains `fatal`. Contextual parsing (skip optional `hello`, parse the expected type) replaced the
+  ambiguous untagged `Response`. 18 protocol unit tests.
+- Modules: nvidia detect reports `error` on NVML init/enumerate fault (no exit, no empty),
+  self-recovers by lazily re-initing; nvidia run reports `fatal` if NVML can't open. asrock apply
+  reports `fatal` if `/dev/ipmi0` can't open. mock gained detect/apply error+fatal behaviors.
+- Supervisor reacts to DECLARED status: `ok`→reconcile (empty legitimately tears down); `error`→
+  keep instances + surface + recycle detect proc; `fatal`→keep instances + surface + 300s backoff.
+  Crash/timeout/unresponsive remain backstops (surfaced as such); a failed detect keeps `last_found`
+  so instances are never torn down on a detect outage. Per-module detect health stored in AppState.
+- Status page surfaces per-module detect status+error (HTML + JSON).
+- New integration test `detect_error_keeps_instances` (declared error preserves instances). Total
+  **41 tests** green; clippy 0; fmt clean. Deployed + verified on hardware (status page shows
+  `nvidia:ok`, `asrock16-2t:ok`; GPUs under curve control).
+Lesson: supervision must be **error-driven, not inference-driven** — a module that limps along with
+valid-but-wrong output (or exits/goes silent) to signal a fault leaves the supervisor deciding
+blind. The protocol must let modules say *what* is wrong; crash/timeout is only the last resort.
+
+## Rework — self-sufficient module shutdown + config-agnostic fail-safe (2026-05-29, decisions 17-20)
+User rejected the first cut of the SIGKILL fail-safe as bad practice on two counts: (a) modules must
+catch signals and self-restore rather than depend on the parent killing them; (b) the systemd unit
+must not hardcode module names — any `ExecStopPost` restore must route through `aiolos`, which reads
+its own config and calls the modules. Confirmed decisions:
+
+17. **Modules catch SIGTERM/SIGINT and self-restore (mechanism A1).** Each anemos installs handlers
+    that do ONLY an async-signal-safe atomic flag store; the `run` loop restores the device in normal
+    code, then exits. Implementation: stdin set non-blocking + `poll()` with a short step (~200 ms),
+    checking the flag between polls (reaction ≤ ~step). Restoring inside the handler was REJECTED
+    (NVML/IPMI allocate + take locks → not async-signal-safe → deadlock risk). The signal-aware
+    stdin line-reader lives in the **`protocol`** crate (adds `libc` there) so every module behaves
+    identically and it is governed by the protocol contract/skill (fail-safe-on-EOF *and* on-signal).
+18. **Config-agnostic fail-safe via `aiolos restore`.** New `aiolos restore` subcommand reads the
+    registry from its own config and runs `<module> restore` for every configured module (bounded
+    timeout, best-effort). Every anemos exposes a uniform `restore` one-shot — module CLI contract
+    becomes `detect` / `run <id>` / `restore` (asrock's `release` renamed to `restore`). systemd uses
+    a single `ExecStopPost=-/opt/aiolos/bin/aiolos restore` (no module names); the hardcoded per-
+    module lines and `ExecStartPre` are removed (aiolos re-claims/regulates on start).
+19. **KillMode = systemd default (`control-group`).** On stop, aiolos AND every module get SIGTERM;
+    each module self-restores (decision 17). No `KillMode=mixed`. Simplest, agnostic, exercises the
+    handlers, and does not depend on aiolos orchestration. `ExecStopPost` covers the SIGKILL-the-
+    whole-cgroup case (post-mortem cleanup).
+20. **Soften `Instance::Drop`.** Escalate gracefully: close stdin (EOF → module restores) → grace →
+    `SIGTERM` (caught → restore) → grace → `SIGKILL` only as an absolute last resort for a wedged
+    child (SIGKILL cannot be removed — it is the only guaranteed stop for a hung process — but it is
+    no longer the second step).
+
+### Execution — danger-list fixes R1-R8 + decisions 17-20 (2026-05-29)
+Workstream: "conditions where fans are set to manual mode but are NOT regulated" — verify each with
+a mock/unit test, then fix. All landed; `cargo test --workspace` = **59 tests**, clippy 0, fmt clean.
+- **R1** Instance::Drop closes stdin (EOF→restore) before any kill. Integration test
+  `alive_module_drop_restores_device_via_eof`.
+- **R6** `Damper::deadband` asymmetric: increases applied immediately, only small decreases held
+  (never lag a needed ramp-up). Tests `deadband_asymmetric_*`, `deadband_never_holds_an_increase`.
+- **R2** asrock `regulate` policy: on a persistent duty-set failure it RELEASES to BMC auto instead
+  of holding manual-but-frozen. `FanBus` trait + mock; tests `regulate_releases_to_auto_*`.
+- **R3** nvidia `apply_or_restore`: a mid-loop fan-set failure reverts ALL fans to firmware default;
+  `run_loop` also restores on ANY tick error (temp-read/resolve). `FanControl` trait + mock; 3 tests.
+- **R7** supervisor-thread watchdog: main respawns a supervisor whose thread panicked (backoff-
+  bounded, never gives up). `Supervisor::Drop` shuts down + deregisters its instances on a non-
+  shutdown drop so the replacement starts clean. Pure `should_respawn` unit-tested.
+- **R8** `FanRestore::restore` disarms ONLY on a successful release (failed release retried by Drop).
+  `still_armed_after` unit-tested.
+- **Decision 17** every anemos catches SIGTERM/SIGINT and self-restores: new
+  `protocol::StdinReader` (non-blocking stdin + `poll(2)` in 200ms steps, checking an async-signal-
+  safe flag; no SA_RESTART so a signal wakes the poll). Handler does only an atomic store; restore
+  runs in normal code (NVML/IPMI are not async-signal-safe). nvidia + asrock + the mock all use it.
+  Protocol stdio tests (lines/EOF/CRLF/partial) + integration `module_self_restores_on_sigterm`
+  (stdin held open so only the signal path can produce `.restored`).
+- **Decision 18** config-agnostic fail-safe: new `aiolos restore` reads the registry and runs each
+  module's uniform `restore` one-shot (concurrent, bounded). asrock `release`→`restore` (CLI now
+  `detect`/`run <id>`/`restore`). systemd: single `ExecStopPost=-/opt/aiolos/bin/aiolos restore`;
+  removed the hardcoded per-module lines, `KillMode=mixed`, and `ExecStartPre`.
+- **Decision 19** KillMode = systemd default (control-group): on stop every process gets SIGTERM and
+  each module self-restores (decision 17).
+- **Decision 20** `Instance::Drop` escalates EOF → SIGTERM → SIGKILL (last resort only).
+- **Supersedes** the earlier per-module `ExecStopPost`/`KillMode=mixed` wiring (user rejected it as
+  hardcoding config + relying on the parent to kill modules).
+- **Artifacts updated**: aiolos-protocol spec (uniform `restore` subcommand + signal/EOF self-
+  restore, conformance items 5-7), orchestrator spec (`aiolos restore`, watchdog, Drop escalation,
+  KillMode discipline), both anemos specs (modes, fail-safe triggers, R2/R3 behavior, curve defaults
+  corrected to the decision-16 35% floor), and both project skills.
+- **Deployed + verified on nova (user-approved, 2026-05-29 ~13:19):** `install.sh` (new binaries +
+  config-agnostic unit, configs preserved) → `systemctl restart aiolos`. The restart's stop ran the
+  new **config-agnostic `aiolos restore`** ExecStopPost on real hardware — journal showed
+  `all GPU fans restored to firmware default gpus=2`, `restored module=nvidia`,
+  `fans released to BMC auto`, `restored module=asrock16-2t`, `restore complete` (it iterated the
+  registry, naming no modules). New aiolos came up healthy: both modules `status:ok`, curve +
+  **35% floor confirmed** (GPU 30 °C → 35% via nvidia-smi, matching the journal pwm), no warn/error.
+  Module self-restore-on-SIGTERM (decision 17) is proven by the integration test
+  `module_self_restores_on_sigterm` and will be exercised on the next real stop now that the
+  signal-aware modules are live. nvfd remains inactive + boot-enabled as the fallback.
 
 ## Validation
 Off-hardware (done, green):

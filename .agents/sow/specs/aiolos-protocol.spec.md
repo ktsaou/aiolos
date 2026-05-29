@@ -17,6 +17,11 @@ Status: design (no implementation yet). This is the authoritative contract; `DES
 ## Modes (argv)
 - `<module> detect` — a persistent process that answers `detect` requests.
 - `<module> run <ID>` — a persistent process bound to one detected ID; answers `apply`/`shutdown`.
+- `<module> restore` — a **one-shot**: restore EVERY device this module manages to its
+  firmware/auto-safe state, then exit. Idempotent (safe when already auto). The verb is **uniform
+  across all anemoi** so the orchestrator can invoke it agnostically — `aiolos restore` reads the
+  registry and runs `<module> restore` for each configured module (wired to systemd `ExecStopPost`
+  as a belt-and-suspenders for a hard kill where modules could not self-restore).
 
 ## Messages (each exactly one line)
 
@@ -29,19 +34,37 @@ first response; the orchestrator consumes and skips any leading `hello` on both 
 run streams, so emitting it is optional and never desyncs the stream. (The shipped `nvidia` and
 `asrock16-2t` modules do not emit `hello`.)
 
+### Status model (both detect and apply)
+Every `detect`/`apply` response carries `status` ∈ {`ok`,`error`,`fatal`}. Modules MUST report
+faults **explicitly** via this status — never by exiting, returning empty, or going silent (the
+supervisor must not have to infer faults from absence of data). Crash/timeout detection is a
+last-resort backstop only.
+- `ok` — the module did its job; `found`/`readings` are authoritative (empty is a real result). An
+  accompanying `error` field is a **non-fatal warning** ("done, with errors").
+- `error` — transient: it could NOT do its job this time. NOT "no devices". The supervisor keeps
+  existing instances, surfaces the reason, and retries with backoff.
+- `fatal` — it cannot work on this host (wrong hw, missing capability). The supervisor surfaces it
+  and retries only on a **long backoff** (never permanently abandons; the condition may clear).
+`error`/`fatal` responses include `error:"<reason>"`.
+
 ### detect (orchestrator → detect process; re-sent each detect cycle)
 ```json
 → {"cmd":"detect"}
-← {"found":[{"id":"<opaque-stable-id>","type":"GPU","name":"…", "...":"..."}]}
+← {"status":"ok","found":[{"id":"<opaque-stable-id>","type":"GPU","name":"…","...":"..."}]}
+← {"status":"error","error":"NVML init failed: …"}      // cannot detect right now (keep instances)
+← {"status":"fatal","error":"no /dev/ipmi0 on this host"} // cannot work here (long backoff)
 ```
-- `found` is an array (possibly empty). Each entry MUST have `id` (opaque, stable across
-  re-detect and across device drop/return) and SHOULD have `type` and a human `name`. Extra
-  keys are allowed and surfaced on the status page.
+- On `ok`, `found` is authoritative (possibly empty = genuinely no devices). Each entry MUST have
+  `id` (opaque, stable across re-detect and across device drop/return) and SHOULD have `type` and a
+  human `name`. Extra keys are allowed and surfaced on the status page.
+- A bare `{"found":[...]}` with no `status` is accepted as `ok` (lenient/back-compat).
 
 ### apply (orchestrator → run process; each heartbeat)
 ```json
 → {"cmd":"apply","inputs":{"<peer-id>":[{"type":"temp","label":"GPU","temp":63}], "...":[]}}
 ← {"status":"ok","readings":[{"type":"temp","label":"CPU1","temp":37,"pwm":50,"rpm":900}]}
+← {"status":"error","error":"device read failed"}        // transient; instance kept, retried
+← {"status":"fatal","error":"GPU unsupported"}           // long-backoff respawn
 ```
 - `inputs` is present only when the registry wires `input=<other-module>`. It maps each peer
   instance's `id` to **that instance's full `readings` array** (the same records the peer last
@@ -49,9 +72,8 @@ run streams, so emitting it is optional and never desyncs the stream. (The shipp
   uninterpreted** — it does not pick "the temperature"; the consumer selects what it needs (e.g.
   records with `"type":"temp"`). Absent when no `input=` is wired; the `inputs` key is omitted
   entirely (never serialized as `null`).
-- Response: `status` ∈ {`ok`,`error`}. On `ok`, `readings` is an array of records; each record
-  has a `type` (`temp`,`fan`,…) and `label`, plus arbitrary numeric/string fields
-  (`temp`,`pwm`,`rpm`,…). On `error`, include `error:"<reason>"`; `readings` optional.
+- On `ok`, `readings` is an array of records; each has a `type` (`temp`,`fan`,…) and `label`, plus
+  arbitrary numeric/string fields (`temp`,`pwm`,`rpm`,…).
 - The run process knows its own `id` from argv; `apply` does not repeat it.
 
 ### shutdown (orchestrator → run/detect process; graceful stop)
@@ -59,21 +81,38 @@ run streams, so emitting it is optional and never desyncs the stream. (The shipp
 → {"cmd":"shutdown"}
 ← {"status":"ok"}
 ```
-On `shutdown` — and **identically on stdin EOF** (covers the orchestrator dying) — a `run`
-process MUST restore its device to firmware/auto-safe state, then exit. This is the fail-safe.
+On `shutdown` — **identically on stdin EOF** (covers the orchestrator dying) **and identically on
+SIGTERM/SIGINT** — a `run` process MUST restore its device to firmware/auto-safe state, then exit.
+This is the fail-safe, and all three triggers run the same restore.
+
+### Signal self-restore (run mode)
+A `run` instance MUST catch `SIGTERM`/`SIGINT` and restore its device itself — it must never depend
+on the parent killing it. The handler must be async-signal-safe (set a flag only); the restore runs
+in normal code (device libraries like NVML/IPMI allocate and take locks, so restoring inside a
+signal handler can deadlock). Because std's blocking line reads swallow `EINTR`, modules read stdin
+non-blocking and `poll(2)` in short steps, checking the flag between polls. The shipped modules use
+`protocol::StdinReader` + `protocol::install_shutdown_handlers`, which implement exactly this.
 
 ## Timing, failure, fail-safe
 - The orchestrator waits at most `timeout` (< heartbeat) for a response. No response in time →
-  the instance is `SIGKILL`ed and respawned on a later cycle. Modules must never block the
-  orchestrator; isolation is by separate processes.
+  the instance is `SIGKILL`ed and respawned (a **backstop** for a module too broken to report).
+  Modules must never block the orchestrator; isolation is by separate processes.
+- **Report errors, don't infer them.** A module that hits a fault MUST send `status:error`/`fatal`
+  with a reason. Exiting, returning empty, or going silent to signal a fault is a conformance bug:
+  it forces the supervisor to make critical decisions blind. The supervisor reacts to declared
+  status and surfaces the reason; crash/timeout is only the last resort.
 - A module's controlled state must be *more aggressive/safe* than the device default, so
   "module dies → firmware/BMC reclaims control" is always the safe direction.
 
 ## Conformance checklist (a module is conformant iff)
 1. Emits only valid one-line JSON on stdout; everything else on stderr.
 2. `detect` returns stable `id`s; re-detect of an unchanged device returns the same `id`.
-3. `apply` returns within `timeout`; reports `readings` or `error`.
-4. On `shutdown` OR stdin EOF, restores the device to safe/auto and exits.
-5. Tolerates being `SIGKILL`ed at any time without leaving the device in an unsafe state
+3. Every `detect`/`apply` reply carries `status` ∈ {`ok`,`error`,`fatal`}; faults are reported
+   EXPLICITLY (with a reason), never by exiting/empty/silence. `ok` data is authoritative.
+4. `apply` returns within `timeout`.
+5. On `shutdown` OR stdin EOF OR `SIGTERM`/`SIGINT`, restores the device to safe/auto and exits
+   (signal handler is async-signal-safe; the restore runs in normal code).
+6. Implements `<module> restore` as an idempotent one-shot that restores every device it manages.
+7. Tolerates being `SIGKILL`ed at any time without leaving the device in an unsafe state
    (i.e. the safe state is the device's own firmware default, reached automatically on process
-   death where the hardware allows; where it does not, see the module spec's fail-safe note).
+   death where the hardware allows; where it does not, `aiolos restore` via ExecStopPost is the net).
