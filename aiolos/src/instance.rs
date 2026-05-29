@@ -419,18 +419,30 @@ pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 }
 
 /// poll a single fd for `events`; retries on EINTR. Returns Ok(true) if ready, Ok(false) on timeout.
+/// Tracks an absolute deadline so an EINTR retry does NOT restart the full timeout — aiolos installs
+/// SIGTERM/SIGINT without SA_RESTART, so a signal can interrupt this poll; we keep waiting but stay
+/// bounded by the caller's original `timeout_ms`.
 pub(crate) fn poll_fd(fd: RawFd, events: libc::c_short, timeout_ms: i32) -> io::Result<bool> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
     loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        let ms = deadline
+            .saturating_duration_since(now)
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
         let mut pfd = libc::pollfd {
             fd,
             events,
             revents: 0,
         };
-        let r = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms) };
+        let r = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, ms) };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
+                continue; // recompute remaining from the deadline (no drift)
             }
             return Err(e);
         }
