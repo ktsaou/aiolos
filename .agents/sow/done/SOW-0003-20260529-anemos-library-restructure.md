@@ -2,11 +2,11 @@
 
 ## Status
 
-Status: in-progress
+Status: completed
 
-Sub-state: decisions D1-D7 confirmed by the user (all recommended options, 2026-05-29). SOW-0001
-completed. Implementing per the approved plan (D7: SDK + tech crates first, migrate nvidia, verify,
-then asrock).
+Sub-state: completed 2026-05-29. Three-level structure implemented (tech crates / anemos SDK / thin
+anemoi), behavior-preserving, 60 tests + clippy/fmt clean, deployed and verified on nova (commit
+5b20978). Optional follow-up offered to the user: a multi-model edge-case review of the restructure.
 
 ## Requirements
 
@@ -226,20 +226,63 @@ Original options + recommendations (for the record):
 
 ### 2026-05-29
 
-- Authored. Duplication mapped; 3-level design + decisions drafted. Awaiting user decisions; gated on
-  SOW-0001 completion.
+- Authored. Duplication mapped; 3-level design + decisions drafted.
+- User confirmed D1-D7 (all recommended). SOW-0001 completed; this SOW activated.
+- Implemented (commit 5b20978): created `anemos` SDK (`run`/`run_with` driver, `Anemos`/`Device`
+  traits, `Controller`); moved `stdio`/`curve`/`damper` from `protocol` (now wire-types-only);
+  created `tech/ipmi` (transport, `raw` made public), `tech/nvml` (pure NVML — curve/EMA/readings
+  removed), `tech/hwmon` (generalized `read_temps(chip)`); migrated nvidia (single-file Anemos/Device)
+  and asrock16-2t (thin main + `src/board.rs` for the OEM commands, `query` via the extra hook);
+  the mock now dogfoods the SDK's `StdinReader`; aiolos depends on `anemos` only for the mock bin.
+- Deviation from the as-stated D2 plan (improvement): `tech/ipmi` is the GENERIC IPMI transport;
+  the ASRockRack OEM fan commands (claim/set/release/regulate/payloads) live in
+  `anemoi/asrock16-2t/src/board.rs` (level 3), keeping the tech crate reusable.
 
 ## Validation
 
-Pending (implementation not started).
+Acceptance criteria evidence:
+- Minimal per-anemos code: nvidia is a single ~110-line file of device logic only; asrock is a thin
+  main + an isolated board module. No CLI/signal/curve/EMA/protocol/restore code in either.
+- Zero behavioral change: `cargo test --workspace` = **60 tests** pass (the hardened behavior is
+  encoded in moved tests: `regulate`, `apply_or_restore`, damper, curve floor, stdio, orchestrator
+  integration incl. signal-restore + `aiolos restore` + blackboard-liveness). clippy 0; fmt clean.
+- On-hardware re-verify (nova, 2026-05-29 ~14:57): restructured build deployed via `install.sh` +
+  restart; both modules `status:ok`, board fans tracking the curve, GPUs at the 35% floor, no
+  warn/error. Binaries unchanged in name/location (`aiolos`,`nvidia`,`asrock16-2t`).
+- No boilerplate duplication: lifecycle/signals/curve/EMA/protocol live once in `anemos`.
+- Tech reusable + selectable: `tech/{ipmi,nvml,hwmon}` are independent crates; each anemos depends
+  only on the ones it needs.
+
+Reviewer findings: not run on the restructure (behavior-preserving move; safety net = the full test
+suite + on-hardware re-verify). A multi-model edge-case review is OFFERED to the user as a follow-up
+(consistent with the project's iterative-review practice).
+
+Sensitive data gate: structural change only; no secrets in any artifact.
+
+Artifact maintenance gate:
+- AGENTS.md: Layout rewritten to the 3-level structure + "a new anemos = traits + thin main".
+- Runtime project skills: `project-create-anemos` rewritten around the SDK (implement the traits +
+  thin main; pick tech crates); `project-anemos-protocol` updated (`anemos::StdinReader`).
+- Specs: `aiolos-protocol.spec.md` updated (`anemos::` SDK reference). Protocol wire contract
+  unchanged. (A dedicated `anemos-sdk` spec is a possible later addition — noted in Followup.)
+- SOW lifecycle: `Status: completed`; moved to `.agents/sow/done/` together with the work.
 
 ## Outcome
 
-Pending.
+**Completed 2026-05-29.** aiolos is now structured in three reuse levels: level-1 tech crates
+(`tech/ipmi`,`tech/nvml`,`tech/hwmon`), the level-2 `anemos` SDK (all boilerplate + the
+`Anemos`/`Device` traits), and thin level-3 anemoi. A new anemos implements only its device logic
+and reuses everything else; the protocol/CLI/signals/curve/EMA are maintained once. Behavior is
+unchanged (60 tests + hardware re-verify); deployed and live on nova.
 
 ## Lessons Extracted
 
-Pending.
+- A shared `run()` driver + small `Anemos`/`Device` traits collapse ~80% of per-module code; the
+  trait boundary (detect/open/apply/restore + a `Controller::duty` helper) keeps level-3 readable.
+- Keep the level-1 tech crate GENERIC (IPMI transport) and push device/board-specific OEM commands
+  up to level 3 — otherwise the "tech library" isn't reusable.
+- A big behavior-preserving refactor of production code is safe when an existing comprehensive test
+  suite encodes the behavior: move tests with their code, keep the suite green at each step.
 
 ## Followup
 
