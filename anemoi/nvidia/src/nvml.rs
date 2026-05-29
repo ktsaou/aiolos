@@ -272,6 +272,13 @@ impl Gpu {
         }
         Ok(())
     }
+
+    /// Reset the damper so control re-seeds cleanly. Call when handing the fans back to firmware
+    /// after a failed tick, so a stale EMA/deadband isn't carried across the outage (mirrors the
+    /// asrock release path, which resets its damper when it releases to BMC auto).
+    pub fn reset_damper(&mut self) {
+        self.damper.reset();
+    }
 }
 
 impl Drop for Gpu {

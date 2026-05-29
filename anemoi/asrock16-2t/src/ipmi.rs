@@ -217,11 +217,14 @@ impl Ipmi {
         Ok(())
     }
 
-    /// Release all fans back to BMC auto control (the fail-safe).
+    /// Release all fans back to BMC auto control (the fail-safe). Clears `claimed` regardless of the
+    /// result: after a release attempt we no longer intend to hold manual control, so the next
+    /// control cycle must re-claim rather than trust a stale `claimed=true` (which could skip the
+    /// claim while the board is actually in auto). Returns the BMC error, if any.
     pub fn release_auto(&mut self) -> Result<()> {
-        self.raw(NETFN_OEM, CMD_FAN_MODE, &release_payload())?;
+        let r = self.raw(NETFN_OEM, CMD_FAN_MODE, &release_payload());
         self.claimed = false;
-        Ok(())
+        r.map(|_| ())
     }
 
     /// Claim (if needed) and set every fan's duty to `pct`. On a persistent set failure this
@@ -305,8 +308,19 @@ fn duty_payload(pct: i32) -> [u8; 16] {
 }
 
 fn poll_in(fd: libc::c_int, timeout: Duration) -> io::Result<bool> {
-    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    // Track an absolute deadline so an EINTR retry does NOT restart the full timeout. A module now
+    // installs SIGTERM/SIGINT handlers without SA_RESTART, so a signal can interrupt this poll; we
+    // must keep waiting for the IPMI reply but stay bounded by the original timeout.
+    let deadline = Instant::now() + timeout;
     loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false); // timed out
+        }
+        let ms = deadline
+            .saturating_duration_since(now)
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -316,7 +330,7 @@ fn poll_in(fd: libc::c_int, timeout: Duration) -> io::Result<bool> {
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
+                continue; // recompute remaining from the deadline (no drift)
             }
             return Err(e);
         }

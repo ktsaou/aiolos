@@ -144,8 +144,10 @@ fn run_loop(id: &str) {
                         Err(e) => {
                             // A failed tick must never leave the GPU in manual-but-unregulated state
                             // (e.g. a temp-read failure after a prior manual set). Revert to firmware
-                            // so the onboard controller keeps the GPU cool until we recover.
+                            // so the onboard controller keeps the GPU cool until we recover, and
+                            // reset the damper so control re-seeds cleanly on recovery.
                             let _ = g.restore_fans();
+                            g.reset_damper();
                             Applied::error(e.to_string())
                         }
                     },

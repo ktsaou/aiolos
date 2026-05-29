@@ -18,8 +18,19 @@ impl Curve {
     pub fn from_json(map: &serde_json::Map<String, Value>) -> Self {
         let mut points = BTreeMap::new();
         for (k, v) in map {
-            if let (Ok(temp), Some(pct)) = (k.parse::<i32>(), v.as_i64()) {
-                points.insert(temp, pct as i32);
+            // Accept integer OR float temps and duties — operators commonly write "35.0"; parsing
+            // only i64 would silently drop such a point (and a non-numeric key like "sensitivity"
+            // is correctly skipped). Round floats to the nearest whole degree / percent.
+            let temp = k
+                .parse::<i32>()
+                .ok()
+                .or_else(|| k.parse::<f64>().ok().map(|f| f.round() as i32));
+            let pct = v
+                .as_i64()
+                .map(|n| n as i32)
+                .or_else(|| v.as_f64().map(|f| f.round() as i32));
+            if let (Some(temp), Some(pct)) = (temp, pct) {
+                points.insert(temp, pct);
             }
         }
         Curve { points }
@@ -172,6 +183,18 @@ mod tests {
         // "sensitivity" must not be parsed as a temperature point.
         let c = floor_curve();
         assert_eq!(c.points.len(), 2);
+    }
+
+    #[test]
+    fn from_json_accepts_float_temps_and_duties() {
+        // Operators commonly write "35.0"; such points must NOT be silently dropped (they were when
+        // parsing only i64). "sensitivity" (a float) is still excluded — its key isn't numeric.
+        let v: Value =
+            serde_json::from_str(r#"{"35.0":35.0,"80":100.0,"sensitivity":0.5}"#).unwrap();
+        let c = Curve::from_json(v.as_object().unwrap());
+        assert_eq!(c.points.len(), 2, "float temp/duty points must parse");
+        assert_eq!(c.eval(35), 35);
+        assert_eq!(c.eval(80), 100);
     }
 
     #[test]

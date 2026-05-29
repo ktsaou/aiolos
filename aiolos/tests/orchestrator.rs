@@ -296,6 +296,50 @@ fn detect_error_keeps_instances() {
 }
 
 #[test]
+fn aiolos_restore_runs_every_configured_module() {
+    // `aiolos restore` (systemd ExecStopPost) must read the registry and run `<module> restore` for
+    // each configured module — agnostic of the set, no module names in the unit. Two mock modules;
+    // assert each ran its one-shot restore. This is the config-agnostic fail-safe (decision 18).
+    let uniq = UNIQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("aiolos-restore-{}-{}", std::process::id(), uniq));
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for name in ["alpha", "beta"] {
+        std::os::unix::fs::symlink(MOCK, bin.join(name)).unwrap();
+    }
+    let conf = dir.join("aiolos.conf");
+    fs::write(
+        &conf,
+        "status_bind=127.0.0.1:0\ntick=2\ntimeout=1\ndetect_every=1\nalpha\nbeta\n",
+    )
+    .unwrap();
+
+    let status = Command::new(AIOLOS)
+        .arg("restore")
+        .env("AIOLOS_CONF", &conf)
+        .env("AIOLOS_BIN_DIR", &bin)
+        .env("MOCK_ALPHA_WORKDIR", &dir)
+        .env("MOCK_BETA_WORKDIR", &dir)
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run aiolos restore");
+    assert!(status.success(), "`aiolos restore` exited non-zero");
+
+    assert!(
+        dir.join("alpha.restored_oneshot").exists(),
+        "module 'alpha' restore one-shot was not invoked by `aiolos restore`"
+    );
+    assert!(
+        dir.join("beta.restored_oneshot").exists(),
+        "module 'beta' restore one-shot was not invoked by `aiolos restore`"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn module_self_restores_on_sigterm() {
     // Decision 17: a module must catch SIGTERM and restore its device ITSELF — not depend on the
     // parent. Spawn the mock in `run` mode with stdin held OPEN (so EOF can never be the trigger),

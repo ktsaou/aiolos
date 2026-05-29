@@ -19,7 +19,7 @@
 
 use protocol::{Applied, Detected, Event, FoundEntry, Inputs, Reading, Request, StdinReader};
 use serde_json::json;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,16 @@ fn main() {
             &module,
             &std::env::args().nth(2).expect("run requires <ID>"),
         ),
+        // One-shot fail-safe invoked by `aiolos restore` (uniform across anemoi). Emulate restoring
+        // every device this module manages, mark it, exit 0.
+        "restore" => {
+            if let Some(d) = envk(&module, "WORKDIR") {
+                let _ = std::fs::write(
+                    Path::new(&d).join(format!("{module}.restored_oneshot")),
+                    "x",
+                );
+            }
+        }
         other => {
             eprintln!("mock: unknown mode {other}");
             std::process::exit(1);
@@ -51,16 +61,13 @@ fn detect_loop(module: &str) {
     // After SWITCH_MS, switch detect behaviour: ok (default, using IDS2 if set), or error/fatal.
     let after = envk(module, "AFTER").unwrap_or_else(|| "ok".into());
 
-    let stdin = std::io::stdin();
-    let mut lock = stdin.lock();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match lock.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
+    // Use the signal-aware reader (like the production modules) so the mock faithfully mirrors the
+    // protocol; detect holds no device, so a signal/EOF just exits.
+    let mut stdin = match StdinReader::new() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    while let Event::Line(line) = stdin.next_event(Duration::from_millis(100)) {
         match Request::from_line(line.trim()) {
             Ok(Request::Detect) => {
                 let switched = switch_ms > 0 && start.elapsed() >= Duration::from_millis(switch_ms);

@@ -441,10 +441,25 @@ impl Drop for Supervisor {
     }
 }
 
+/// RAII guard for the live-instance count, so a worker panic can't leak the count (which would make
+/// `graceful_shutdown` wait the full grace for a phantom instance). Decrements on ANY exit/unwind.
+struct ActiveGuard;
+impl ActiveGuard {
+    fn new() -> Self {
+        ACTIVE_INSTANCES.fetch_add(1, Ordering::AcqRel);
+        ActiveGuard
+    }
+}
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE_INSTANCES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Instance worker thread body: owns the child, services Tick/Shutdown, exits on a fatal result so
 /// the supervisor respawns it. Tracks the live-instance count for graceful shutdown.
 fn worker(mut inst: Instance, cmd_rx: mpsc::Receiver<InstanceCmd>, module_name: &str, id: &str) {
-    ACTIVE_INSTANCES.fetch_add(1, Ordering::AcqRel);
+    let _active = ActiveGuard::new();
     loop {
         match cmd_rx.recv() {
             Err(_) => break, // all senders dropped
@@ -468,5 +483,5 @@ fn worker(mut inst: Instance, cmd_rx: mpsc::Receiver<InstanceCmd>, module_name: 
         }
     }
     drop(inst); // reap child + restore via EOF for any non-shutdown exit
-    ACTIVE_INSTANCES.fetch_sub(1, Ordering::AcqRel);
+                // `_active` drops here -> ACTIVE_INSTANCES decremented (also on panic unwind).
 }
