@@ -253,9 +253,16 @@ Acceptance criteria evidence:
 - Tech reusable + selectable: `tech/{ipmi,nvml,hwmon}` are independent crates; each anemos depends
   only on the ones it needs.
 
-Reviewer findings: not run on the restructure (behavior-preserving move; safety net = the full test
-suite + on-hardware re-verify). A multi-model edge-case review is OFFERED to the user as a follow-up
-(consistent with the project's iterative-review practice).
+Reviewer findings: 5-model edge-case review run on the restructure (glm/mimo/kimi/minimax/qwen,
+2026-05-29) — ALL returned "behavior-preserving / ready to ship", zero blockers/majors. Every
+finding validated against the code. One real observability regression fixed (commit 03cf398): the
+per-module per-tick "decision" logs (nvidia uuid/temp/commanded_pct; asrock
+gpu_max/cpu_max/raw/smoothed/pct) had been dropped in the move — restored, and the unused
+`ModuleInfo::name` wired into the SDK logs. Rejected as non-issues (with reasons): absent
+`EMPTY_STRIKE_LIMIT` (deliberately removed in SOW-0001 decision 14 — explicit error/fatal detect
+status replaced it); generic fatal message + lazy NVML init (correct/improvements); idempotent
+double-restore. Redeployed; decision logs confirmed live and fans scaling correctly under real GPU
+load (66-69 °C → 70-81%). 60 tests; clippy + fmt clean.
 
 Sensitive data gate: structural change only; no secrets in any artifact.
 
