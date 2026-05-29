@@ -127,13 +127,13 @@ fn detect_loop<A: Anemos>(anemos: &mut A) {
 fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) {
     let mut ctrl = Controller::new(curve_path(info));
     if ctrl.curve_is_empty() {
-        error!(path=%ctrl.path(), "curve missing/empty — device stays on firmware/auto until a valid curve exists");
+        error!(module = info.name, path=%ctrl.path(), "curve missing/empty — device stays on firmware/auto until a valid curve exists");
     }
 
     let mut dev: Option<Box<dyn Device>> = match anemos.open(id) {
         Ok(d) => Some(d),
         Err(e) => {
-            error!(id=%id, error=%e, "open failed — instance degraded (device stays on firmware/auto)");
+            error!(module = info.name, id=%id, error=%e, "open failed — instance degraded (device stays on firmware/auto)");
             None
         }
     };
@@ -153,7 +153,10 @@ fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) {
             Event::Line(l) => l,
             // SIGTERM/SIGINT or parent gone (EOF): restore the device, then exit. Self-sufficient.
             Event::Shutdown => {
-                info!("termination signal — restoring device and exiting");
+                info!(
+                    module = info.name,
+                    "termination signal — restoring device and exiting"
+                );
                 if let Some(d) = dev.as_mut() {
                     d.restore();
                 }
@@ -198,7 +201,10 @@ fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) {
             }
         }
     }
-    // `dev` drops here -> the device's own Drop is the final restore net (panic/early-exit).
+    // `dev` drops here -> the concrete device type (or its fields, e.g. an NVML/IPMI handle with a
+    // restoring Drop) is the final restore net on panic/early-exit. A `Device` impl SHOULD ensure
+    // its underlying resource restores on drop (the shipped nvidia/asrock devices do, via the tech
+    // handle's Drop).
 }
 
 fn curve_path(info: &ModuleInfo) -> String {

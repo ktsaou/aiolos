@@ -81,6 +81,8 @@ impl Device for AsrockDevice {
         let Some(pct) = duty.pct else {
             return release_or_error(&mut self.board, "no usable curve");
         };
+        tracing::info!(gpu_max = ?gpu_max, cpu_max = ?cpu_max, raw_driving = raw,
+            smoothed_driving = duty.smoothed, commanded_pct = pct, "decision: set all board fans");
 
         if let Err(e) = self.board.set_all_fans(pct as i32) {
             return Applied::error(format!("set fans: {e}"));

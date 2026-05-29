@@ -78,6 +78,8 @@ impl Device for GpuDevice {
             }
         };
         let duty = ctrl.duty(temp);
+        tracing::info!(uuid = %self.gpu.uuid(), temp, commanded_pct = ?duty.pct,
+            fans = self.gpu.num_fans(), "decision: set GPU fans");
         let set = match duty.pct {
             Some(p) => self.gpu.set_all_fans(p),
             None => self.gpu.set_all_default(), // empty curve -> firmware/default control
