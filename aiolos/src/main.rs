@@ -253,7 +253,7 @@ fn heartbeat(
 ) {
     // Snapshot instances + build each one's inputs from the PREVIOUS tick's blackboard.
     let (snapshot, inputs_map): (Snapshot, InputsMap) = {
-        let s = state.read().unwrap();
+        let s = state.read().unwrap_or_else(|e| e.into_inner());
         let snapshot = s
             .instances
             .iter()
@@ -307,8 +307,20 @@ fn heartbeat(
         );
     }
 
-    // Apply results.
-    let mut s = state.write().unwrap();
+    // Apply the collected results to shared state (extracted + unit-tested in `apply_results`).
+    apply_results(
+        &mut state.write().unwrap_or_else(|e| e.into_inner()),
+        results,
+        tick_count,
+    );
+}
+
+/// Fold tick results into shared state. Updates per-instance status/readings AND the blackboard
+/// ONLY for instances that still exist: a supervisor may have removed (and blackboard-pruned) this
+/// instance between the heartbeat's snapshot and now, so re-inserting its readings would orphan a
+/// stale blackboard entry that nothing prunes again — routed to consumers forever. Gating both on
+/// liveness prevents that.
+fn apply_results(s: &mut AppState, results: Vec<(String, TickResult)>, tick_count: u64) {
     for (key, r) in results {
         let is_ok = r.status == TickStatus::Ok;
         if let Some(e) = s.instances.get_mut(&key) {
@@ -318,9 +330,9 @@ fn heartbeat(
             if is_ok {
                 e.last_readings = r.readings.clone();
             }
-        }
-        if is_ok && !r.readings.is_empty() {
-            s.blackboard.insert(key, r.readings);
+            if is_ok && !r.readings.is_empty() {
+                s.blackboard.insert(key, r.readings);
+            }
         }
     }
     s.tick_count = tick_count;
@@ -389,7 +401,7 @@ fn summarize_readings(readings: &[Reading]) -> String {
 
 fn graceful_shutdown(state: &Arc<RwLock<AppState>>) {
     let txs: Vec<mpsc::Sender<InstanceCmd>> = {
-        let s = state.read().unwrap();
+        let s = state.read().unwrap_or_else(|e| e.into_inner());
         s.instances.values().map(|e| e.cmd_tx.clone()).collect()
     };
     info!(instances = txs.len(), "sending shutdown to all instances");
@@ -471,6 +483,54 @@ extern "C" fn handle_signal(_sig: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_results_does_not_resurrect_a_removed_instances_blackboard_entry() {
+        // Race guard: a result arriving for an instance the supervisor already removed must NOT
+        // re-create a blackboard entry (which nothing would prune again -> stale routed forever).
+        use instance::TickStatus;
+        use protocol::Reading;
+        use serde_json::json;
+
+        let mut s = AppState::default();
+        // One live instance "mod:a"; "mod:ghost" is intentionally absent (already removed).
+        let (tx, _rx) = mpsc::channel();
+        s.instances.insert(
+            "mod:a".to_string(),
+            InstanceEntry {
+                module_name: "mod".into(),
+                id: "a".into(),
+                name: "a".into(),
+                last_status: "starting".into(),
+                last_error: None,
+                last_readings: Vec::new(),
+                restart_count: 0,
+                last_seen_tick: 0,
+                cmd_tx: tx,
+                stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            },
+        );
+
+        let mk = |t: i64| TickResult {
+            status: TickStatus::Ok,
+            error: None,
+            readings: vec![Reading::new("temp", "GPU", json!({ "temp": t }))],
+        };
+        apply_results(
+            &mut s,
+            vec![("mod:a".into(), mk(50)), ("mod:ghost".into(), mk(99))],
+            1,
+        );
+
+        assert!(
+            s.blackboard.contains_key("mod:a"),
+            "a live instance's readings must be stored"
+        );
+        assert!(
+            !s.blackboard.contains_key("mod:ghost"),
+            "a removed instance must NOT get a (resurrected) blackboard entry"
+        );
+    }
 
     #[test]
     fn watchdog_respawns_only_a_dead_supervisor_after_backoff() {

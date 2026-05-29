@@ -34,7 +34,9 @@ RestartSec=5s
 # On stop, aiolos catches SIGTERM, tells every module to restore its device (BMC auto / firmware
 # fan control), waits for them, then exits. Give it room before systemd escalates to SIGKILL.
 KillSignal=SIGTERM
-TimeoutStopSec=15s
+# Headroom for the full stop sequence: aiolos graceful shutdown (~5s) THEN the ExecStopPost
+# `aiolos restore` one-shots (bounded ~10s) — 20s keeps systemd from SIGKILLing mid-restore.
+TimeoutStopSec=20s
 
 # NOTE: do NOT add MemoryDenyWriteExecute — NVML/driver userspace may map W+X memory (same
 # constraint as the C nvfd unit). Other aggressive sandboxing can also block /dev/ipmi0 + NVML.

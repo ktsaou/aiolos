@@ -285,8 +285,10 @@ impl Drop for Gpu {
     fn drop(&mut self) {
         // Safety net: restore firmware fan control on ANY drop (normal exit or panic unwind),
         // since NVML manual control would otherwise persist after we're gone.
-        if self.restore_fans().is_ok() {
-            info!(uuid=%self.uuid, "fans restored to firmware default on drop");
+        match self.restore_fans() {
+            Ok(()) => info!(uuid=%self.uuid, "fans restored to firmware default on drop"),
+            Err(e) => warn!(uuid=%self.uuid, error=%e,
+                "fan restore on drop FAILED — GPU may be left in manual (`aiolos restore` is the net)"),
         }
     }
 }

@@ -33,7 +33,14 @@ pub fn install_shutdown_handlers() {
         sa.sa_sigaction = on_signal as usize;
         sa.sa_flags = 0;
         for sig in [libc::SIGTERM, libc::SIGINT] {
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
+            if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+                // Near-impossible for SIGTERM/SIGINT, but if it fails the module would die on that
+                // signal WITHOUT restoring its device — surface it rather than fail silently.
+                eprintln!(
+                    "WARNING: sigaction({sig}) failed: {} — device may not restore on this signal",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
     }
 }
