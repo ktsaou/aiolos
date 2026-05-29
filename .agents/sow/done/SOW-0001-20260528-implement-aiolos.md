@@ -2,8 +2,15 @@
 
 ## Status
 
-Status: in-progress
-Sub-state: clean rebuild underway. A prior implementation was reviewed (2026-05-29) and found
+Status: completed
+Sub-state: completed 2026-05-29 — orchestrator + nvidia & asrock16-2t anemoi built, hardened over
+two multi-model review rounds, deployed and verified on nova (both modules controlling; 35% floor;
+restore-on-stop + `aiolos restore` both exercised on hardware). Follow-ups (on-hardware soak, test
+expansion) tracked in SOW-0002; the boilerplate/tech restructure is SOW-0003. C `nvfd` remains
+inactive + boot-enabled as fallback (cutover not made boot-permanent — see Followup).
+
+Historical sub-state (kept for the record): clean rebuild underway. A prior implementation was
+reviewed (2026-05-29) and found
 unfit: both device layers were stubs (nvidia NVML returned fake values / empty detect; asrock
 IPMI used a wrong `/dev/ipmi0` ioctl ABI and a hardcoded fake response), plus several
 orchestrator robustness bugs (partial-line read defeating the timeout, blackboard never pruned,
@@ -365,6 +372,30 @@ a mock/unit test, then fix. All landed; `cargo test --workspace` = **59 tests**,
   `module_self_restores_on_sigterm` and will be exercised on the next real stop now that the
   signal-aware modules are live. nvfd remains inactive + boot-enabled as the fallback.
 
+### Multi-model edge-case review + redeploy (2026-05-29)
+Ran 5 external reviewers (glm/mimo/kimi/minimax/qwen) over the committed branch, **two rounds**,
+same prompt + fix-notes (never narrowed scope). Validated every finding against the code; fixed the
+real ones; rejected false positives with reasons (SIGPIPE-kill — Rust std SIG_IGNs SIGPIPE;
+stale-PID SIGTERM — child not reaped before signalling; run_restore "shared deadline" — children run
+concurrently under a wall-clock bound; two self-contradictory "blockers").
+- **Round 1 fixes** (commits ea97edc, 70a2e39): curve float-value parsing; `poll_fd`+`poll_in`
+  recompute timeout on EINTR (signals now reach them); nvidia damper reset on tick error;
+  `release_auto` clears `claimed` regardless of result; `ACTIVE_INSTANCES` RAII guard;
+  mock `restore` mode + signal-aware detect + `aiolos restore` integration test.
+- **Round 2 fixes** (commit 380d7e8): blackboard-resurrection race (a result for a just-removed
+  instance no longer re-inserts a stale, never-pruned entry — gated on liveness, unit-tested);
+  main tolerates a poisoned `RwLock` (so the R7 watchdog handles a supervisor panic instead of the
+  orchestrator aborting); `TimeoutStopSec` 15s→20s; `install_shutdown_handlers` warns on sigaction
+  failure; `Gpu::Drop` logs a restore failure.
+- **Convergence:** round 2 produced ONE real finding across five models + nits; all five returned
+  "production-quality / ready to ship". Stopped at 2 rounds (diminishing returns). 62 tests; clippy
+  0; fmt clean.
+- **Redeployed to nova** (user-approved "install aiolos"): `install.sh` + `systemctl restart`. The
+  restart exercised BOTH fail-safe layers on real hardware — the outgoing aiolos gracefully restored
+  its devices on SIGTERM AND the new config-agnostic `aiolos restore` ExecStopPost ran
+  (`restore complete`) — then the new build came up healthy (both modules ok, 35% floor confirmed via
+  nvidia-smi, no errors). `TimeoutStopSec=20s` active. nvfd remains inactive + boot-enabled fallback.
+
 ## Validation
 Off-hardware (done, green):
 - Acceptance via tests: protocol round-trips/omit-inputs/hello/malformed; curve interpolation;
@@ -386,8 +417,12 @@ Remaining (on-hardware, operator-gated — tracked in SOW-0002):
 - Idle RSS measured; cutover from C `nvfd` (stop nvfd, enable aiolos) with temps monitored.
 
 ## Outcome
-Software complete and validated off-hardware; **Status stays `in-progress`** pending the
-operator-gated on-hardware validation + `nvfd` cutover (do not stop `nvfd` without user approval).
+**Completed 2026-05-29.** Orchestrator + both anemoi built, hardened across two multi-model review
+rounds (62 tests, clippy/fmt clean), deployed to nova and verified on hardware: both modules control
+fans under their curves, the 35% floor holds, and both fail-safe layers (per-module graceful restore
+on SIGTERM/EOF + the config-agnostic `aiolos restore` ExecStopPost) were exercised live during a
+restart. `nvfd` is inactive but boot-enabled as the fallback; making aiolos boot-permanent (and any
+`nvfd` removal) is a deliberate later step (Followup). Follow-ups are mapped below.
 
 ## Lessons Extracted
 - Stubs that answer `status:ok` are worse than errors — they look healthy while doing nothing.
@@ -401,11 +436,14 @@ operator-gated on-hardware validation + `nvfd` cutover (do not stop `nvfd` witho
   exactly the class of bug a `const assert` catches.
 
 ## Followup
-- On-hardware validation + cutover (SOW-0002).
+- On-hardware soak + expanded testing → **SOW-0002** (tracked).
+- Three-level boilerplate/tech restructure (minimal per-anemos code) → **SOW-0003** (authored).
+- Make aiolos boot-enabled and retire/disable `nvfd` permanently — deliberate operator step, not yet
+  done (aiolos is active but `disabled`; `nvfd` inactive but `enabled`). Tracked for SOW-0002 soak.
 - asrock board/DIMM IPMI SDR temps + per-fan tach RPM (currently CPU via k10temp + GPU inputs only).
 - Optional per-fan asrock curves (CPU vs case) if uniform proves insufficient.
-- Belt-and-suspenders restore for SIGKILL (systemd `ExecStopPost`/watchdog) — neither aiolos nor
-  the C `nvfd` restores on a hard kill.
+- **DONE this SOW** (was a followup): belt-and-suspenders restore for SIGKILL via `aiolos restore`
+  ExecStopPost + module signal self-restore + supervisor watchdog.
 - Additional anemoi (nvme, power-cap, alerting) — separate SOWs.
 
 ## Regression Log
