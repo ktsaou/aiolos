@@ -1,0 +1,13 @@
+[package]
+name = "nvml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Level-1 tech: NVML GPU access (enumerate, temperature, per-fan set/restore). No curve/EMA/protocol
+# concepts — those belong to the SDK + the anemos.
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+nvml-wrapper = { workspace = true }

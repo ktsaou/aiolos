@@ -1,5 +1,14 @@
 [workspace]
-members = ["protocol", "aiolos", "anemoi/nvidia", "anemoi/asrock16-2t"]
+members = [
+    "protocol",        # level-2 wire types (aiolos + anemos share)
+    "anemos",          # level-2 anemos SDK (CLI/lifecycle/signals/logging/curve/EMA + traits)
+    "tech/ipmi",       # level-1 tech: inband IPMI transport
+    "tech/nvml",       # level-1 tech: NVML GPU access
+    "tech/hwmon",      # level-1 tech: hwmon sysfs sensors
+    "aiolos",          # orchestrator
+    "anemoi/nvidia",   # level-3 anemos
+    "anemoi/asrock16-2t",
+]
 resolver = "2"
 
 [workspace.package]

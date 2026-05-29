@@ -8,12 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-mod curve;
-mod damper;
-mod stdio;
-pub use curve::{Curve, CurveCache};
-pub use damper::Damper;
-pub use stdio::{install_shutdown_handlers, shutdown_requested, Event, StdinReader};
+// Wire types only. The module-side SDK (signal-aware stdin, curve, EMA, the run() driver and the
+// Anemos/Device traits) lives in the `anemos` crate; the orchestrator depends only on these types.
 
 /// Current wire protocol version (the `proto` field of `hello`).
 pub const PROTO_VERSION: u32 = 1;

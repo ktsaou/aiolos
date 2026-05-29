@@ -17,15 +17,16 @@
 //!   <mod>-<id>.signaled   created when the restore was triggered by SIGTERM/SIGINT (decision 17)
 //!   <mod>-<id>.lastinput  overwritten each apply with the max routed input temp (or -1)
 
-use protocol::{Applied, Detected, Event, FoundEntry, Inputs, Reading, Request, StdinReader};
+use anemos::{Event, StdinReader};
+use protocol::{Applied, Detected, FoundEntry, Inputs, Reading, Request};
 use serde_json::json;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn main() {
-    // Use the real module signal-restore path so the integration tests exercise it (decision 17).
-    protocol::install_shutdown_handlers();
+    // Use the real SDK signal-restore path so the integration tests exercise it (decision 17).
+    anemos::install_shutdown_handlers();
     let module = module_name();
     let mode = std::env::args().nth(1).unwrap_or_else(|| "detect".into());
     match mode.as_str() {

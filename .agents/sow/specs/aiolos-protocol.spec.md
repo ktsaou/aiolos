@@ -91,7 +91,7 @@ on the parent killing it. The handler must be async-signal-safe (set a flag only
 in normal code (device libraries like NVML/IPMI allocate and take locks, so restoring inside a
 signal handler can deadlock). Because std's blocking line reads swallow `EINTR`, modules read stdin
 non-blocking and `poll(2)` in short steps, checking the flag between polls. The shipped modules use
-`protocol::StdinReader` + `protocol::install_shutdown_handlers`, which implement exactly this.
+`anemos::StdinReader` + `anemos::install_shutdown_handlers`, which implement exactly this.
 
 ## Timing, failure, fail-safe
 - The orchestrator waits at most `timeout` (< heartbeat) for a response. No response in time →

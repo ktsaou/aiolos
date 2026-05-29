@@ -15,6 +15,7 @@ dependencies = [
 name = "aiolos"
 version = "0.1.0"
 dependencies = [
+ "anemos",
  "anyhow",
  "libc",
  "protocol",
@@ -28,20 +29,31 @@ dependencies = [
 name = "anemoi-asrock16-2t"
 version = "0.1.0"
 dependencies = [
+ "anemos",
  "anyhow",
- "libc",
- "protocol",
+ "hwmon",
+ "ipmi",
  "serde_json",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "anemoi-nvidia"
 version = "0.1.0"
 dependencies = [
+ "anemos",
  "anyhow",
- "nvml-wrapper",
+ "nvml",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "anemos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
  "protocol",
  "serde_json",
  "tracing",
@@ -108,10 +120,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "hwmon"
+version = "0.1.0"
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
+
+[[package]]
+name = "ipmi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+]
 
 [[package]]
 name = "itoa"
@@ -172,6 +196,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvml"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nvml-wrapper",
+ "tracing",
+]
+
+[[package]]
 name = "nvml-wrapper"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -219,7 +252,6 @@ dependencies = [
 name = "protocol"
 version = "0.1.0"
 dependencies = [
- "libc",
  "serde",
  "serde_json",
 ]

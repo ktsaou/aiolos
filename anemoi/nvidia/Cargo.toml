@@ -10,9 +10,8 @@ name = "nvidia"
 path = "src/main.rs"
 
 [dependencies]
-protocol = { path = "../../protocol" }
+anemos = { path = "../../anemos" }   # level-2 SDK (lifecycle/signals/logging/curve/EMA + traits)
+nvml = { path = "../../tech/nvml" }  # level-1 tech (NVML GPU access)
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-nvml-wrapper = { workspace = true }

@@ -52,7 +52,7 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
   itself; it never relies on the parent killing it. The handler is async-signal-safe (sets a flag
   only); the restore runs in normal code (NVML/IPMI allocate + lock → unsafe in a handler). Read
   stdin non-blocking + `poll(2)` in short steps checking the flag (std blocking reads swallow
-  `EINTR`). Use `protocol::StdinReader` + `protocol::install_shutdown_handlers` (they do exactly
+  `EINTR`). Use `anemos::StdinReader` + `anemos::install_shutdown_handlers` (they do exactly
   this) rather than hand-rolling.
 - **`restore` one-shot:** every module implements `<module> restore` — restore ALL its devices and
   exit, idempotently. Verb is uniform across anemoi so `aiolos restore` (systemd ExecStopPost) can
@@ -80,7 +80,7 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
 1. Re-read `aiolos-protocol.spec.md`.
 2. Confirm stdout carries only JSON; route all logs to stderr.
 3. Implement/verify detect (stable ids), apply (within timeout), shutdown + EOF + SIGTERM (device
-   restore), and the `restore` one-shot. Use `protocol::StdinReader` + `install_shutdown_handlers`.
+   restore), and the `restore` one-shot. Use `anemos::StdinReader` + `install_shutdown_handlers`.
 4. Test with a one-line stdin → one-line stdout harness and with the orchestrator's mock/timeout.
 
 ## Validation Checklist

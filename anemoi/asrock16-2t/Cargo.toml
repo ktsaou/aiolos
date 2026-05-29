@@ -10,9 +10,9 @@ name = "asrock16-2t"
 path = "src/main.rs"
 
 [dependencies]
-protocol = { path = "../../protocol" }
+anemos = { path = "../../anemos" }   # level-2 SDK (lifecycle/signals/logging/curve/EMA + traits)
+ipmi = { path = "../../tech/ipmi" }  # level-1 tech (inband IPMI transport)
+hwmon = { path = "../../tech/hwmon" } # level-1 tech (CPU temps via k10temp)
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-libc = { workspace = true }

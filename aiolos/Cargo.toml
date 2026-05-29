@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 protocol = { path = "../protocol" }
+# The orchestrator itself uses only `protocol` wire types; `anemos` is here so the test `mock` bin
+# (a stand-in anemos) can exercise the REAL signal-aware stdin reader from the SDK.
+anemos = { path = "../anemos" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

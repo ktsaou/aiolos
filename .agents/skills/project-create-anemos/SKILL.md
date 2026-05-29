@@ -16,11 +16,23 @@ Do not use for: changing the orchestrator core, or the protocol itself (that's a
 
 ## What a module IS
 - A single executable installed at `/opt/aiolos/bin/<name>`, launched by aiolos in three modes:
-  - `<name> detect` — long-running; answers `{"cmd":"detect"}` with the IDs it manages.
-  - `<name> run <ID>` — long-running, bound to one ID; answers `apply`/`shutdown`.
-  - `<name> restore` — one-shot; restore ALL devices it manages to safe/auto, then exit
-    (idempotent). Verb is uniform across anemoi so `aiolos restore` can call it agnostically.
-- It owns ALL device knowledge. aiolos only spawns it, ticks it, routes data, and renders status.
+  `<name> detect`, `<name> run <ID>`, `<name> restore` (one-shot; uniform verb so `aiolos restore`
+  calls it agnostically). It owns ALL device knowledge; aiolos stays agnostic.
+
+## Reuse the SDK — do NOT re-implement boilerplate (SOW-0003)
+Three reuse levels exist so a module carries only its device logic:
+1. **Level-1 tech crates** (`tech/ipmi`, `tech/nvml`, `tech/hwmon`, …): the underlying technologies.
+   Depend on the ones you need; add a new one for a new technology.
+2. **Level-2 `anemos` SDK**: owns the lifecycle (`anemos::run` — CLI dispatch, signals, logging,
+   the protocol stdio loops, the restore-on-shutdown/EOF/signal wiring), the signal-aware
+   `StdinReader`, the `Controller` (temp→duty: curve + EMA + deadband + 35% floor), and the
+   `Anemos`/`Device` traits. **All of this is inherited — never copy it.**
+3. **Level-3 (your module)**: implement `Anemos` (detect / open / restore_all) + `Device`
+   (apply / restore), and a `main()` of `anemos::run(ModuleInfo { .. }, MyAnemos::new())`.
+- A Rust anemos MUST use the SDK (zero boilerplate duplication). A non-Rust anemos speaks the raw
+  protocol directly (see `project-anemos-protocol`) — but prefer Rust + the SDK.
+- Model on `anemoi/nvidia` (single file) and `anemoi/asrock16-2t` (+ a `board.rs` for its IPMI OEM
+  commands). The CLI/signals/curve/EMA/protocol/restore behaviour is changed once, in `anemos`.
 
 ## Mandatory Knowledge (the contract — see project-anemos-protocol)
 - One line in (request), one line out (response). JSON only on stdout; logs to stderr.
@@ -30,7 +42,7 @@ Do not use for: changing the orchestrator core, or the protocol itself (that's a
 - `shutdown` OR stdin EOF OR **SIGTERM/SIGINT** → **restore the device to its safe/firmware/auto
   state, then exit.** The module is self-sufficient: it catches the signal itself (async-signal-safe
   flag → restore in normal code), never relying on the parent to kill it. In Rust, use
-  `protocol::StdinReader` + `protocol::install_shutdown_handlers` (non-blocking stdin + poll that
+  `anemos::StdinReader` + `anemos::install_shutdown_handlers` (non-blocking stdin + poll that
   wakes on the signal). Also implement the `restore` one-shot.
 - The module's controlled state must be more aggressive/safe than the device default.
 
@@ -40,45 +52,55 @@ Do not use for: changing the orchestrator core, or the protocol itself (that's a
    readings, IPMI/API/sysfs access, **fail-safe**, config/curve, acceptance criteria). Model it on
    `anemos-nvidia.spec.md` / `anemos-asrock16-2t.spec.md`.
 3. **Open a SOW** from `.agents/sow/SOW.template.md` for the work (it's non-trivial).
-4. **Implement the three modes** over the protocol. Put device-restore in ONE function called from
-   the shutdown handler, the EOF path, the SIGTERM/SIGINT path, and the `restore` one-shot. The
-   signal handler only sets a flag; the restore runs in normal code (device libs aren't
-   async-signal-safe). In Rust, `protocol::StdinReader::next_event` returns `Line`/`Shutdown`/`Eof`.
+4. **Implement the device logic only** (Rust): `impl Anemos` (`detect` → `Detected`; `open(id)` →
+   `Box<dyn Device>`; `restore_all`) + `impl Device` (`apply(inputs, ctrl)` → `Applied` using
+   `ctrl.duty(raw_temp)`; `restore`), and `fn main() -> ! { anemos::run(ModuleInfo { .. }, MyAnemos) }`
+   (use `run_with` to add an extra subcommand like asrock's `query`). The SDK supplies the lifecycle,
+   signals, logging, curve+EMA, and the restore wiring — you write NONE of that. Bring in the
+   level-1 tech crates you need; add a new `tech/<name>` crate for a new technology. (Non-Rust
+   module: speak the raw protocol per `project-anemos-protocol`, and restore on
+   shutdown/EOF/SIGTERM + a `restore` one-shot yourself.)
 5. **Config**: device IDs stable; curves/params in `/opt/aiolos/etc/<name>.*` (e.g. a JSON
    temp→duty curve). No secrets/IPs in committed defaults — operator config or `*.local.md`.
 6. **Register** it in `/opt/aiolos/etc/aiolos.conf` (one line; add `input=<other>` if it consumes
    another module's readings — aiolos relays the prior tick's readings into `apply.inputs`).
 7. **Test** (see below) before claiming done.
 
-## Minimal skeleton (language-agnostic — shell shown for clarity)
-```sh
-#!/bin/sh
-# logs MUST go to stderr; stdout is protocol-only
-mode="$1"; id="$2"
-emit() { printf '%s\n' "$1"; }          # one JSON line to stdout
-case "$mode" in
-  detect)
-    while IFS= read -r line; do
-      case "$line" in
-        *'"detect"'*) emit '{"found":[{"id":"thing0","type":"DEMO","name":"demo"}]}';;
-        *'"shutdown"'*) emit '{"status":"ok"}'; exit 0;;
-      esac
-    done; exit 0 ;;                       # stdin EOF -> nothing to restore in detect
-  run)
-    trap 'restore; exit 0' TERM INT       # fatal-signal restore where possible
-    while IFS= read -r line; do
-      case "$line" in
-        *'"apply"'*) act_on "$id";        # read device, apply curve, set output
-                     emit '{"status":"ok","readings":[{"type":"temp","label":"'"$id"'","temp":42,"pwm":50}]}';;
-        *'"shutdown"'*) restore; emit '{"status":"ok"}'; exit 0;;
-      esac
-    done
-    restore; exit 0 ;;                     # stdin EOF (aiolos died) -> RESTORE then exit
-  restore) restore; exit 0 ;;              # one-shot fail-safe (called by `aiolos restore`)
-esac
+## Minimal skeleton (Rust + the SDK — this is the whole module)
+```rust
+use anemos::{Anemos, Applied, Controller, Detected, Device, FoundEntry, Inputs, ModuleInfo, Reading};
+
+fn main() -> ! {
+    anemos::run(
+        ModuleInfo { name: "demo", curve_default_path: "/opt/aiolos/etc/demo.curve.json",
+                     curve_env_filename: "demo.curve.json" },
+        Demo,
+    )
+}
+
+struct Demo;
+impl Anemos for Demo {
+    fn detect(&mut self) -> Detected {
+        Detected::ok(vec![FoundEntry { id: "thing0".into(), kind: "DEMO".into(),
+                                       name: "demo".into(), extra: Default::default() }])
+    }
+    fn open(&mut self, id: &str) -> anyhow::Result<Box<dyn Device>> { Ok(Box::new(Dev::open(id)?)) }
+    fn restore_all(&mut self) { /* restore every device this module manages */ }
+}
+impl Device for Dev {
+    fn apply(&mut self, _inputs: Option<&Inputs>, ctrl: &mut Controller) -> Applied {
+        let temp = self.read_temp();                 // your tech crate
+        match ctrl.duty(temp).pct {                  // SDK: curve + EMA + deadband + 35% floor
+            Some(p) => { if let Err(e) = self.set(p) { self.restore_dev(); return Applied::error(e.to_string()); } }
+            None    => self.set_default(),           // empty curve -> firmware/auto
+        }
+        Applied::ok(vec![Reading::new("temp", "demo", serde_json::json!({ "temp": temp }))])
+    }
+    fn restore(&mut self) { /* hand the device back to firmware/auto */ }
+}
 ```
-(Rust modules: parse with serde_json into typed structs; same control flow. NVML →
-`nvml-wrapper`; IPMI → raw `/dev/ipmi0` ioctl or libfreeipmi FFI.)
+No CLI parsing, no signal handling, no stdin loop, no logging setup, no curve/EMA, no emit — the SDK
+owns all of it. The level-1 tech (`read_temp`/`set`/`restore_dev`) lives in a `tech/<name>` crate.
 
 ## Bad Practices
 - Writing logs/debug to stdout (corrupts the protocol).

@@ -1,0 +1,12 @@
+[package]
+name = "ipmi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Level-1 tech: generic inband IPMI transport over /dev/ipmi0 (raw netfn/cmd request -> response).
+# Device-/board-specific OEM commands live in the anemos that uses it, not here.
+[dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }

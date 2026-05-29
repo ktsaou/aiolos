@@ -1,0 +1,17 @@
+[package]
+name = "anemos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Level-2 anemos SDK: the boilerplate every anemos reuses (CLI/lifecycle driver, signal-aware
+# stdio, logging, curve, EMA/deadband Controller) + the Anemos/Device traits. Depends only on the
+# wire-type `protocol` crate; knows nothing about any specific device technology.
+[dependencies]
+protocol = { path = "../protocol" }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc = { workspace = true }

@@ -23,15 +23,27 @@ Authoritative design: [`DESIGN.md`](DESIGN.md). Contracts: `.agents/sow/specs/`.
 
 ## Layout
 
+Three reuse levels (SOW-0003) so an anemos carries only its device logic:
+
 ```
-aiolos/                  orchestrator crate (Rust)
-anemoi/nvidia/           nvidia anemos crate (Rust, nvml-wrapper)
-anemoi/asrock16-2t/      asrock anemos (Rust; IPMI via /dev/ipmi0 raw, or libfreeipmi FFI)
+protocol/                L2 wire types (aiolos + anemos share); JSON request/response
+anemos/                  L2 SDK: the run() lifecycle driver (CLI/signals/logging/protocol loops),
+                         signal-aware StdinReader, Curve/CurveCache/Damper, the Controller
+                         (temp→duty: curve+EMA+deadband, 35% floor), and the Anemos/Device traits
+tech/ipmi/               L1 tech: generic inband IPMI transport (/dev/ipmi0 raw netfn/cmd)
+tech/nvml/               L1 tech: NVML GPU access (enumerate, temp, per-fan set/restore)
+tech/hwmon/              L1 tech: generic hwmon (sysfs) temperature reader
+aiolos/                  the orchestrator (depends only on protocol wire types)
+anemoi/nvidia/           L3 anemos: Anemos/Device impl on anemos + nvml (~10-line main + logic)
+anemoi/asrock16-2t/      L3 anemos: anemos + ipmi + hwmon; board OEM commands in src/board.rs
 systemd/aiolos.service
 packaging/               install.sh / update.sh
 ```
-Install target `/opt/aiolos/`: binaries in `bin/`, config in `etc/` (registry `aiolos.conf`,
-per-module `*.curve.json`). Public repo: `github.com/ktsaou/aiolos`.
+A new anemos = implement the `Anemos`/`Device` traits + a thin `main()` calling `anemos::run`, and
+depend on the level-1 tech crates it needs. CLI/signals/logging/curve/EMA/protocol/restore are
+inherited from the SDK — changed once, in `anemos`, for every module. Install target `/opt/aiolos/`:
+binaries in `bin/`, config in `etc/` (registry `aiolos.conf`, per-module `*.curve.json`). Public
+repo: `github.com/ktsaou/aiolos`.
 
 ## Goals
 

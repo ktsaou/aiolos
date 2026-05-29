@@ -1,0 +1,10 @@
+[package]
+name = "hwmon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Level-1 tech: generic Linux hwmon (sysfs) sensor reader — read labelled temperatures from any
+# chip by name (e.g. "k10temp"). No std-external dependencies.
+[dependencies]
