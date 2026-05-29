@@ -71,7 +71,14 @@ Status: blocked (fill before execution)
    guard + monitored CPU-fan test; documented step-by-step with restore commands.
 
 ## Execution Log
-(none yet)
+- 2026-05-29: The **no-hardware subset was implemented under SOW-0001**: a `mock` anemos (aiolos
+  crate, test-only bin) with injectable behaviors (hang, partial-line flood, error, detect-set
+  change) plus 5 process-level integration tests in `aiolos/tests/orchestrator.rs` —
+  reconcile/tick/graceful-restore, hung-sibling isolation, partial-line-flood kill+respawn,
+  `input=` routing, hotplug add/remove — all green via `cargo test --workspace`. Protocol/curve/
+  config/IPMI-ABI unit tests also landed. **Remaining for this SOW:** the on-hardware manual
+  runbook (nvidia restore-on-exit; asrock claim/duty/release + 0xda readback + 0xcc-trap guard +
+  monitored CPU-fan test), idle-RSS measurement, and the `0xd6` rule re-check on the live BMC.
 
 ## Validation
 - CI subset green; isolation test proves a hung module cannot stall siblings.

@@ -29,10 +29,21 @@ Per-GPU fan control via NVML. One `run` instance per physical GPU, bound by GPU 
 - On GPU-lost (NVML error): respond `{"status":"error","error":"gpu lost"}`; the orchestrator
   will reconcile via the next `detect`.
 
+## Implementation note (binding)
+Rust via the `nvml-wrapper` crate (≥ 0.12.1; loads `libnvidia-ml.so.1` at runtime — no link-time
+dep, no raw FFI). Used: `Nvml::init`, `device_count`, `device_by_index`, `Device::uuid`/`name`/
+`num_fans`/`temperature(Gpu)`/`fan_speed`/`fan_speed_rpm`/`set_fan_speed`/`set_default_fan_speed`.
+Fans are set/restored **per fan index** (`0..num_fans`), not per GPU.
+
 ## Fail-safe
 On `shutdown` or stdin EOF: restore the GPU to firmware/default fan control
-(`SetDefaultFanSpeed`-equivalent) and exit. The configured curve must be more aggressive than
-firmware default so a failure degrades to the (safe, lazier) firmware curve.
+(`set_default_fan_speed` per fan) and exit. **Critical:** NVML manual fan control PERSISTS after
+the process exits — the driver does NOT auto-revert — so restore is mandatory and is also wired
+into the `Gpu` value's `Drop` (covers panic unwinding). A direct `SIGKILL` of the run process
+cannot restore in-process (same gap as the C `nvfd`); the orchestrator respawns the instance,
+which re-takes control. The configured curve must be more aggressive than firmware default so a
+failure degrades to the (safe, lazier) firmware curve. If the curve is missing/empty the module
+holds firmware/default control rather than commanding 0%.
 
 ## Config — `/opt/aiolos/etc/nvidia.curve.json`
 Temperature °C → fan %, linear-interpolated, clamped, hold-outside:

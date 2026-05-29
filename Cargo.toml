@@ -1,0 +1,29 @@
+[workspace]
+members = ["protocol", "aiolos", "anemoi/nvidia", "anemoi/asrock16-2t"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["aiolos contributors"]
+
+# Deliberately NO async runtime (tokio/async-std). The orchestrator is std-threads +
+# blocking I/O by design — see DESIGN.md §10 and AGENTS.md project overrides.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+nvml-wrapper = "0.12.1"
+
+# Lean release binaries (low-MB, single-digit-MB RSS goal).
+# NOTE: unwinding is intentionally kept (no panic="abort") so the anemoi's Drop-based
+# device restore fires on an unexpected panic — a fail-safe backstop. See anemoi *_restore.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

@@ -24,7 +24,10 @@ Status: design (no implementation yet). This is the authoritative contract; `DES
 ```json
 {"hello":{"proto":1,"name":"nvidia","modes":["detect","run"]}}
 ```
-`proto` is the protocol version (this spec = `1`). The orchestrator may reject mismatched majors.
+`proto` is the protocol version (this spec = `1`). A module MAY emit one `hello` line before its
+first response; the orchestrator consumes and skips any leading `hello` on both the detect and
+run streams, so emitting it is optional and never desyncs the stream. (The shipped `nvidia` and
+`asrock16-2t` modules do not emit `hello`.)
 
 ### detect (orchestrator → detect process; re-sent each detect cycle)
 ```json
@@ -37,12 +40,15 @@ Status: design (no implementation yet). This is the authoritative contract; `DES
 
 ### apply (orchestrator → run process; each heartbeat)
 ```json
-→ {"cmd":"apply","inputs":{"<peer-id>":{"temp":63}, "...":{}}}
+→ {"cmd":"apply","inputs":{"<peer-id>":[{"type":"temp","label":"GPU","temp":63}], "...":[]}}
 ← {"status":"ok","readings":[{"type":"temp","label":"CPU1","temp":37,"pwm":50,"rpm":900}]}
 ```
-- `inputs` is present only when the registry wires `input=<other-module>`; it carries the most
-  recent readings of that module's instances (keyed by their `id`), one heartbeat stale. Absent
-  or `{}` otherwise. The consumer decides how to use it.
+- `inputs` is present only when the registry wires `input=<other-module>`. It maps each peer
+  instance's `id` to **that instance's full `readings` array** (the same records the peer last
+  reported), one heartbeat stale. The orchestrator relays the readings **verbatim and
+  uninterpreted** — it does not pick "the temperature"; the consumer selects what it needs (e.g.
+  records with `"type":"temp"`). Absent when no `input=` is wired; the `inputs` key is omitted
+  entirely (never serialized as `null`).
 - Response: `status` ∈ {`ok`,`error`}. On `ok`, `readings` is an array of records; each record
   has a `type` (`temp`,`fan`,…) and `label`, plus arbitrary numeric/string fields
   (`temp`,`pwm`,`rpm`,…). On `error`, include `error:"<reason>"`; `readings` optional.

@@ -6,7 +6,10 @@
 > regulate airflow (fans) by temperature — but `aiolos` itself knows nothing about fans,
 > GPUs, or IPMI.
 
-Status: **DESIGN — pending review. No code yet.**
+Status: **IMPLEMENTED (SOW-0001).** Orchestrator + `nvidia` (NVML) + `asrock16-2t` (IPMI) built and
+unit/integration-tested off-hardware. On-hardware validation + cutover from the C `nvfd` remain
+operator-gated (see `.agents/sow/`). The authoritative contracts are the specs under
+`.agents/sow/specs/`; where this rationale doc and the specs differ, the specs win.
 
 ---
 
@@ -111,9 +114,11 @@ optional startup `hello`).
             {"id":"GPU-a17…","type":"GPU","name":"RTX PRO 6000"}]}
 ```
 
-**apply** (to a `run <ID>` process each heartbeat; `inputs` present only if `input=` wired):
+**apply** (to a `run <ID>` process each heartbeat; `inputs` present only if `input=` wired —
+each peer id maps to that peer's full readings array, relayed uninterpreted):
 ```json
-→ {"cmd":"apply","inputs":{"GPU-5f2…":{"temp":63},"GPU-a17…":{"temp":70}}}
+→ {"cmd":"apply","inputs":{"GPU-5f2…":[{"type":"temp","label":"GPU","temp":63}],
+                            "GPU-a17…":[{"type":"temp","label":"GPU","temp":70}]}}
 ← {"status":"ok","readings":[
      {"type":"temp","label":"CPU1","temp":37,"pwm":50,"rpm":900},
      {"type":"fan","label":"FAN3","pwm":60,"rpm":1900}]}
@@ -268,7 +273,7 @@ The protocol is language-agnostic; any anemos may be written in any language lat
 | 4 | nvidia curve | 0–80 °C → 0–100 % (as today) |
 | 5 | asrock curve | 40→40, 55→60, 65→80, 75→100 |
 | 6 | sensor set for asrock max | GPU(inputs) + CPU + MB + card-side + DIMM (exclude TEMP_LAN? it floors ~45 °C) |
-| 7 | status page bind | 127.0.0.1:<port> |
+| 7 | status page bind | `0.0.0.0:9876` (SOW-0001 decision; configurable, `127.0.0.1` to restrict) |
 
 ---
 

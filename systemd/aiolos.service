@@ -1,0 +1,31 @@
+[Unit]
+Description=Aiolos — agnostic fan/airflow orchestrator
+Documentation=https://github.com/ktsaou/aiolos
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/aiolos/bin/aiolos
+# aiolos and the anemoi require root: /dev/ipmi0 is root-only and NVML fan control needs root.
+User=root
+
+# aiolos logs to stderr (tracing). Capture both streams in the journal — do NOT send to /dev/null.
+StandardOutput=journal
+StandardError=journal
+# Dedicated journal namespace: view with `journalctl --namespace=aiolos [-f]`.
+LogNamespace=aiolos
+Environment=RUST_LOG=info
+
+Restart=on-failure
+RestartSec=5s
+
+# On stop, aiolos catches SIGTERM, tells every module to restore its device (BMC auto / firmware
+# fan control), waits for them, then exits. Give it room before systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# NOTE: do NOT add MemoryDenyWriteExecute — NVML/driver userspace may map W+X memory (same
+# constraint as the C nvfd unit). Other aggressive sandboxing can also block /dev/ipmi0 + NVML.
+
+[Install]
+WantedBy=multi-user.target

@@ -26,6 +26,14 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
 - **Messages:** `detect → {found:[{id,type,name,…}]}`; `apply{inputs?} → {status,readings:[…]}`
   or `{status:"error",error}`; `shutdown → {status:"ok"}`. `id`s from `detect` MUST be stable
   across re-detect and device drop/return (e.g. GPU UUID, never NVML index).
+- **`inputs` shape:** when present, `apply.inputs` maps each peer instance `id` to **that peer's
+  full readings array** (e.g. `{"GPU-…":[{"type":"temp","label":"GPU","temp":63}, …]}`). aiolos
+  relays them verbatim and uninterpreted — the consumer selects what it needs (typically the
+  `"type":"temp"` records). The `inputs` key is omitted entirely when no `input=` is wired (never
+  `null`). `Request::Apply.inputs` is `Option`, serialized with `skip_serializing_if`.
+- **`hello` is consumed by aiolos:** a module MAY emit one `hello` line at startup; the
+  orchestrator skips a leading `hello` on both streams, so it never desyncs. Emitting it is
+  optional (the shipped modules don't).
 - **Fail-safe:** on `shutdown` OR **stdin EOF**, a `run` instance MUST restore its device to
   firmware/auto-safe and exit. EOF covers aiolos dying. The controlled state must be more
   aggressive/safe than the device default so "module dies → firmware reclaims" is the safe direction.
