@@ -68,9 +68,14 @@ within the timeout — never wedging anything else.
 - **`nvidia`** — per-GPU onboard fan control via NVML (`nvml-wrapper`). One `run` instance per GPU,
   keyed by stable UUID. Restores firmware fan control on exit (NVML manual control persists
   otherwise).
+- **`nvme`** — NVMe SSD temperatures via sysfs. A **sensor-only** anemos: one `run` instance per
+  drive (keyed by stable serial), it reports per-drive temps and controls nothing. Routed into the
+  fan controller so hot disks raise the chassis fans; it lives in its own process because an NVMe
+  temp read can block on a wedged controller.
 - **`asrock16-2t`** — ASRockRack ROME2D16-2T chassis fans via **inband IPMI** (raw `/dev/ipmi0`
-  ioctls, zero extra deps). Driven by `max(GPU temps routed from nvidia, its own CPU temps via
-  k10temp)`. Releases to BMC auto control on exit, and whenever a temperature is indeterminable.
+  ioctls, zero extra deps). Driven by `max(GPU temps from nvidia, NVMe temps from nvme, its own CPU
+  temps via k10temp)`. Releases to BMC auto control on exit, and whenever a temperature is
+  indeterminable.
 
 In practice the two together hold a heavily-loaded dual-RTX-PRO-6000 box in the low-to-mid 60s °C at
 70–85% fan — with headroom to spare.
@@ -138,13 +143,15 @@ The systemd unit logs to a dedicated journal namespace (`journalctl --namespace=
 # detect_every=10           # hotplug re-detect period (s)
 # status_bind=0.0.0.0:9876  # read-only status page (127.0.0.1:9876 to restrict)
 
-# modules: `<binary> [input=<peer>]`
+# modules: `<binary> [input=<peer> ...]`
 nvidia
-asrock16-2t  input=nvidia   # chassis fans follow max(GPU temps from nvidia, own CPU sensors)
+nvme                                  # NVMe SSD temps (sensor-only; controls nothing)
+asrock16-2t  input=nvidia input=nvme  # chassis fans follow max(GPU, NVMe, own CPU sensors)
 ```
 
-`input=<peer>` wires one module's last readings into another's `apply` (one heartbeat stale); the
-orchestrator relays them verbatim and stays agnostic about what they mean.
+`input=<peer>` wires one module's last readings into another's `apply` (one heartbeat stale), keyed
+by `module:id` so the consumer can tell sources apart. Repeat it (or use a comma list) for multiple
+sources. The orchestrator relays them verbatim and stays agnostic about what they mean.
 
 **Curves** — `/opt/aiolos/etc/<module>.curve.json` (see above).
 
@@ -162,9 +169,11 @@ anemos/              the SDK: run() lifecycle driver (CLI, signals, logging, the
 tech/ipmi/           generic inband IPMI transport
 tech/nvml/           NVML GPU access
 tech/hwmon/          generic hwmon (sysfs) temperature reader
+tech/nvme/           NVMe enumeration + per-drive temperatures (sysfs)
 aiolos/              the orchestrator (depends only on protocol wire types)
 anemoi/nvidia/       a thin anemos: Anemos/Device on anemos + nvml
 anemoi/asrock16-2t/  a thin anemos: anemos + ipmi + hwmon (board OEM commands in src/board.rs)
+anemoi/nvme/         a sensor-only anemos: anemos + nvme (reports temps, controls nothing)
 ```
 
 ### Writing a new anemos
@@ -179,8 +188,9 @@ use anemos::{Anemos, Applied, Controller, Detected, Device, FoundEntry, Inputs, 
 fn main() -> ! {
     anemos::run(
         ModuleInfo { name: "demo",
-                     curve_default_path: "/opt/aiolos/etc/demo.curve.json",
-                     curve_env_filename: "demo.curve.json" },
+                     // `Some(path)` for a fan/curve module; `None` for a sensor-only module.
+                     curve_default_path: Some("/opt/aiolos/etc/demo.curve.json"),
+                     curve_env_filename: Some("demo.curve.json") },
         Demo,
     )
 }

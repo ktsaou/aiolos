@@ -14,11 +14,17 @@ directives. Global lines: a bare `key=value` whose first token contains `=`.
 ```
 # globals (defaults): tick=3, timeout=2, detect_every=10, status_bind=0.0.0.0:9876
 nvidia
-asrock16-2t  input=nvidia
+nvme
+asrock16-2t  input=nvidia input=nvme
 ```
 - `input=<module>`: relay that module's instances' last `readings` arrays into this module's
-  `apply.inputs` (keyed by peer id). Unknown module directives are preserved but ignored
-  (forward-compat). Unknown globals are warned + ignored.
+  `apply.inputs` (keyed by `module:id`). **Multiple sources** are allowed — repeat `input=` and/or
+  use a comma list (`input=nvidia input=nvme` ≡ `input=nvidia,nvme`); order preserved, duplicates
+  dropped. Unknown module directives are preserved but ignored (forward-compat). Unknown globals are
+  warned + ignored.
+- A **module name MUST NOT contain `:`** (the blackboard/routing key is `module:id`, so a `:` in the
+  name would make source prefix-matching ambiguous). A module line with a `:` in its name is
+  rejected at parse time with a warning and does not run.
 - Globals: `tick`, `timeout`, `detect_every` (integer seconds), `status_bind` (`host:port`).
   Invariant `0 < timeout < tick` is enforced by clamping (and `tick` is floored to 2s so an
   integer `timeout` can be smaller).
@@ -74,10 +80,12 @@ asrock16-2t  input=nvidia
   Keeps the unit config-agnostic (no module names in the unit file).
 
 ## Data routing (blackboard)
-The orchestrator keeps each instance's last `readings`. For a module configured `input=X`, it
-includes X's instances' readings (keyed by id) as `inputs` in this module's next `apply`. Values
-are relayed verbatim and uninterpreted (orchestrator stays agnostic). Routing uses the previous
-tick's values (one heartbeat stale) to keep instances order-independent within a tick.
+The orchestrator keeps each instance's last `readings`. For a module configured `input=X [Y …]`, it
+includes every named source's instances' readings (keyed by `module:id`, so the consumer can
+attribute each reading to its source module and keys never collide across sources) as `inputs` in
+this module's next `apply`. Values are relayed verbatim and uninterpreted (orchestrator stays
+agnostic). Routing uses the previous tick's values (one heartbeat stale) to keep instances
+order-independent within a tick.
 
 ## State & status web page
 Holds: registry, per-module detect results, per-instance last readings + status + last error +

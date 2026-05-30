@@ -49,6 +49,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "anemoi-nvme"
+version = "0.1.0"
+dependencies = [
+ "anemos",
+ "anyhow",
+ "nvme",
+ "serde_json",
+]
+
+[[package]]
 name = "anemos"
 version = "0.1.0"
 dependencies = [
@@ -194,6 +204,10 @@ checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys",
 ]
+
+[[package]]
+name = "nvme"
+version = "0.1.0"
 
 [[package]]
 name = "nvml"

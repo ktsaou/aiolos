@@ -36,7 +36,7 @@ echo "--- creating directories ---"
 run sudo mkdir -p "${BIN}" "${ETC}"
 
 echo "--- installing binaries (overwrite) ---"
-for b in aiolos nvidia asrock16-2t; do
+for b in aiolos nvidia asrock16-2t nvme; do
   run sudo install -m 0755 "target/release/${b}" "${BIN}/${b}"
 done
 

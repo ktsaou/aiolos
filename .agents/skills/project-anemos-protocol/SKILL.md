@@ -36,11 +36,16 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
   orchestrator's last-resort backstop, surfaced as "unresponsive/crashed".)
 - **Init device libraries ONCE per process** (NVML/IPMI open fds); re-initialising every detect
   cycle leaks fds → EMFILE → the module silently stops working.
-- **`inputs` shape:** when present, `apply.inputs` maps each peer instance `id` to **that peer's
-  full readings array** (e.g. `{"GPU-…":[{"type":"temp","label":"GPU","temp":63}, …]}`). aiolos
-  relays them verbatim and uninterpreted — the consumer selects what it needs (typically the
-  `"type":"temp"` records). The `inputs` key is omitted entirely when no `input=` is wired (never
-  `null`). `Request::Apply.inputs` is `Option`, serialized with `skip_serializing_if`.
+- **`inputs` shape:** when present, `apply.inputs` maps each source instance's **`module:id`** key
+  to **that peer's full readings array** (e.g.
+  `{"nvidia:GPU-…":[{"type":"temp","label":"GPU","temp":63}], "nvme:<serial>":[{"type":"temp","label":"Composite","temp":43}]}`).
+  Keying by `module:id` (not the bare id) lets the consumer attribute each reading to its **source
+  module** and keeps keys unique across sources. A consumer may wire **multiple** sources (repeat
+  `input=` or comma-list, e.g. `input=nvidia input=nvme`); all are merged into one `inputs` map.
+  aiolos relays verbatim and uninterpreted — the consumer selects what it needs (typically the
+  `"type":"temp"` records, optionally filtered by the `module:` key prefix). The `inputs` key is
+  omitted entirely when no `input=` is wired (never `null`). `Request::Apply.inputs` is `Option`,
+  serialized with `skip_serializing_if`.
 - **`hello` is consumed by aiolos:** a module MAY emit one `hello` line at startup; the
   orchestrator skips a leading `hello` on both streams, so it never desyncs. Emitting it is
   optional (the shipped modules don't).

@@ -74,11 +74,13 @@ module concerns.
 
 ```
 nvidia
-asrock16-2t  input=nvidia        # feed nvidia's reported temps into this anemos
+nvme                             # NVMe SSD temps (sensor-only; controls nothing)
+asrock16-2t  input=nvidia input=nvme   # feed GPU + NVMe temps into this anemos
 ```
 
 Directives (extensible):
-- `input=<anemos>` — aiolos relays the named anemos's last readings into this anemos's `apply` request.
+- `input=<anemos>` — aiolos relays the named anemos's last readings into this anemos's `apply`
+  request (keyed by `module:id`). Repeatable and/or comma-listed for multiple sources.
 - (future) `args=…`, `every=<sec>`, `timeout=<sec>` per-anemos overrides.
 
 Module binaries live in `/opt/aiolos/bin/<name>`. Per-module config (curves, etc.) in
@@ -136,10 +138,11 @@ The `run` instance knows its own ID from argv, so `apply` need not repeat it.
 ## 6. Data routing (`input=`)
 
 aiolos keeps a **blackboard**: the last `readings` reported by every instance. For an anemos
-configured `input=X`, aiolos extracts X's instances' readings and includes them as `inputs` in
-this anemos's next `apply`. aiolos does **not** interpret the values — it only relays. The
-consumer decides how to use them (max, per-zone, …). This is how GPU temps reach the fan module
-while aiolos stays agnostic.
+configured `input=X [Y …]`, aiolos extracts every named source's instances' readings and includes
+them as `inputs` (keyed by `module:id`, so the consumer can attribute each reading to its source
+module) in this anemos's next `apply`. aiolos does **not** interpret the values — it only relays.
+The consumer decides how to use them (max, per-zone, per-source, …). This is how GPU and NVMe temps
+reach the fan module while aiolos stays agnostic.
 
 Timing: `inputs` carry the **previous tick's** values (one heartbeat stale) — irrelevant for
 thermal mass, and it keeps every instance independent within a tick (no ordering dependency).
@@ -196,6 +199,7 @@ instances are healthy, recent errors. Small, dependency-light (hand-rolled or `t
   anemoi/
     nvidia/                       # nvidia anemos crate (Rust)
     asrock16-2t/                  # asrock16-2t anemos (Rust; IPMI via /dev/ipmi0 or libfreeipmi FFI)
+    nvme/                         # nvme anemos (Rust; sensor-only NVMe temps via sysfs)
   systemd/aiolos.service
   packaging/                      # install.sh / update.sh
 
@@ -203,6 +207,7 @@ instances are healthy, recent errors. Small, dependency-light (hand-rolled or `t
   bin/aiolos
   bin/nvidia
   bin/asrock16-2t
+  bin/nvme                        # sensor-only (no curve file)
   etc/aiolos.conf                 # registry
   etc/nvidia.curve.json           # per-module config
   etc/asrock16-2t.curve.json
@@ -240,9 +245,10 @@ The protocol is language-agnostic; any anemos may be written in any language lat
 ## 12. Anemos: `asrock16-2t` (ASRockRack ROME2D16-2T, BMC AST2500, fw ≥ 3.03)
 
 - **detect:** emit **one** ID (the board).
-- **input=nvidia:** receives GPU temps from aiolos.
-- **run <BOARD>:** driving_temp = `max(`GPU temps from inputs, own CPU temps, own MB/board
-  temps`)`; interpolate `etc/asrock16-2t.curve.json`; set all 8 board fans; report readings.
+- **input=nvidia input=nvme:** receives GPU + NVMe temps from aiolos (attributed by `module:id`).
+- **run <BOARD>:** driving_temp = `max(`GPU + NVMe temps from inputs, own CPU temps, own MB/board
+  temps`)`; interpolate `etc/asrock16-2t.curve.json`; set all 8 board fans; report readings
+  (GPU and NVMe reported under distinct `temp` labels).
 - **CPU fans are real:** FAN1/FAN2 are large **Noctua CPU coolers** (low RPM by size), FAN3–FAN8
   are 120 mm case fans. User decision: all fans follow the global max (CPU fans speeding up on GPU
   heat is desirable). Default **uniform** duty = curve(driving_temp). *(Open: optional per-fan
@@ -294,5 +300,7 @@ an optional `"sensitivity"` knob (EMA α, 0–1) for noise smoothing. Default (b
 ## 15. Extensibility
 
 New behaviour = new anemos binary, any language, that implements detect/apply/shutdown over the
-line protocol and is added to the registry. Examples: a `nvme` anemos, a `power-cap` anemos, an
-`alert` anemos that emails on threshold. aiolos needs no changes.
+line protocol and is added to the registry. The `nvme` sensor anemos (SOW-0004) is a worked example
+of a **sensor-only** module — it reports temperatures and controls nothing, routed into the fan
+controller via `input=nvme`. Further examples: a `power-cap` anemos, an `alert` anemos that emails
+on threshold. aiolos needs no changes.

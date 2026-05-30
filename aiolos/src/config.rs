@@ -3,7 +3,8 @@
 //! File format (one directive per line; blank lines and `#` comments ignored):
 //! - a `key=value` line sets a global: `tick=`, `timeout=`, `detect_every=` (seconds),
 //!   `status_bind=` (host:port).
-//! - any other line is a module line (`<name> [input=<peer>]`) — see `registry`.
+//! - any other line is a module line (`<name> [input=<peer> ...]`) — see `registry`. A module
+//!   name MUST NOT contain `:` (the blackboard/routing key is `module:id`); such a line is rejected.
 //!
 //! Paths are overridable via env for testing/packaging:
 //! - `AIOLOS_CONF`    — config file path (default `/opt/aiolos/etc/aiolos.conf`)
@@ -89,7 +90,14 @@ impl Config {
                 continue;
             }
 
-            cfg.registry.push(parse_module_line(line));
+            let entry = parse_module_line(line);
+            // A module name with `:` would make the `module:id` routing key ambiguous (a source
+            // prefix could match the wrong module). Reject the line loudly rather than route wrong.
+            if entry.module_name.contains(':') {
+                warn!(module = %entry.module_name, "module name contains ':' (breaks input routing keys) — ignoring this module line");
+                continue;
+            }
+            cfg.registry.push(entry);
         }
 
         // Invariant: 0 < timeout < tick. Clamp forgivingly rather than refusing to boot.
@@ -176,7 +184,7 @@ asrock16-2t  input=nvidia   # board fans follow GPU temps
         assert_eq!(c.status_bind, "127.0.0.1:9000");
         assert_eq!(c.registry.len(), 2);
         assert_eq!(c.registry[0].module_name, "nvidia");
-        assert_eq!(c.registry[1].input.as_deref(), Some("nvidia"));
+        assert_eq!(c.registry[1].inputs, vec!["nvidia".to_string()]);
     }
 
     #[test]
@@ -215,5 +223,18 @@ asrock16-2t  input=nvidia   # board fans follow GPU temps
         let c = Config::parse("asrock16-2t").unwrap();
         assert_eq!(c.registry.len(), 1);
         assert_eq!(c.registry[0].module_name, "asrock16-2t");
+    }
+
+    #[test]
+    fn module_name_with_colon_is_rejected() {
+        // A ':' in a module name would make the `module:id` routing key ambiguous — the line is
+        // dropped (with a warning), so it never participates in routing.
+        let c = Config::parse("nvidia\nbad:name input=nvidia\nnvme").unwrap();
+        let names: Vec<&str> = c.registry.iter().map(|e| e.module_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["nvidia", "nvme"],
+            "the ':' module line is rejected"
+        );
     }
 }

@@ -41,10 +41,13 @@ pub trait Device {
 pub struct ModuleInfo {
     /// Module name, e.g. "nvidia" (logging only).
     pub name: &'static str,
-    /// Absolute default curve path, e.g. "/opt/aiolos/etc/nvidia.curve.json".
-    pub curve_default_path: &'static str,
+    /// Absolute default curve path, e.g. "/opt/aiolos/etc/nvidia.curve.json". `None` marks a
+    /// **sensor-only** module: it controls no device, needs no curve, and its `apply` ignores the
+    /// controller (e.g. `nvme`, which only reports temperatures for routing).
+    pub curve_default_path: Option<&'static str>,
     /// Curve filename under `$AIOLOS_ETC_DIR` when set (tests/dev), e.g. "nvidia.curve.json".
-    pub curve_env_filename: &'static str,
+    /// `None` for a sensor-only module.
+    pub curve_env_filename: Option<&'static str>,
 }
 
 /// An optional extra one-shot subcommand a module registers (e.g. asrock `query`); receives the
@@ -125,8 +128,14 @@ fn detect_loop<A: Anemos>(anemos: &mut A) {
 }
 
 fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) {
-    let mut ctrl = Controller::new(curve_path(info));
-    if ctrl.curve_is_empty() {
+    // A sensor-only module (no curve configured) controls no device and ignores the controller in
+    // `apply`; only a control module warns when its curve is missing/empty (device stays on
+    // firmware/auto until a valid curve exists). The controller is constructed regardless (cheap)
+    // so the `Device::apply(ctrl)` contract is uniform.
+    let curve = curve_path(info);
+    let curve_configured = curve.is_some();
+    let mut ctrl = Controller::new(curve.unwrap_or_default());
+    if curve_configured && ctrl.curve_is_empty() {
         error!(module = info.name, path=%ctrl.path(), "curve missing/empty — device stays on firmware/auto until a valid curve exists");
     }
 
@@ -207,10 +216,15 @@ fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) {
     // handle's Drop).
 }
 
-fn curve_path(info: &ModuleInfo) -> String {
-    std::env::var("AIOLOS_ETC_DIR")
-        .map(|d| format!("{d}/{}", info.curve_env_filename))
-        .unwrap_or_else(|_| info.curve_default_path.to_string())
+/// Resolve the curve path, or `None` for a sensor-only module (no curve configured). The env
+/// override (`$AIOLOS_ETC_DIR/<filename>`) applies only when both the dir and a filename exist.
+fn curve_path(info: &ModuleInfo) -> Option<String> {
+    let default = info.curve_default_path?;
+    let resolved = match (std::env::var("AIOLOS_ETC_DIR"), info.curve_env_filename) {
+        (Ok(dir), Some(filename)) => format!("{dir}/{filename}"),
+        _ => default.to_string(),
+    };
+    Some(resolved)
 }
 
 fn emit_line(line: serde_json::Result<String>) {
@@ -232,4 +246,36 @@ fn init_logging() {
         )
         .with_target(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curve_path_is_none_for_a_sensor_only_module() {
+        let info = ModuleInfo {
+            name: "nvme",
+            curve_default_path: None,
+            curve_env_filename: None,
+        };
+        assert_eq!(
+            curve_path(&info),
+            None,
+            "a sensor-only module (curve = None) has no curve path"
+        );
+    }
+
+    #[test]
+    fn curve_path_resolves_for_a_curved_module() {
+        let info = ModuleInfo {
+            name: "nvidia",
+            curve_default_path: Some("/opt/aiolos/etc/nvidia.curve.json"),
+            curve_env_filename: Some("nvidia.curve.json"),
+        };
+        // Resolves to the default path, or `$AIOLOS_ETC_DIR/<filename>` if that env is set — either
+        // way it ends with the curve filename.
+        let p = curve_path(&info).expect("a curved module resolves a path");
+        assert!(p.ends_with("nvidia.curve.json"), "got {p}");
+    }
 }

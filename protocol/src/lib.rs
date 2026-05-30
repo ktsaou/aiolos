@@ -34,11 +34,13 @@ pub enum Request {
     Shutdown,
 }
 
-/// Readings relayed from another module's instances, keyed by that peer's `id`.
+/// Readings relayed from source modules' instances, keyed by `module:id` (the source module name
+/// and the peer instance id), so a consumer wired to multiple `input=` sources can attribute each
+/// reading to its source module and keys never collide across sources.
 ///
 /// Each peer instance reports a *list* of readings (temp, fan, …); aiolos relays the whole list
-/// verbatim and uninterpreted (it never picks "the temperature" — the consumer decides). This
-/// mirrors the protocol spec's normative text ("the most recent readings … keyed by their id").
+/// verbatim and uninterpreted (it never picks "the temperature" — the consumer decides, optionally
+/// filtering by the `module:` key prefix). Mirrors the protocol spec's normative text.
 pub type Inputs = HashMap<String, Vec<Reading>>;
 
 // ---------------------------------------------------------------------------

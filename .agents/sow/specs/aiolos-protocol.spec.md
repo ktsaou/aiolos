@@ -61,17 +61,21 @@ last-resort backstop only.
 
 ### apply (orchestrator → run process; each heartbeat)
 ```json
-→ {"cmd":"apply","inputs":{"<peer-id>":[{"type":"temp","label":"GPU","temp":63}], "...":[]}}
+→ {"cmd":"apply","inputs":{"nvidia:<gpu-uuid>":[{"type":"temp","label":"GPU","temp":63}],
+                           "nvme:<serial>":[{"type":"temp","label":"Composite","temp":43}]}}
 ← {"status":"ok","readings":[{"type":"temp","label":"CPU1","temp":37,"pwm":50,"rpm":900}]}
 ← {"status":"error","error":"device read failed"}        // transient; instance kept, retried
 ← {"status":"fatal","error":"GPU unsupported"}           // long-backoff respawn
 ```
-- `inputs` is present only when the registry wires `input=<other-module>`. It maps each peer
-  instance's `id` to **that instance's full `readings` array** (the same records the peer last
-  reported), one heartbeat stale. The orchestrator relays the readings **verbatim and
-  uninterpreted** — it does not pick "the temperature"; the consumer selects what it needs (e.g.
-  records with `"type":"temp"`). Absent when no `input=` is wired; the `inputs` key is omitted
-  entirely (never serialized as `null`).
+- `inputs` is present only when the registry wires `input=<module>` (one or more sources — repeat
+  `input=` or use a comma list). It maps each source instance's **`module:id`** key to **that
+  instance's full `readings` array** (the same records the peer last reported), one heartbeat stale.
+  Keying by `module:id` (not the bare id) lets the consumer attribute each reading to its **source
+  module** (e.g. tell `nvidia:*` GPU temps from `nvme:*` disk temps) and guarantees keys never
+  collide across sources. The orchestrator relays the readings **verbatim and uninterpreted** — it
+  does not pick "the temperature"; the consumer selects what it needs (e.g. records with
+  `"type":"temp"`, optionally filtered by the `module:` key prefix). Absent when no `input=` is
+  wired; the `inputs` key is omitted entirely (never serialized as `null`).
 - On `ok`, `readings` is an array of records; each has a `type` (`temp`,`fan`,…) and `label`, plus
   arbitrary numeric/string fields (`temp`,`pwm`,`rpm`,…).
 - The run process knows its own `id` from argv; `apply` does not repeat it.

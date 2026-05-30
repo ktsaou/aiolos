@@ -89,11 +89,11 @@ fn main() -> Result<()> {
 
     install_signal_handlers();
 
-    // module_name -> input module (for routing).
-    let input_map: HashMap<String, Option<String>> = cfg
+    // module_name -> its input source modules (for routing).
+    let input_map: HashMap<String, Vec<String>> = cfg
         .registry
         .iter()
-        .map(|e| (e.module_name.clone(), e.input.clone()))
+        .map(|e| (e.module_name.clone(), e.inputs.clone()))
         .collect();
 
     // Supervisor per module, tracked so the watchdog can respawn one whose thread dies (panics).
@@ -247,7 +247,7 @@ type InputsMap = HashMap<String, Option<Inputs>>;
 /// deadline, then update state + blackboard. No instance waits on another.
 fn heartbeat(
     state: &Arc<RwLock<AppState>>,
-    input_map: &HashMap<String, Option<String>>,
+    input_map: &HashMap<String, Vec<String>>,
     timeout: Duration,
     tick_count: u64,
 ) {
@@ -338,34 +338,37 @@ fn apply_results(s: &mut AppState, results: Vec<(String, TickResult)>, tick_coun
     s.tick_count = tick_count;
 }
 
-/// For each instance, if its module has `input=<peer>`, gather that peer's instances' last
-/// readings (keyed by peer id) from the blackboard. Uninterpreted, one heartbeat stale.
+/// For each instance, if its module has `input=<peer...>`, gather every named peer's instances'
+/// last readings from the blackboard into this module's `apply.inputs`. Keyed by the full
+/// `module:id` blackboard key (not the bare peer id) so the consumer can attribute each reading to
+/// its SOURCE MODULE (e.g. tell GPU temps from NVMe temps) and so keys never collide across
+/// sources. Uninterpreted, one heartbeat stale.
 fn build_inputs(
     state: &AppState,
-    input_map: &HashMap<String, Option<String>>,
+    input_map: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, Option<Inputs>> {
     let mut out = HashMap::with_capacity(state.instances.len());
     for (key, entry) in &state.instances {
-        let inputs = match input_map.get(&entry.module_name) {
-            Some(Some(src)) => {
-                let prefix = format!("{src}:");
-                let mut m: Inputs = HashMap::new();
-                for (bkey, readings) in &state.blackboard {
-                    if let Some(peer_id) = bkey.strip_prefix(&prefix) {
-                        if !readings.is_empty() {
-                            m.insert(peer_id.to_string(), readings.clone());
-                        }
-                    }
-                }
-                if m.is_empty() {
-                    None
-                } else {
-                    Some(m)
+        let sources = match input_map.get(&entry.module_name) {
+            Some(srcs) if !srcs.is_empty() => srcs,
+            _ => {
+                out.insert(key.clone(), None);
+                continue;
+            }
+        };
+        let mut m: Inputs = HashMap::new();
+        for src in sources {
+            let prefix = format!("{src}:");
+            for (bkey, readings) in &state.blackboard {
+                // The `:` delimiter prevents typical prefix collisions (source "nv" does not match
+                // "nvme:..."); module names are constrained not to contain `:`. Insert under the
+                // full `module:id` key.
+                if bkey.starts_with(&prefix) && !readings.is_empty() {
+                    m.insert(bkey.clone(), readings.clone());
                 }
             }
-            _ => None,
-        };
-        out.insert(key.clone(), inputs);
+        }
+        out.insert(key.clone(), if m.is_empty() { None } else { Some(m) });
     }
     out
 }
@@ -530,6 +533,120 @@ mod tests {
             !s.blackboard.contains_key("mod:ghost"),
             "a removed instance must NOT get a (resurrected) blackboard entry"
         );
+    }
+
+    #[test]
+    fn build_inputs_merges_multiple_sources_keyed_by_module_id() {
+        // Multi-input routing: a consumer wired `input=nvidia input=nvme` must receive BOTH
+        // sources' readings, keyed by the full `module:id` (so it can attribute source), and must
+        // NOT receive an unrelated module's readings.
+        use protocol::Reading;
+        use serde_json::json;
+
+        let mut s = AppState::default();
+        let (tx, _rx) = mpsc::channel();
+        s.instances.insert(
+            "asrock16-2t:board".to_string(),
+            InstanceEntry {
+                module_name: "asrock16-2t".into(),
+                id: "board".into(),
+                name: "board".into(),
+                last_status: "ok".into(),
+                last_error: None,
+                last_readings: Vec::new(),
+                restart_count: 0,
+                last_seen_tick: 0,
+                cmd_tx: tx,
+                stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            },
+        );
+        s.blackboard.insert(
+            "nvidia:GPU-1".into(),
+            vec![Reading::new("temp", "GPU", json!({"temp": 63}))],
+        );
+        s.blackboard.insert(
+            "nvme:SER-A".into(),
+            vec![Reading::new("temp", "Composite", json!({"temp": 40}))],
+        );
+        s.blackboard.insert(
+            "nvme:SER-B".into(),
+            vec![Reading::new("temp", "Composite", json!({"temp": 44}))],
+        );
+        // Unrelated module — must NOT be routed to asrock.
+        s.blackboard.insert(
+            "other:x".into(),
+            vec![Reading::new("temp", "x", json!({"temp": 99}))],
+        );
+
+        let mut input_map: HashMap<String, Vec<String>> = HashMap::new();
+        input_map.insert("asrock16-2t".into(), vec!["nvidia".into(), "nvme".into()]);
+
+        let out = build_inputs(&s, &input_map);
+        let inputs = out
+            .get("asrock16-2t:board")
+            .expect("consumer present")
+            .as_ref()
+            .expect("inputs routed");
+        assert_eq!(inputs.len(), 3, "both sources merged (1 GPU + 2 NVMe)");
+        assert!(inputs.contains_key("nvidia:GPU-1"), "keyed by module:id");
+        assert!(inputs.contains_key("nvme:SER-A"));
+        assert!(inputs.contains_key("nvme:SER-B"));
+        assert!(
+            !inputs.contains_key("other:x"),
+            "unwired module must not be routed"
+        );
+    }
+
+    #[test]
+    fn build_inputs_none_when_no_source_readings_and_skips_empty() {
+        use protocol::Reading;
+        use serde_json::json;
+
+        // A consumer instance wired to `sources`, with an empty blackboard to start.
+        fn consumer(sources: Vec<String>) -> (AppState, HashMap<String, Vec<String>>) {
+            let mut s = AppState::default();
+            let (tx, _rx) = mpsc::channel();
+            s.instances.insert(
+                "asrock16-2t:board".to_string(),
+                InstanceEntry {
+                    module_name: "asrock16-2t".into(),
+                    id: "board".into(),
+                    name: "board".into(),
+                    last_status: "ok".into(),
+                    last_error: None,
+                    last_readings: Vec::new(),
+                    restart_count: 0,
+                    last_seen_tick: 0,
+                    cmd_tx: tx,
+                    stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+                },
+            );
+            let mut map = HashMap::new();
+            map.insert("asrock16-2t".to_string(), sources);
+            (s, map)
+        }
+
+        // (a) sources wired but blackboard empty -> None (the `inputs` key is omitted, not `{}`).
+        let (s, map) = consumer(vec!["nvidia".into(), "nvme".into()]);
+        assert!(build_inputs(&s, &map)["asrock16-2t:board"].is_none());
+
+        // (b) two sources, only one has readings -> only the present source is routed.
+        let (mut s, map) = consumer(vec!["nvidia".into(), "nvme".into()]);
+        s.blackboard.insert(
+            "nvidia:GPU-1".into(),
+            vec![Reading::new("temp", "GPU", json!({"temp": 70}))],
+        );
+        let got = build_inputs(&s, &map);
+        let inputs = got["asrock16-2t:board"]
+            .as_ref()
+            .expect("the present source must route");
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs.contains_key("nvidia:GPU-1"));
+
+        // (c) a source instance with an EMPTY readings list is skipped (never routed as empty).
+        let (mut s, map) = consumer(vec!["nvme".into()]);
+        s.blackboard.insert("nvme:SER-A".into(), Vec::new());
+        assert!(build_inputs(&s, &map)["asrock16-2t:board"].is_none());
     }
 
     #[test]

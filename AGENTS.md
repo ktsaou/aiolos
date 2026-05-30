@@ -14,8 +14,9 @@
 - **anemoi** — autonomous module binaries (any language) implementing the protocol: `detect`
   (report the IDs they manage) and `run <ID>` (act each tick, report readings).
   - `nvidia` — per-GPU onboard fan control via NVML.
+  - `nvme` — sensor-only NVMe SSD temperatures via sysfs (controls nothing; routed into fan modules).
   - `asrock16-2t` — ASRockRack ROME2D16-2T board fans via IPMI (`/dev/ipmi0`), driven by GPU
-    temps routed from `nvidia` plus its own CPU/board sensors.
+    temps routed from `nvidia`, NVMe temps from `nvme`, plus its own CPU/board sensors.
 - Process isolation is the core guarantee: each module instance is its own OS process, so a hung
   or lost device can never stall the orchestrator or sibling modules.
 
@@ -33,9 +34,11 @@ anemos/                  L2 SDK: the run() lifecycle driver (CLI/signals/logging
 tech/ipmi/               L1 tech: generic inband IPMI transport (/dev/ipmi0 raw netfn/cmd)
 tech/nvml/               L1 tech: NVML GPU access (enumerate, temp, per-fan set/restore)
 tech/hwmon/              L1 tech: generic hwmon (sysfs) temperature reader
+tech/nvme/               L1 tech: NVMe enumeration (serial) + per-drive temps (sysfs)
 aiolos/                  the orchestrator (depends only on protocol wire types)
 anemoi/nvidia/           L3 anemos: Anemos/Device impl on anemos + nvml (~10-line main + logic)
 anemoi/asrock16-2t/      L3 anemos: anemos + ipmi + hwmon; board OEM commands in src/board.rs
+anemoi/nvme/             L3 anemos: sensor-only NVMe temps (anemos + nvme); no curve, no control
 systemd/aiolos.service
 packaging/               install.sh / update.sh
 ```

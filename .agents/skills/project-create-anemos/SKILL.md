@@ -72,8 +72,8 @@ use anemos::{Anemos, Applied, Controller, Detected, Device, FoundEntry, Inputs, 
 
 fn main() -> ! {
     anemos::run(
-        ModuleInfo { name: "demo", curve_default_path: "/opt/aiolos/etc/demo.curve.json",
-                     curve_env_filename: "demo.curve.json" },
+        ModuleInfo { name: "demo", curve_default_path: Some("/opt/aiolos/etc/demo.curve.json"),
+                     curve_env_filename: Some("demo.curve.json") }, // None,None = sensor-only
         Demo,
     )
 }
@@ -101,6 +101,16 @@ impl Device for Dev {
 ```
 No CLI parsing, no signal handling, no stdin loop, no logging setup, no curve/EMA, no emit — the SDK
 owns all of it. The level-1 tech (`read_temp`/`set`/`restore_dev`) lives in a `tech/<name>` crate.
+
+## Sensor-only modules (report, control nothing)
+A module that only *reports* a signal (e.g. `nvme` — NVMe temps for routing) and drives no device:
+- Set **`curve_default_path: None, curve_env_filename: None`** in `ModuleInfo`. The SDK then skips
+  the curve-empty warning, and `apply` ignores the `ctrl` argument (no curve to apply).
+- `apply` just returns `Applied::ok(readings)`; `restore` and `restore_all` are **no-ops** (there is
+  nothing to hand back to firmware), and the `restore` one-shot exits 0.
+- No curve file is shipped/installed. Wire it into a consumer with `input=<name>` so its readings
+  reach a fan controller. Isolation still matters: if its read can block (e.g. an NVMe admin
+  command on a wedged drive), its own process being killed at the tick deadline protects siblings.
 
 ## Bad Practices
 - Writing logs/debug to stdout (corrupts the protocol).

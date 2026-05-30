@@ -1,0 +1,16 @@
+[package]
+name = "anemoi-nvme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "nvme"
+path = "src/main.rs"
+
+[dependencies]
+anemos = { path = "../../anemos" }   # level-2 SDK (lifecycle/signals/logging/protocol + traits)
+nvme = { path = "../../tech/nvme" }  # level-1 tech (NVMe enumeration + per-drive temps)
+serde_json = { workspace = true }
+anyhow = { workspace = true }

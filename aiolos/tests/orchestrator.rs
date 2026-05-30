@@ -232,6 +232,27 @@ fn input_routing_delivers_peer_readings() {
 }
 
 #[test]
+fn multi_input_routing_merges_sources() {
+    // A consumer wired to TWO producers (`input=a input=b`) must receive BOTH peers' readings and
+    // see the max across them. Exercises multi-source routing + the `module:id` input keying.
+    let mut h = Harness::start(
+        &["a", "b", "consumer input=a input=b"],
+        &[("MOCK_A_TEMP", "55"), ("MOCK_B_TEMP", "67")],
+        &[],
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            h.read_marker("consumer-thing0.lastinput").as_deref() == Some("67")
+        }),
+        "multi-input consumer never saw the max across both sources (got {:?})",
+        h.read_marker("consumer-thing0.lastinput")
+    );
+
+    assert!(h.shutdown(Duration::from_secs(6)));
+}
+
+#[test]
 fn detect_set_change_adds_and_removes() {
     // Start with ids a,b; after ~1.5s detect switches to a,c. Expect b removed (graceful restore)
     // and c added (started); a untouched.

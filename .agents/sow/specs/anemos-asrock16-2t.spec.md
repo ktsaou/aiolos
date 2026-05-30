@@ -4,9 +4,9 @@ Status: design. ASRockRack ROME2D16-2T board-fan controller via IPMI. Conforms t
 `aiolos-protocol.spec.md`. Hardware findings verified on BMC firmware 3.03 (AST2500).
 
 ## Purpose
-Drive the 8 motherboard fan headers by temperature. Registry: `asrock16-2t input=nvidia` — the
-orchestrator routes GPU temps in; the module also reads its own CPU/board sensors. One `run`
-instance (the board).
+Drive the 8 motherboard fan headers by temperature. Registry:
+`asrock16-2t input=nvidia input=nvme` — the orchestrator routes GPU and NVMe temps in; the module
+also reads its own CPU/board sensors. One `run` instance (the board).
 
 ## Hardware facts
 - BMC: ASPEED AST2500, MegaRAC; firmware ≥ 3.03 required for reliable fan duty control.
@@ -18,13 +18,17 @@ instance (the board).
 - Emit exactly one board ID: `{"id":"asrock16-2t","type":"board","name":"ROME2D16-2T"}`.
 
 ## run <board>
-- Driving temperature = `max(` GPU temps from `inputs`, own CPU temps `)`. CPU temps come from
+- Driving temperature = `max(` all routed `inputs` temps, own CPU temps `)`. Routed temps arrive
+  keyed by `module:id`, so the module attributes them by source module: GPU temps (`nvidia:*`) and
+  NVMe temps (`nvme:*`) are reported under distinct `temp` labels (`GPU`, `NVMe`). The driving max
+  uses **all** routed temps (robust if more sources are wired later) plus CPU. CPU temps come from
   **`k10temp` sysfs** (`/sys/class/hwmon/*` where `name == k10temp`), reading every `tempN_input`
-  across **both** EPYC sockets (labeled via `tempN_label` where present). GPU temps are the
-  `"type":"temp"` records relayed in `inputs`.
+  across **both** EPYC sockets (labeled via `tempN_label` where present).
+- NVMe temps are relayed by the `nvme` sensor anemos (`input=nvme`): hot SSDs raise the board fans.
+  Routed temps are the `"type":"temp"` records relayed in `inputs`.
 - *Board/DIMM IPMI SDR temps (`TEMP_MB1/2`, `TEMP_CARD_SIDE1`, `TEMP_DDR4_*`) and per-fan tach RPM
-  are a planned enhancement (require SDR repository decoding) — see SOW follow-ups. They are not
-  yet in the driving max; CPU + GPU dominate cooling demand on this host.*
+  are a planned enhancement (require SDR repository decoding) — **SOW-0005** covers per-fan RPM.
+  They are not yet in the driving max; CPU + GPU + NVMe dominate cooling demand on this host.*
 - Interpolate `/opt/aiolos/etc/asrock16-2t.curve.json`; set all 8 fans (uniform); read back duty
   via `0xda` and report it as each fan's `pwm`, alongside the temp readings and a `driving` record.
 - **Fan model (default): uniform** — apply `curve(driving_temp)` to all 8 fans. CPU fans following
@@ -91,7 +95,8 @@ asserts, and the two ioctl numbers are asserted against the values above. CPU te
 
 ## Acceptance criteria
 - `detect` → one board ID.
-- Receives GPU temps via `inputs`; computes max with its own sensors.
+- Receives GPU + NVMe temps via `inputs` (attributed by `module:id`); computes the driving max with
+  its own CPU sensors; reports distinct `temp/GPU` and `temp/NVMe` readings.
 - Sets all fans via the verified all-manual + non-zero sequence; `0xda` readback matches.
 - shutdown/EOF/SIGTERM each release to BMC auto; verified by `0xda` + observing fans return to auto.
 - A persistent duty-set failure releases to BMC auto (never holds manual-but-frozen).

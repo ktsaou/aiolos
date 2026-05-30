@@ -21,8 +21,8 @@ fn main() -> ! {
     anemos::run_with(
         ModuleInfo {
             name: "asrock16-2t",
-            curve_default_path: "/opt/aiolos/etc/asrock16-2t.curve.json",
-            curve_env_filename: "asrock16-2t.curve.json",
+            curve_default_path: Some("/opt/aiolos/etc/asrock16-2t.curve.json"),
+            curve_env_filename: Some("asrock16-2t.curve.json"),
         },
         Asrock,
         extra,
@@ -66,11 +66,17 @@ struct AsrockDevice {
 
 impl Device for AsrockDevice {
     fn apply(&mut self, inputs: Option<&Inputs>, ctrl: &mut Controller) -> Applied {
-        let gpu_temps = input_temps(inputs);
+        // Routed temps arrive keyed by `module:id`; partition by source so GPU and NVMe are
+        // labelled distinctly in the readings. The driving max uses ALL routed temps (robust if
+        // more sources are wired later) plus the local CPU sensors.
+        let gpu_temps = input_temps_from(inputs, "nvidia");
+        let nvme_temps = input_temps_from(inputs, "nvme");
         let cpu_temps = hwmon::read_temps("k10temp");
         let gpu_max = gpu_temps.iter().copied().max();
+        let nvme_max = nvme_temps.iter().copied().max();
         let cpu_max = cpu_temps.iter().map(|(_, t)| *t).max();
-        let raw_driving = [gpu_max, cpu_max].into_iter().flatten().max();
+        let input_max = input_temps(inputs).into_iter().max();
+        let raw_driving = [input_max, cpu_max].into_iter().flatten().max();
 
         // Without a valid temperature OR a usable curve we cannot control safely: release to BMC auto
         // rather than hold manual control while blind (decision 9). The SDK resets the controller.
@@ -81,8 +87,9 @@ impl Device for AsrockDevice {
         let Some(pct) = duty.pct else {
             return release_or_error(&mut self.board, "no usable curve");
         };
-        tracing::info!(gpu_max = ?gpu_max, cpu_max = ?cpu_max, raw_driving = raw,
-            smoothed_driving = duty.smoothed, commanded_pct = pct, "decision: set all board fans");
+        tracing::info!(gpu_max = ?gpu_max, nvme_max = ?nvme_max, cpu_max = ?cpu_max,
+            raw_driving = raw, smoothed_driving = duty.smoothed, commanded_pct = pct,
+            "decision: set all board fans");
 
         if let Err(e) = self.board.set_all_fans(pct as i32) {
             return Applied::error(format!("set fans: {e}"));
@@ -91,6 +98,9 @@ impl Device for AsrockDevice {
         let mut readings = Vec::new();
         if let Some(g) = gpu_max {
             readings.push(Reading::new("temp", "GPU", json!({ "temp": g })));
+        }
+        if let Some(n) = nvme_max {
+            readings.push(Reading::new("temp", "NVMe", json!({ "temp": n })));
         }
         for (label, t) in &cpu_temps {
             readings.push(Reading::new("temp", label.clone(), json!({ "temp": t })));
@@ -173,22 +183,43 @@ fn query_mode() -> i32 {
     }
 }
 
-/// Extract every temperature reading from routed peer inputs (uninterpreted relay; we pick the
-/// `temp` values here, in the consumer).
+/// Extract every temperature reading from ALL routed peer inputs, source-agnostic (used for the
+/// driving max, which must reflect every routed source). `inputs` are keyed `module:id`.
 fn input_temps(inputs: Option<&Inputs>) -> Vec<i32> {
     let mut v = Vec::new();
     if let Some(inputs) = inputs {
         for readings in inputs.values() {
-            for r in readings {
-                if r.kind == "temp" {
-                    if let Some(t) = r.get_i64("temp") {
-                        v.push(t as i32);
-                    }
-                }
+            push_temps(readings, &mut v);
+        }
+    }
+    v
+}
+
+/// Extract temperature readings only from inputs whose SOURCE MODULE is `src` (keys are
+/// `module:id`; module names cannot contain `:` — enforced by the registry — so the `module:`
+/// prefix is unambiguous). Used to label GPU vs NVMe distinctly in the readings.
+fn input_temps_from(inputs: Option<&Inputs>, src: &str) -> Vec<i32> {
+    let mut v = Vec::new();
+    if let Some(inputs) = inputs {
+        let prefix = format!("{src}:");
+        for (key, readings) in inputs {
+            if key.starts_with(&prefix) {
+                push_temps(readings, &mut v);
             }
         }
     }
     v
+}
+
+/// Append the `temp` value of every `type:temp` reading to `out`.
+fn push_temps(readings: &[Reading], out: &mut Vec<i32>) {
+    for r in readings {
+        if r.kind == "temp" {
+            if let Some(t) = r.get_i64("temp") {
+                out.push(t as i32);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,21 +236,57 @@ mod tests {
     }
 
     #[test]
-    fn input_temps_extracts_gpu_temps() {
+    fn input_temps_extracts_all_temps_source_agnostic() {
         let mut inputs: Inputs = HashMap::new();
         inputs.insert(
-            "GPU-1".into(),
+            "nvidia:GPU-1".into(),
             vec![
                 Reading::new("temp", "GPU", json!({"temp": 63})),
                 Reading::new("fan", "fan0", json!({"pwm": 70})),
             ],
         );
         inputs.insert(
-            "GPU-2".into(),
-            vec![Reading::new("temp", "GPU", json!({"temp": 71}))],
+            "nvme:SER-A".into(),
+            vec![Reading::new("temp", "Composite", json!({"temp": 44}))],
         );
         let mut temps = input_temps(Some(&inputs));
         temps.sort();
-        assert_eq!(temps, vec![63, 71]);
+        assert_eq!(temps, vec![44, 63], "driving max sees every routed source");
+    }
+
+    #[test]
+    fn input_temps_from_partitions_by_source_module() {
+        let mut inputs: Inputs = HashMap::new();
+        inputs.insert(
+            "nvidia:GPU-1".into(),
+            vec![Reading::new("temp", "GPU", json!({"temp": 63}))],
+        );
+        inputs.insert(
+            "nvidia:GPU-2".into(),
+            vec![Reading::new("temp", "GPU", json!({"temp": 71}))],
+        );
+        inputs.insert(
+            "nvme:SER-A".into(),
+            vec![
+                Reading::new("temp", "Composite", json!({"temp": 40})),
+                Reading::new("temp", "Sensor 2", json!({"temp": 44})),
+            ],
+        );
+
+        let mut gpu = input_temps_from(Some(&inputs), "nvidia");
+        gpu.sort();
+        assert_eq!(gpu, vec![63, 71]);
+
+        let mut nv = input_temps_from(Some(&inputs), "nvme");
+        nv.sort();
+        assert_eq!(nv, vec![40, 44]);
+
+        // A short source name must not match a longer module (the `:` guards it); unknown -> empty.
+        assert!(input_temps_from(Some(&inputs), "nv").is_empty());
+        assert!(input_temps_from(Some(&inputs), "other").is_empty());
+
+        // No routed inputs at all -> empty, never a panic (both helpers).
+        assert!(input_temps_from(None, "nvidia").is_empty());
+        assert!(input_temps(None).is_empty());
     }
 }

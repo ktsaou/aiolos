@@ -14,8 +14,8 @@ fn main() -> ! {
     anemos::run(
         ModuleInfo {
             name: "nvidia",
-            curve_default_path: "/opt/aiolos/etc/nvidia.curve.json",
-            curve_env_filename: "nvidia.curve.json",
+            curve_default_path: Some("/opt/aiolos/etc/nvidia.curve.json"),
+            curve_env_filename: Some("nvidia.curve.json"),
         },
         Nvidia {
             detector: Detector::new(),

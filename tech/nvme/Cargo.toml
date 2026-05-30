@@ -1,0 +1,10 @@
+[package]
+name = "nvme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Level-1 tech: NVMe drive enumeration (stable serial ids) + per-drive temperature reading via the
+# controller's own hwmon sysfs node. Read-only; controls nothing. No std-external dependencies.
+[dependencies]
