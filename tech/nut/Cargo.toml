@@ -1,0 +1,12 @@
+[package]
+name = "nut"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Level-1 tech: NUT (Network UPS Tools) client. Shells out to the system `upsc` to list UPS names
+# and read a UPS's variables, parsing them into a typed state. Read-only; controls no device. No
+# crate dependencies beyond std (the `upsc` binary is the dependency, provided by the OS `nut`
+# package).
+[dependencies]

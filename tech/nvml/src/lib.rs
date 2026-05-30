@@ -10,6 +10,20 @@ use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 use nvml_wrapper::Nvml;
 use tracing::{info, warn};
 
+/// A GPU's power-limit envelope, in **milliwatts** (NVML's native unit). The `default` is the
+/// firmware/board default limit (the value to restore to); `min`/`max` bound any `set`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerLimits {
+    /// Firmware default power-management limit (mW) — the safe value to restore to.
+    pub default_mw: u32,
+    /// Current power-management limit (mW) at the time of the read.
+    pub current_mw: u32,
+    /// Lowest limit (mW) the device will accept.
+    pub min_mw: u32,
+    /// Highest limit (mW) the device will accept.
+    pub max_mw: u32,
+}
+
 /// A discovered GPU (raw info; the anemos maps this into the protocol's `FoundEntry`).
 pub struct GpuInfo {
     pub uuid: String,
@@ -96,6 +110,35 @@ pub fn restore_all() -> Result<()> {
     Ok(())
 }
 
+/// One-shot: restore EVERY GPU's power-management limit to its firmware default. Best-effort per
+/// GPU; idempotent. A GPU whose default limit cannot be read is skipped (nothing to restore to).
+pub fn restore_all_power() -> Result<()> {
+    let nvml = Nvml::init().map_err(|e| anyhow!("NVML init: {e}"))?;
+    let count = nvml
+        .device_count()
+        .map_err(|e| anyhow!("device_count: {e}"))?;
+    for i in 0..count {
+        let Ok(mut dev) = nvml.device_by_index(i) else {
+            continue;
+        };
+        match dev.power_management_limit_default() {
+            Ok(def) => {
+                if let Err(e) = dev.set_power_management_limit(def) {
+                    warn!(index = i, default_mw = def, error=%e,
+                        "set_power_management_limit(default) failed");
+                }
+            }
+            Err(e) => warn!(index = i, error=%e,
+                "power_management_limit_default unreadable; cannot restore this GPU's power limit"),
+        }
+    }
+    info!(
+        gpus = count,
+        "all GPU power limits restored to firmware default"
+    );
+    Ok(())
+}
+
 // ---- per-fan apply policy (trait-based so it is unit-testable without a real GPU) ----
 
 /// The minimal per-fan operations the apply policy needs.
@@ -113,6 +156,16 @@ impl FanControl for nvml_wrapper::Device<'_> {
         self.set_default_fan_speed(fan)
             .map_err(|e| anyhow!("set_default_fan_speed(fan {fan}): {e}"))
     }
+}
+
+/// Clamp a requested power limit (mW) into the device's accepted `[min,max]` window. NVML rejects a
+/// limit outside the constraints, so a power-cap module must never command one. Pure (testable).
+/// `min > max` cannot happen on real hardware; if it ever did, `u32::clamp` would panic, so guard it.
+pub fn clamp_power_limit(requested_mw: u32, min_mw: u32, max_mw: u32) -> u32 {
+    if min_mw > max_mw {
+        return max_mw; // degenerate constraints: prefer the lower (safer) bound
+    }
+    requested_mw.clamp(min_mw, max_mw)
 }
 
 /// Apply `pct` to every fan (or firmware-default when `None`). If ANY set fails, restore ALL fans to
@@ -139,6 +192,10 @@ pub struct Gpu {
     uuid: String,
     index: u32,
     num_fans: u32,
+    /// Whether `Drop` restores firmware fan control. A fan module leaves this `true` (NVML manual
+    /// fan control persists after exit, so the Drop is the panic backstop); a non-fan module (e.g.
+    /// the power-cap anemos, which never touches fans) opts out so dropping it issues no fan command.
+    restore_fans_on_drop: bool,
 }
 
 impl Gpu {
@@ -157,11 +214,20 @@ impl Gpu {
                         uuid: uuid.to_string(),
                         index: i,
                         num_fans,
+                        restore_fans_on_drop: true,
                     });
                 }
             }
         }
         Err(anyhow!("GPU {uuid} not found among {count} device(s)"))
+    }
+
+    /// Opt this handle out of the fan-restore-on-drop backstop. For a module that never touches the
+    /// fans (e.g. the power-cap anemos), so dropping the handle issues no `set_default_fan_speed`.
+    /// The caller owns its own (power) restore-on-drop instead.
+    pub fn without_fan_restore_on_drop(mut self) -> Self {
+        self.restore_fans_on_drop = false;
+        self
     }
 
     pub fn uuid(&self) -> &str {
@@ -234,6 +300,63 @@ impl Gpu {
         Ok(())
     }
 
+    /// Read this GPU's power-limit envelope (default/current/min/max, all in mW). Used by a
+    /// power-cap module to record the original limit at open and to clamp any cap into range.
+    pub fn power_limits(&mut self) -> Result<PowerLimits> {
+        let idx = self.resolve_index()?;
+        let dev = self.nvml.device_by_index(idx)?;
+        let default_mw = dev
+            .power_management_limit_default()
+            .map_err(|e| anyhow!("power_management_limit_default: {e}"))?;
+        let current_mw = dev
+            .power_management_limit()
+            .map_err(|e| anyhow!("power_management_limit: {e}"))?;
+        let c = dev
+            .power_management_limit_constraints()
+            .map_err(|e| anyhow!("power_management_limit_constraints: {e}"))?;
+        Ok(PowerLimits {
+            default_mw,
+            current_mw,
+            min_mw: c.min_limit,
+            max_mw: c.max_limit,
+        })
+    }
+
+    /// Set this GPU's power-management limit to `limit_mw`, clamped into the device's accepted
+    /// `[min,max]` range first (a request outside the range would otherwise be rejected by NVML).
+    /// Returns the value actually commanded (after clamping), in mW.
+    pub fn set_power_limit(&mut self, limit_mw: u32) -> Result<u32> {
+        let idx = self.resolve_index()?;
+        let mut dev = self.nvml.device_by_index(idx)?;
+        let c = dev
+            .power_management_limit_constraints()
+            .map_err(|e| anyhow!("power_management_limit_constraints: {e}"))?;
+        let clamped = clamp_power_limit(limit_mw, c.min_limit, c.max_limit);
+        dev.set_power_management_limit(clamped)
+            .map_err(|e| anyhow!("set_power_management_limit({clamped} mW): {e}"))?;
+        Ok(clamped)
+    }
+
+    /// Restore this GPU's power-management limit to the firmware default (the fail-safe). Reads the
+    /// default fresh each time (so it is correct even if the index renumbered). Best-effort.
+    pub fn restore_power(&mut self) -> Result<()> {
+        let idx = self.resolve_index()?;
+        let mut dev = self.nvml.device_by_index(idx)?;
+        let def = dev
+            .power_management_limit_default()
+            .map_err(|e| anyhow!("power_management_limit_default: {e}"))?;
+        dev.set_power_management_limit(def)
+            .map_err(|e| anyhow!("set_power_management_limit(default {def} mW): {e}"))?;
+        Ok(())
+    }
+
+    /// Current power draw (mW), if readable (for readings).
+    pub fn power_usage(&mut self) -> Option<u32> {
+        let idx = self.resolve_index().ok()?;
+        let dev = self.nvml.device_by_index(idx).ok()?;
+        dev.power_usage().ok()
+    }
+
     /// Current fan duty % for `fan`, if readable (for readings).
     pub fn fan_speed(&mut self, fan: u32) -> Option<u32> {
         let idx = self.resolve_index().ok()?;
@@ -252,7 +375,11 @@ impl Gpu {
 impl Drop for Gpu {
     fn drop(&mut self) {
         // Safety net: restore firmware fan control on ANY drop (normal exit or panic unwind), since
-        // NVML manual control would otherwise persist after we're gone.
+        // NVML manual control would otherwise persist after we're gone. A non-fan module (power-cap)
+        // opts out via `without_fan_restore_on_drop` so it never issues a fan command it never owned.
+        if !self.restore_fans_on_drop {
+            return;
+        }
         match self.restore_fans() {
             Ok(()) => info!(uuid=%self.uuid, "fans restored to firmware default on drop"),
             Err(e) => warn!(uuid=%self.uuid, error=%e,
@@ -325,5 +452,22 @@ mod tests {
             d.set_calls.is_empty(),
             "None must never command a manual duty"
         );
+    }
+
+    #[test]
+    fn clamp_power_limit_keeps_in_range_and_pins_to_bounds() {
+        // In range -> unchanged; below min -> min; above max -> max (NVML rejects out-of-range).
+        assert_eq!(clamp_power_limit(300_000, 100_000, 600_000), 300_000);
+        assert_eq!(clamp_power_limit(50_000, 100_000, 600_000), 100_000);
+        assert_eq!(clamp_power_limit(900_000, 100_000, 600_000), 600_000);
+        // Exact bounds are accepted as-is.
+        assert_eq!(clamp_power_limit(100_000, 100_000, 600_000), 100_000);
+        assert_eq!(clamp_power_limit(600_000, 100_000, 600_000), 600_000);
+    }
+
+    #[test]
+    fn clamp_power_limit_guards_degenerate_constraints() {
+        // min > max can never happen on real hardware, but must not panic if it ever did.
+        assert_eq!(clamp_power_limit(500_000, 600_000, 100_000), 100_000);
     }
 }

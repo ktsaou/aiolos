@@ -1,0 +1,17 @@
+[package]
+name = "anemoi-nut"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "nut"
+path = "src/main.rs"
+
+[dependencies]
+anemos = { path = "../../anemos" }  # level-2 SDK (lifecycle/signals/logging + traits)
+nut = { path = "../../tech/nut" }   # level-1 tech (NUT/upsc client)
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

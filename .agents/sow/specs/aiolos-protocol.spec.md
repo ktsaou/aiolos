@@ -77,8 +77,11 @@ last-resort backstop only.
   does not pick "the temperature"; the consumer selects what it needs (e.g. records with
   `"type":"temp"`, optionally filtered by the `module:` key prefix). Absent when no `input=` is
   wired; the `inputs` key is omitted entirely (never serialized as `null`).
-- On `ok`, `readings` is an array of records; each has a `type` (`temp`,`fan`,…) and `label`, plus
-  arbitrary numeric/string fields (`temp`,`pwm`,`rpm`,…).
+- On `ok`, `readings` is an array of records; each has a `type` (`temp`,`fan`,`power-state`,
+  `powercap`,…) and `label`, plus arbitrary numeric/string fields (`temp`,`pwm`,`rpm`,
+  `on_battery`,`runtime_s`,`limit_mw`,…). The `type` set is open — aiolos relays records verbatim,
+  so a new module can introduce a new reading type (e.g. `power-state` from `nut`) without any
+  orchestrator change; consumers select the records they understand.
 - The run process knows its own `id` from argv; `apply` does not repeat it.
 - **Invalid curve at startup (control modules):** a module that controls a device (it has a curve)
   and cannot load a usable curve when it starts (missing file, invalid JSON, or no usable points)
