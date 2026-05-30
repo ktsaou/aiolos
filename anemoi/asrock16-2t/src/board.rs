@@ -248,7 +248,11 @@ mod tests {
         // rejects a non-mirrored tail with 0xcc).
         let p = duty_payload(&[30, 30, 75, 75, 75, 75, 75, 75]);
         assert_eq!(&p[0..8], &[30, 30, 75, 75, 75, 75, 75, 75]);
-        assert_eq!(&p[8..16], &[30, 30, 75, 75, 75, 75, 75, 75], "tail must mirror the head");
+        assert_eq!(
+            &p[8..16],
+            &[30, 30, 75, 75, 75, 75, 75, 75],
+            "tail must mirror the head"
+        );
         // A zero / negative per-fan duty is still floored to 1 (never a zero byte), in both halves.
         let z = duty_payload(&[0, -1, 100, 150, 1, 50, 50, 50]);
         assert_eq!(&z[0..8], &[1, 1, 100, 100, 1, 50, 50, 50]);
