@@ -30,6 +30,7 @@ use inputs::power_signal;
 use nvml::{Detector, Gpu};
 use policy::{decide, CapReason, Decision, Policy};
 use serde_json::json;
+use std::io::Write;
 
 fn main() -> ! {
     anemos::run(
@@ -273,12 +274,14 @@ impl Drop for GpuCap {
         // Final fail-safe: if a cap is still owed (a restore never succeeded), restore on drop — the
         // backstop for panic unwinding or any path that skipped `restore`. NVML power limits persist
         // after exit, so this matters.
-        if self.restore_armed {
-            if let Err(e) = self.gpu.restore_power() {
-                eprintln!(
-                    "WARNING: power-limit restore on drop FAILED — GPU may stay capped (`aiolos restore` is the net): {e}"
-                );
-            }
+        if self.restore_armed && self.gpu.restore_power().is_err() {
+            // Panic-safe logging: `eprintln!` PANICS on a stderr write error. In a Drop running during
+            // a panic unwind that would double-panic -> process abort, defeating this very backstop.
+            // Use a raw, infallible write of a static message instead (no formatting -> no allocation).
+            // (`aiolos restore` via systemd ExecStopPost remains the net if the limit stays capped.)
+            let _ = std::io::stderr().write_all(
+                b"WARNING: nvidia-powercap restore-on-drop FAILED - GPU may stay capped; `aiolos restore` is the net\n",
+            );
         }
     }
 }

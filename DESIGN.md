@@ -81,7 +81,8 @@ asrock16-2t  input=nvidia input=nvme   # feed GPU + NVMe temps into this anemos
 Directives (extensible):
 - `input=<anemos>` — aiolos relays the named anemos's last readings into this anemos's `apply`
   request (keyed by `module:id`). Repeatable and/or comma-listed for multiple sources.
-- (future) `args=…`, `every=<sec>`, `timeout=<sec>` per-anemos overrides.
+- `every=<dur>` / `timeout=<dur>` — per-anemos schedule overrides (SOW-0013 decoupled scheduler;
+  bare number = seconds). `args=…` is future.
 
 Module binaries live in `/opt/aiolos/bin/<name>`. Per-module config (curves, etc.) in
 `/opt/aiolos/etc/<name>.*`.
@@ -116,7 +117,8 @@ optional startup `hello`).
             {"id":"GPU-a17…","type":"GPU","name":"RTX PRO 6000"}]}
 ```
 
-**apply** (to a `run <ID>` process each heartbeat; `inputs` present only if `input=` wired —
+**apply** (to a `run <ID>` process when the anemos is due — aiolos wakes every `base_tick` and
+dispatches each idle, due anemos (SOW-0013); `inputs` present only if `input=` wired —
 each peer id maps to that peer's full readings array, relayed uninterpreted):
 ```json
 → {"cmd":"apply","inputs":{"GPU-5f2…":[{"type":"temp","label":"GPU","temp":63}],
@@ -144,8 +146,10 @@ module) in this anemos's next `apply`. aiolos does **not** interpret the values 
 The consumer decides how to use them (max, per-zone, per-source, …). This is how GPU and NVMe temps
 reach the fan module while aiolos stays agnostic.
 
-Timing: `inputs` carry the **previous tick's** values (one heartbeat stale) — irrelevant for
-thermal mass, and it keeps every instance independent within a tick (no ordering dependency).
+Timing: `inputs` carry each source's **last completed** `apply` readings (one cycle stale, never
+blocking on a peer) — irrelevant for thermal mass, and it keeps every instance independent (no
+ordering dependency). Under the decoupled scheduler (SOW-0013) sources and consumers run on their
+own cadences; a consumer always sees the most recent values the blackboard holds.
 
 ---
 
@@ -294,7 +298,7 @@ the routed max). Example:
 
 | # | Decision | Default |
 |---|---|---|
-| 1 | `tick` heartbeat / `timeout` | 3 s / 2 s |
+| 1 | `base_tick` / per-anemos `every` / `timeout` (SOW-0013 decoupled scheduler) | 100 ms / 1 s / 5 s |
 | 2 | `detect_every` (hotplug re-scan) | 10 s |
 | 3 | asrock fan model | uniform curve(max) over all 8 (per-fan optional later) |
 | 4 | nvidia curve | 0–80 °C → 0–100 % (as today) |

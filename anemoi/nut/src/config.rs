@@ -34,7 +34,15 @@ pub fn ups_ids() -> Vec<String> {
 fn read_conf(path: &str) -> Vec<String> {
     match std::fs::read_to_string(path) {
         Ok(body) => parse_conf(&body),
-        Err(_) => Vec::new(),
+        // Absent file is the normal "not configured" case -> silently fall back to discovery.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        // Present but unreadable (e.g. wrong permissions): do NOT silently ignore the operator's
+        // intended UPS list — warn (to stderr, the log channel) so the misconfig is diagnosable,
+        // then still fall back to discovery so the module keeps working.
+        Err(e) => {
+            eprintln!("nut: cannot read {path} ({e}); falling back to `upsc -l` discovery");
+            Vec::new()
+        }
     }
 }
 

@@ -312,7 +312,14 @@ impl Supervisor {
         let key = self.key(id);
         if let Ok(mut s) = self.state.write() {
             s.instances.remove(&key);
-            s.blackboard.remove(&key); // prune: never relay a dead instance's stale readings
+            // Prune the blackboard so a dead instance's stale readings are never relayed.
+            s.blackboard.remove(&key);
+            // Drop the scheduler slot too, so its lifecycle matches the instance's. Otherwise a stale
+            // `busy`/`last_dispatch` could survive into a respawn with the same key when the main
+            // loop's `dispatch_due` prune doesn't fall between this removal and the (backoff-delayed)
+            // respawn — e.g. if `base_tick` exceeds the respawn backoff. Removing it here makes the
+            // cleanup synchronous; `dispatch_due` recreates a fresh slot on next dispatch.
+            s.sched.remove(&key);
         }
     }
 

@@ -324,8 +324,10 @@ fn dispatch_due(
             info!(wake = wake_count, to = %key, inputs = %summarize_inputs(inp), "routing inputs");
         }
         if cmd_tx.send(InstanceCmd::Tick { timeout, inputs }).is_err() {
-            // The worker is gone (it exited between snapshot and send). Clear busy so the slot
-            // doesn't wedge; the supervisor will remove the instance and we'll prune the slot.
+            // The worker is gone (it exited between snapshot and send). This dispatch never happened:
+            // clear busy AND reset last_dispatch so the slot records no phantom dispatch. (The
+            // supervisor will remove the instance and its slot shortly; until then the slot reflects
+            // reality.)
             if let Some(slot) = state
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
@@ -333,6 +335,7 @@ fn dispatch_due(
                 .get_mut(&key)
             {
                 slot.busy = false;
+                slot.last_dispatch = None;
             }
         }
     }

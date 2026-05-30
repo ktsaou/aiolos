@@ -366,8 +366,12 @@ impl LineReader {
                 Ok(false) => return ReadOutcome::Timeout,
                 Ok(true) => {
                     let mut tmp = [0u8; 8192];
-                    let n =
-                        unsafe { libc::read(self.fd, tmp.as_mut_ptr() as *mut c_void, tmp.len()) };
+                    // Cap the read so the buffer overshoots `max_len` by at most ONE byte before the
+                    // next iteration returns `TooLong` — a full 8 KiB chunk would otherwise let the
+                    // buffer exceed the advertised limit by ~8 KiB. (`buf.len() <= max_len` here: the
+                    // `> max_len` check above returns first; `saturating_sub` is belt-and-suspenders.)
+                    let want = (max_len.saturating_sub(self.buf.len()) + 1).min(tmp.len());
+                    let n = unsafe { libc::read(self.fd, tmp.as_mut_ptr() as *mut c_void, want) };
                     if n == 0 {
                         return ReadOutcome::Eof;
                     }
