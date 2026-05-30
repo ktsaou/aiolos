@@ -6,6 +6,7 @@
 
 use crate::instance::{
     set_nonblocking, write_line_deadline, Instance, InstanceCmd, LineReader, ReadOutcome,
+    TickReport,
 };
 use crate::registry::RegistryEntry;
 use crate::{AppState, InstanceEntry, ModuleHealth, StderrTail, ACTIVE_INSTANCES, SHUTDOWN_FLAG};
@@ -39,12 +40,15 @@ fn backoff_delay_secs(count: u32, max_secs: u64) -> u64 {
 
 /// Spawn a supervisor thread for one registry entry. `max_backoff` caps the exponential respawn
 /// backoff (a crashed/declared-fatal instance is retried forever, but never slower than this).
+/// `results` is the shared channel every worker posts its async `apply` result to (SOW-0013): the
+/// main loop drains it non-blockingly, so no instance ever blocks the scheduler or a sibling.
 pub fn run_module(
     entry: RegistryEntry,
     state: Arc<RwLock<AppState>>,
     bin_dir: PathBuf,
     detect_every: Duration,
     max_backoff: Duration,
+    results: mpsc::Sender<TickReport>,
 ) -> thread::JoinHandle<()> {
     let module_name = entry.module_name.clone();
     info!(module=%module_name, "starting module supervisor");
@@ -55,6 +59,7 @@ pub fn run_module(
             bin_dir,
             detect_every,
             max_backoff,
+            results,
             running: HashMap::new(),
             detect_proc: None,
             last_found: Vec::new(),
@@ -87,6 +92,8 @@ struct Supervisor {
     detect_every: Duration,
     /// Cap for the exponential respawn backoff (per-id and the declared-fatal jump).
     max_backoff: Duration,
+    /// Shared channel every worker posts its async `apply` result to (drained by the main loop).
+    results: mpsc::Sender<TickReport>,
     running: HashMap<String, (mpsc::Sender<InstanceCmd>, thread::JoinHandle<()>)>,
     detect_proc: Option<DetectProc>,
     last_found: Vec<FoundEntry>,
@@ -428,8 +435,10 @@ impl Supervisor {
 
         let module_name = self.module_name.clone();
         let id_for_thread = id.clone();
+        let key = self.key(&id);
+        let results = self.results.clone();
         let handle = thread::spawn(move || {
-            worker(inst, cmd_rx, &module_name, &id_for_thread);
+            worker(inst, cmd_rx, &module_name, &id_for_thread, key, results);
         });
 
         self.running.insert(id.clone(), (cmd_tx, handle));
@@ -477,19 +486,36 @@ impl Drop for ActiveGuard {
 
 /// Instance worker thread body: owns the child, services Tick/Shutdown, exits on a fatal result so
 /// the supervisor respawns it. Tracks the live-instance count for graceful shutdown.
-fn worker(mut inst: Instance, cmd_rx: mpsc::Receiver<InstanceCmd>, module_name: &str, id: &str) {
+///
+/// SOW-0013: each `apply` runs on this worker's own clock (under its own `timeout`); the result is
+/// posted asynchronously to the shared `results` channel as a `TickReport` (keyed by `key`, carrying
+/// the measured latency) — the main loop never blocks waiting for it. At most one `apply` is ever in
+/// flight here because the main loop only dispatches a `Tick` when this instance is idle.
+fn worker(
+    mut inst: Instance,
+    cmd_rx: mpsc::Receiver<InstanceCmd>,
+    module_name: &str,
+    id: &str,
+    key: String,
+    results: mpsc::Sender<TickReport>,
+) {
     let _active = ActiveGuard::new();
     loop {
         match cmd_rx.recv() {
             Err(_) => break, // all senders dropped
-            Ok(InstanceCmd::Tick {
-                timeout,
-                inputs,
-                reply,
-            }) => {
+            Ok(InstanceCmd::Tick { timeout, inputs }) => {
+                let started = Instant::now();
                 let res = inst.tick(timeout, inputs);
+                let latency = started.elapsed();
                 let fatal = res.status.is_fatal();
-                let _ = reply.send(res);
+                // Post the result back to the scheduler. If the receiver is gone (shutdown), just
+                // exit. A fatal result still gets posted (so status/blackboard update) before we
+                // break to let the supervisor respawn us.
+                let _ = results.send(TickReport {
+                    key: key.clone(),
+                    result: res,
+                    latency,
+                });
                 if fatal {
                     break;
                 }

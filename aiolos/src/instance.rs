@@ -14,7 +14,6 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -55,12 +54,6 @@ impl TickStatus {
         )
     }
 
-    /// A module-declared fatal (it said so) vs an inferred death (timeout/crash) — the supervisor
-    /// applies a long backoff to declared fatals.
-    pub fn is_declared_fatal(self) -> bool {
-        matches!(self, TickStatus::Fatal)
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             TickStatus::Ok => "ok",
@@ -93,11 +86,21 @@ impl TickResult {
 // Commands the supervisor / main loop send to an instance worker
 // ---------------------------------------------------------------------------
 
+/// An async result posted by a worker after one `apply` completes. Carries the instance key so the
+/// single shared results channel can route it; `latency` is the wall-clock the `apply` took (used to
+/// surface per-instance latency and to confirm the "delay-not-skip" effective period).
+pub struct TickReport {
+    pub key: String,
+    pub result: TickResult,
+    pub latency: Duration,
+}
+
 pub enum InstanceCmd {
+    /// Dispatch one `apply`. The worker runs it under `timeout` on its own clock and posts a
+    /// `TickReport` to the shared results channel when done — the main loop never blocks on it.
     Tick {
         timeout: Duration,
         inputs: Option<Inputs>,
-        reply: SyncSender<TickResult>,
     },
     Shutdown,
 }

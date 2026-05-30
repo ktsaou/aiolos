@@ -60,7 +60,7 @@ last-resort backstop only.
   human `name`. Extra keys are allowed and surfaced on the status page.
 - A bare `{"found":[...]}` with no `status` is accepted as `ok` (lenient/back-compat).
 
-### apply (orchestrator → run process; each heartbeat)
+### apply (orchestrator → run process; on the module's own cadence)
 ```json
 → {"cmd":"apply","inputs":{"nvidia:<gpu-uuid>":[{"type":"temp","label":"GPU","temp":63}],
                            "nvme:<serial>":[{"type":"temp","label":"Composite","temp":43}]}}
@@ -70,7 +70,8 @@ last-resort backstop only.
 ```
 - `inputs` is present only when the registry wires `input=<module>` (one or more sources — repeat
   `input=` or use a comma list). It maps each source instance's **`module:id`** key to **that
-  instance's full `readings` array** (the same records the peer last reported), one heartbeat stale.
+  instance's full `readings` array** (the source's **most recent completed** readings as of this
+  apply's dispatch — producers/consumers run on independent cadences, SOW-0013).
   Keying by `module:id` (not the bare id) lets the consumer attribute each reading to its **source
   module** (e.g. tell `nvidia:*` GPU temps from `nvme:*` disk temps) and guarantees keys never
   collide across sources. The orchestrator relays the readings **verbatim and uninterpreted** — it
@@ -106,9 +107,12 @@ non-blocking and `poll(2)` in short steps, checking the flag between polls. The 
 `anemos::StdinReader` + `anemos::install_shutdown_handlers`, which implement exactly this.
 
 ## Timing, failure, fail-safe
-- The orchestrator waits at most `timeout` (< heartbeat) for a response. No response in time →
-  the instance is `SIGKILL`ed and respawned (a **backstop** for a module too broken to report).
-  Modules must never block the orchestrator; isolation is by separate processes.
+- The orchestrator waits at most the module's own `timeout` for a response (per-module since
+  SOW-0013; it may exceed the anemos's `every` and the scheduler `base_tick`). No response in time →
+  the instance is `SIGKILL`ed and respawned (a **backstop** for a module too broken to report). Each
+  module runs on its own worker thread/process on its own cadence, so a slow/hung one never blocks
+  the orchestrator or a sibling; isolation is by separate processes. A slow-but-answering apply is
+  merely delayed (it runs at ≈ `max(every, apply_duration)`), never killed.
 - **Report errors, don't infer them.** A module that hits a fault MUST send `status:error`/`fatal`
   with a reason. Exiting, returning empty, or going silent to signal a fault is a conformance bug:
   it forces the supervisor to make critical decisions blind. The supervisor reacts to declared

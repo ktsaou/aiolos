@@ -4,9 +4,11 @@
 //! `mock` helper, and assert behaviour via mock-written marker files (no HTTP, so no port binding).
 //! The status page binds 127.0.0.1:0 (never queried). Run via `cargo test --workspace`.
 //!
-//! Coverage: reconcile/spawn, per-tick liveness, graceful shutdown + device-restore path,
-//! ISOLATION (a hung sibling and a partial-line-flooding sibling never stall a healthy one, and
-//! both get killed + respawned), `input=` routing (one tick stale), and detect-set hotplug.
+//! Coverage: reconcile/spawn, per-anemos cadence liveness, graceful shutdown + device-restore path,
+//! ISOLATION under the SOW-0013 decoupled scheduler (a hung, a partial-line-flooding, AND a SLOW
+//! sibling never stall a healthy one that keeps firing at its `every`; the hung/partial ones get
+//! killed at their `timeout` + respawned, the slow one is merely delayed — never skipped — and
+//! never killed), `input=` routing (most-recent completed readings), and detect-set hotplug.
 
 use std::fs;
 use std::path::PathBuf;
@@ -43,8 +45,10 @@ impl Harness {
             }
         }
 
-        // Fast timings for tests; status on an ephemeral port we never query.
-        let mut conf = String::from("status_bind=127.0.0.1:0\ntick=2\ntimeout=1\ndetect_every=1\n");
+        // Fast timings for tests; status on an ephemeral port we never query. SOW-0013 scheduler:
+        // a 50 ms base tick + the default per-module every=1s/timeout=5s (module lines may override
+        // `every=`/`timeout=` for a given test).
+        let mut conf = String::from("status_bind=127.0.0.1:0\nbase_tick=50\ndetect_every=1\n");
         for line in extra_conf {
             conf.push_str(line);
             conf.push('\n');
@@ -165,7 +169,13 @@ fn reconcile_tick_and_graceful_restore() {
 
 #[test]
 fn hung_sibling_does_not_stall_healthy_one() {
-    let mut h = Harness::start(&["good", "bad"], &[("MOCK_BAD_BEHAVIOR", "hang")], &[]);
+    // `bad` hangs forever in apply; a short `timeout=1` makes the orchestrator kill it ~1s after
+    // each dispatch. The healthy `good` keeps firing at its own cadence regardless (isolation).
+    let mut h = Harness::start(
+        &["good", "bad timeout=1"],
+        &[("MOCK_BAD_BEHAVIOR", "hang")],
+        &[],
+    );
 
     // The healthy module keeps ticking despite the hung sibling (isolation).
     assert!(
@@ -174,7 +184,7 @@ fn hung_sibling_does_not_stall_healthy_one() {
             >= 3),
         "healthy module stalled behind a hung sibling"
     );
-    // The hung module is killed at timeout and respawned (starts > 1).
+    // The hung module is killed at its timeout and respawned (starts > 1).
     assert!(
         wait_until(Duration::from_secs(12), || h
             .marker_len("bad-thing0.starts")
@@ -190,7 +200,7 @@ fn partial_line_flood_is_killed_not_wedged() {
     // The specific regression: a module writing a partial line (no newline) then hanging must be
     // killed within ~timeout (deadline-bounded read), not wedge its instance thread.
     let mut h = Harness::start(
-        &["good", "flood"],
+        &["good", "flood timeout=1"],
         &[("MOCK_FLOOD_BEHAVIOR", "partial")],
         &[],
     );
@@ -212,6 +222,45 @@ fn partial_line_flood_is_killed_not_wedged() {
 }
 
 #[test]
+fn slow_sibling_is_delayed_not_skipped_and_never_killed() {
+    // SOW-0013 core property: an anemos whose `apply` is SLOW (here ~700 ms, well under its 5 s
+    // timeout) must NOT be killed — it just runs less often (effective period ≈ max(every, slow)).
+    // Meanwhile a healthy sibling keeps firing at its own `every`. We give `slow` every=200ms so its
+    // cadence is gated by the apply duration, not the `every`, proving delay-not-skip.
+    let mut h = Harness::start(
+        &["good", "slow every=200ms"],
+        &[("MOCK_SLOW_BEHAVIOR", "slow"), ("MOCK_SLOW_SLOW_MS", "700")],
+        &[],
+    );
+
+    // The healthy module keeps ticking at its cadence regardless of the slow sibling (isolation).
+    assert!(
+        wait_until(Duration::from_secs(12), || h
+            .marker_len("good-thing0.applies")
+            >= 3),
+        "healthy module stalled behind a slow sibling"
+    );
+
+    // The slow module DOES make progress (it is delayed, not skipped) — its applies grow.
+    assert!(
+        wait_until(Duration::from_secs(12), || h
+            .marker_len("slow-thing0.applies")
+            >= 2),
+        "slow module never completed an apply (should be delayed, not stuck)"
+    );
+
+    // Crucially it is NEVER killed+respawned: a slow-but-answering apply must not trip the timeout.
+    // It started exactly once.
+    assert_eq!(
+        h.marker_len("slow-thing0.starts"),
+        1,
+        "slow (but answering) module was wrongly killed + respawned"
+    );
+
+    assert!(h.shutdown(Duration::from_secs(6)));
+}
+
+#[test]
 fn input_routing_delivers_peer_readings() {
     let mut h = Harness::start(
         &["sensor", "consumer input=sensor"],
@@ -219,7 +268,8 @@ fn input_routing_delivers_peer_readings() {
         &[],
     );
 
-    // consumer receives sensor's temp via routed inputs (one tick stale -> needs a couple ticks).
+    // consumer receives sensor's most-recent completed temp via routed inputs (needs the producer
+    // to have completed at least one apply first, so it lands within a couple of cadence periods).
     assert!(
         wait_until(Duration::from_secs(12), || {
             h.read_marker("consumer-thing0.lastinput").as_deref() == Some("63")
@@ -331,7 +381,7 @@ fn aiolos_restore_runs_every_configured_module() {
     let conf = dir.join("aiolos.conf");
     fs::write(
         &conf,
-        "status_bind=127.0.0.1:0\ntick=2\ntimeout=1\ndetect_every=1\nalpha\nbeta\n",
+        "status_bind=127.0.0.1:0\nbase_tick=50\ndetect_every=1\nalpha\nbeta\n",
     )
     .unwrap();
 
