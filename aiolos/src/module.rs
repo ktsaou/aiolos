@@ -25,15 +25,26 @@ const DETECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const TAIL_CAP: usize = 50;
 const MAX_DETECT_LINE: usize = 64 * 1024;
-/// Long backoff applied after a module declares `fatal` (decision 15: never give up, retry slowly).
-const FATAL_BACKOFF: Duration = Duration::from_secs(300);
+/// Shift used to jump the exponential backoff straight to its `max_backoff` cap for a declared
+/// `fatal` (decision 15: never give up, retry slowly). `2^32` s saturates any sane cap via `.min`,
+/// and `saturating_pow` keeps it in-bounds even for larger shifts.
+const BACKOFF_SATURATE_SHIFT: u32 = 32;
 
-/// Spawn a supervisor thread for one registry entry.
+/// Exponential respawn backoff (pure, so it is unit-testable): `2^count` seconds, capped at
+/// `max_secs` (and never below 1 s so a misconfigured 0 cap can't busy-loop). aiolos retries
+/// forever (decision 15) — the delay only grows to the cap, it never gives up.
+fn backoff_delay_secs(count: u32, max_secs: u64) -> u64 {
+    2u64.saturating_pow(count).min(max_secs.max(1))
+}
+
+/// Spawn a supervisor thread for one registry entry. `max_backoff` caps the exponential respawn
+/// backoff (a crashed/declared-fatal instance is retried forever, but never slower than this).
 pub fn run_module(
     entry: RegistryEntry,
     state: Arc<RwLock<AppState>>,
     bin_dir: PathBuf,
     detect_every: Duration,
+    max_backoff: Duration,
 ) -> thread::JoinHandle<()> {
     let module_name = entry.module_name.clone();
     info!(module=%module_name, "starting module supervisor");
@@ -43,6 +54,7 @@ pub fn run_module(
             state,
             bin_dir,
             detect_every,
+            max_backoff,
             running: HashMap::new(),
             detect_proc: None,
             last_found: Vec::new(),
@@ -73,6 +85,8 @@ struct Supervisor {
     state: Arc<RwLock<AppState>>,
     bin_dir: PathBuf,
     detect_every: Duration,
+    /// Cap for the exponential respawn backoff (per-id and the declared-fatal jump).
+    max_backoff: Duration,
     running: HashMap<String, (mpsc::Sender<InstanceCmd>, thread::JoinHandle<()>)>,
     detect_proc: Option<DetectProc>,
     last_found: Vec<FoundEntry>,
@@ -140,7 +154,7 @@ impl Supervisor {
 
     /// Run one detect round-trip and react to the module's DECLARED status (never inferring faults
     /// from empty/exit/silence). Returns how long until the next detect attempt: `detect_every`
-    /// normally, or `FATAL_BACKOFF` after a declared `fatal`. On `error`/unresponsive it keeps
+    /// normally, or `max_backoff` after a declared `fatal`. On `error`/unresponsive it keeps
     /// `last_found` unchanged so `reconcile` does NOT tear down healthy instances.
     fn run_detect(&mut self) -> Duration {
         if let Err(e) = self.ensure_detect_proc() {
@@ -216,7 +230,7 @@ impl Supervisor {
                     let msg = d.error.unwrap_or_else(|| "detect fatal".into());
                     self.set_health("fatal", Some(msg.clone()));
                     error!(module=%self.module_name, error=%msg, "detect reported FATAL — long backoff, keeping instances");
-                    FATAL_BACKOFF
+                    self.max_backoff
                 }
             },
         }
@@ -293,11 +307,14 @@ impl Supervisor {
     fn backoff_expired(&self, id: &str) -> bool {
         match self.backoff.get(id) {
             None => true,
-            Some((count, last)) => {
-                let delay = Duration::from_secs(2u64.saturating_pow(*count).min(300));
-                last.elapsed() >= delay
-            }
+            Some((count, last)) => last.elapsed() >= self.backoff_delay(*count),
         }
+    }
+
+    /// Exponential backoff delay for `count` consecutive failures, capped at `max_backoff`:
+    /// 2,4,8,… seconds, never exceeding the configured cap. aiolos retries forever (decision 15).
+    fn backoff_delay(&self, count: u32) -> Duration {
+        Duration::from_secs(backoff_delay_secs(count, self.max_backoff.as_secs()))
     }
 
     fn record_failure(&mut self, id: &str) {
@@ -309,10 +326,12 @@ impl Supervisor {
         e.1 = Instant::now();
     }
 
-    /// Jump straight to the long backoff (~`FATAL_BACKOFF`) for a module-DECLARED fatal — retry
-    /// slowly forever (decision 15), don't crash-loop. (2^9 capped to the 300s ceiling.)
+    /// Jump straight to the `max_backoff` cap for a module-DECLARED fatal — retry slowly forever
+    /// (decision 15), don't crash-loop. The saturating shift makes `2^count` exceed any sane cap, so
+    /// `backoff_delay` clamps it to exactly `max_backoff`.
     fn record_fatal(&mut self, id: &str) {
-        self.backoff.insert(id.to_string(), (9, Instant::now()));
+        self.backoff
+            .insert(id.to_string(), (BACKOFF_SATURATE_SHIFT, Instant::now()));
     }
 
     // ----- reap ---------------------------------------------------------------
@@ -484,4 +503,33 @@ fn worker(mut inst: Instance, cmd_rx: mpsc::Receiver<InstanceCmd>, module_name: 
     }
     drop(inst); // reap child + restore via EOF for any non-shutdown exit
                 // `_active` drops here -> ACTIVE_INSTANCES decremented (also on panic unwind).
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_is_exponential_and_capped_at_max() {
+        // 2^count seconds: 2,4,8,16,… until it reaches the cap, then stays there forever.
+        let cap = 300;
+        assert_eq!(backoff_delay_secs(0, cap), 1); // 2^0
+        assert_eq!(backoff_delay_secs(1, cap), 2);
+        assert_eq!(backoff_delay_secs(2, cap), 4);
+        assert_eq!(backoff_delay_secs(3, cap), 8);
+        assert_eq!(backoff_delay_secs(8, cap), 256);
+        assert_eq!(backoff_delay_secs(9, cap), cap, "2^9=512 capped to 300");
+        assert_eq!(backoff_delay_secs(20, cap), cap, "stays at the cap");
+        // The declared-fatal jump saturates to exactly the cap, for ANY cap value.
+        assert_eq!(backoff_delay_secs(BACKOFF_SATURATE_SHIFT, cap), cap);
+        assert_eq!(backoff_delay_secs(BACKOFF_SATURATE_SHIFT, 600), 600);
+        assert_eq!(backoff_delay_secs(BACKOFF_SATURATE_SHIFT, 60), 60);
+    }
+
+    #[test]
+    fn backoff_cap_never_busy_loops_on_a_zero_cap() {
+        // A 0 cap (shouldn't happen — config clamps to >=1) must still never yield 0s.
+        assert_eq!(backoff_delay_secs(0, 0), 1);
+        assert_eq!(backoff_delay_secs(BACKOFF_SATURATE_SHIFT, 0), 1);
+    }
 }

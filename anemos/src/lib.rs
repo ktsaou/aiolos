@@ -19,7 +19,7 @@ mod run;
 mod stdio;
 
 pub use controller::{Controller, Duty};
-pub use curve::{Curve, CurveCache};
+pub use curve::{BrokenReason, Curve, CurveCache, ReloadOutcome};
 pub use damper::Damper;
 pub use run::{run, run_with, Anemos, Device, ExtraCmd, ModuleInfo};
 pub use stdio::{install_shutdown_handlers, shutdown_requested, Event, StdinReader};

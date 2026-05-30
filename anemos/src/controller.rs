@@ -2,6 +2,7 @@
 //! deadband path that every anemos reuses (so the safety-critical smoothing/floor logic lives in
 //! one place). A module sources its driving temperature however it likes, then calls `duty()`.
 
+use crate::curve::{BrokenReason, ReloadOutcome};
 use crate::{CurveCache, Damper};
 
 /// Result of mapping a raw driving temperature to a fan duty.
@@ -30,11 +31,26 @@ impl Controller {
         }
     }
 
+    /// The reason the INITIAL curve load failed, if it did. A control module fails to start on
+    /// `Some` (SOW-0012 decision 2); a sensor-only module ignores it. `None` if the first load was
+    /// clean. (The live keep-last-good fail-safe still applies for runtime reloads.)
+    pub fn initial_curve_error(&self) -> Option<BrokenReason> {
+        self.curves.initial_error()
+    }
+
     /// Reload the curve + sensitivity (called every tick — live tuning), then EMA-smooth `raw_temp`
     /// and map it through the curve with a deadband. `pct = None` when the curve is missing/empty.
     pub fn duty(&mut self, raw_temp: i32) -> Duty {
-        if self.curves.reload() {
-            tracing::info!(path = %self.curves.path(), alpha = self.curves.alpha(), "config reloaded");
+        match self.curves.reload() {
+            ReloadOutcome::Changed => {
+                tracing::info!(path = %self.curves.path(), alpha = self.curves.alpha(), "config reloaded");
+            }
+            // SOW-0012 decision 1: complain LOUDLY every tick while the file stays broken, but keep
+            // the last-good curve (runtime fail-safe — an in-progress edit must never blip the fans).
+            ReloadOutcome::Broken { reason } => {
+                tracing::warn!(path = %self.curves.path(), reason = reason.as_str(), "curve file broken — keeping last-good curve");
+            }
+            ReloadOutcome::Unchanged => {}
         }
         self.damper.set_alpha(self.curves.alpha()); // live sensitivity knob
         if self.curves.curve().is_empty() {
@@ -92,5 +108,38 @@ mod tests {
             "a sub-floor temperature must hold the 35% floor"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duty_keeps_last_good_curve_when_file_breaks_at_runtime() {
+        // SOW-0012 decision 1: a valid curve at start, then the file breaks mid-run — the controller
+        // must keep regulating on the last-good curve (NOT drop to firmware/None) and never error.
+        let path =
+            std::env::temp_dir().join(format!("aiolos-ctrl-break-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"30":30,"80":100,"sensitivity":1.0}"#).unwrap();
+        let mut c = Controller::new(path.to_string_lossy().into_owned());
+        assert!(
+            c.initial_curve_error().is_none(),
+            "a valid initial curve is not a startup error"
+        );
+        assert_eq!(c.duty(80).pct, Some(100), "valid curve regulates");
+
+        // Break the file: a control module keeps the last-good curve (pct still Some), not None.
+        std::fs::write(&path, "}{ broken").unwrap();
+        let d = c.duty(80);
+        assert_eq!(
+            d.pct,
+            Some(100),
+            "a broken curve at runtime keeps the last-good curve (never drops to firmware)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn initial_curve_error_is_set_for_an_invalid_startup_curve() {
+        // A control module constructs the Controller against its curve path; an unreadable file at
+        // startup surfaces as initial_curve_error (run_loop turns this into a protocol `fatal`).
+        let c = Controller::new("/nonexistent/aiolos-ctrl-missing.json".to_string());
+        assert!(c.initial_curve_error().is_some());
     }
 }

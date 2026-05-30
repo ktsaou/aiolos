@@ -72,10 +72,9 @@ While claimed, BMC auto control is OFF for **all** fans including the CPU Noctua
 releases (`0x3a 0xd8` ×16 `0x00`) so the BMC reclaims auto control on:
 - `shutdown`, stdin EOF, OR `SIGTERM`/`SIGINT` (the module catches the signal itself — it does not
   rely on the parent to kill it; via an RAII guard that also fires on panic), AND
-- **whenever the temperature is indeterminable** — all sensor reads fail AND no GPU `inputs`, or
-  the curve is missing/empty. The module then reports `status:error` rather than holding manual
-  control while blind (**user decision SOW-0001 #9**: never run manual fans without a temperature),
-  AND
+- **whenever the temperature is indeterminable** — all sensor reads fail AND no GPU `inputs`. The
+  module then reports `status:error` rather than holding manual control while blind (**user decision
+  SOW-0001 #9**: never run manual fans without a temperature), AND
 - **whenever a duty cannot be set** — if `0xd6` persistently fails (even after re-claim), the module
   releases to BMC auto rather than holding manual-but-frozen (never leave the fans claimed without a
   fresh duty).
@@ -84,6 +83,17 @@ The RAII restore opens a fresh `/dev/ipmi0` handle (independent of the main loop
 if the main path failed, and it disarms only on a SUCCESSFUL release (a failed release is retried on
 drop). Because the kernel can't auto-release on `SIGKILL`, `aiolos restore` (systemd ExecStopPost) is
 the net for a hard kill. HW thermal throttle (~90 °C) is the hardware backstop.
+
+**Curve loading (SOW-0012).** Two distinct cases, handled before/independently of the temperature
+checks above:
+- **Invalid curve at startup** (missing file, invalid JSON, or no usable points): the module
+  **refuses to start** — it never claims the fans (BMC auto keeps cooling), declares
+  `{"status":"fatal","error":"startup: curve …"}` on its first `apply`, and exits non-zero. aiolos
+  respawns on the `max_backoff` cap until a valid curve appears.
+- **Curve breaks while running** (a live edit leaves it unreadable / invalid / empty): the module
+  **keeps the last-good curve** and warns **every tick** while it stays broken — it does NOT release
+  to auto on this alone (an in-progress edit must never blip the chassis fans). Release-to-auto is
+  reserved for an indeterminable temperature or a persistent duty-set failure (above).
 
 ## Config — `/opt/aiolos/etc/asrock16-2t.curve.json`
 Driving °C → fan %, linear-interpolated, clamped, hold-outside, plus a `sensitivity` key (the live

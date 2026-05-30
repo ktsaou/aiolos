@@ -43,8 +43,9 @@ last-resort backstop only.
   accompanying `error` field is a **non-fatal warning** ("done, with errors").
 - `error` — transient: it could NOT do its job this time. NOT "no devices". The supervisor keeps
   existing instances, surfaces the reason, and retries with backoff.
-- `fatal` — it cannot work on this host (wrong hw, missing capability). The supervisor surfaces it
-  and retries only on a **long backoff** (never permanently abandons; the condition may clear).
+- `fatal` — it cannot work on this host (wrong hw, missing capability, or — for a control module —
+  an invalid curve at startup). The supervisor surfaces it and retries only on a **long backoff**
+  (jumps to the `max_backoff` cap; never permanently abandons — the condition may clear).
 `error`/`fatal` responses include `error:"<reason>"`.
 
 ### detect (orchestrator → detect process; re-sent each detect cycle)
@@ -79,6 +80,13 @@ last-resort backstop only.
 - On `ok`, `readings` is an array of records; each has a `type` (`temp`,`fan`,…) and `label`, plus
   arbitrary numeric/string fields (`temp`,`pwm`,`rpm`,…).
 - The run process knows its own `id` from argv; `apply` does not repeat it.
+- **Invalid curve at startup (control modules):** a module that controls a device (it has a curve)
+  and cannot load a usable curve when it starts (missing file, invalid JSON, or no usable points)
+  MUST NOT regulate. It never opens the device (firmware/auto keeps cooling), answers its first
+  `apply` with `{"status":"fatal","error":"startup: curve …"}` so the reason reaches the status
+  page, then **exits non-zero**. The supervisor respawns it on the `max_backoff` cap. Sensor-only
+  modules (no curve) are exempt. (A curve that breaks *while running* is NOT fatal: the module keeps
+  its last-good curve and warns every tick — see the anemos fail-safe sections.)
 
 ### shutdown (orchestrator → run/detect process; graceful stop)
 ```json

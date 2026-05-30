@@ -113,6 +113,32 @@ A module that only *reports* a signal (e.g. `nvme` — NVMe temps for routing) a
   reach a fan controller. Isolation still matters: if its read can block (e.g. an NVMe admin
   command on a wedged drive), its own process being killed at the tick deadline protects siblings.
 
+## Curve loading — the SDK handles it for you (SOW-0012)
+A **control module** (`curve_default_path: Some(...)`) inherits this from the SDK — you write none of
+it:
+- **Invalid curve at startup** (missing file / invalid JSON / no usable points): the SDK does NOT
+  open your device (`open` is never called), answers the first `apply` with
+  `{"status":"fatal","error":"startup: curve …"}` so the reason hits the status page, and exits
+  non-zero. The device stays on firmware/auto; aiolos respawns on the `max_backoff` cap. **Do not**
+  hand-roll a startup curve check — just configure the path.
+- **Curve breaks while running** (a live edit): the SDK keeps the last-good curve and warns every
+  tick; `ctrl.duty()` keeps returning `Some(pct)`. Your `apply` sees a normal duty — no special
+  handling needed.
+- **Sensor-only modules** (`curve = None`) are exempt from both (no curve is expected).
+
+## Curve loading — the SDK handles it for you (SOW-0012)
+A **control module** (`curve_default_path: Some(...)`) inherits this from the SDK — you write none of
+it:
+- **Invalid curve at startup** (missing file / invalid JSON / no usable points): the SDK does NOT
+  open your device (`open` is never called), answers the first `apply` with
+  `{"status":"fatal","error":"startup: curve …"}` so the reason hits the status page, and exits
+  non-zero. The device stays on firmware/auto; aiolos respawns on the `max_backoff` cap. **Do not**
+  hand-roll a startup curve check — just configure the path.
+- **Curve breaks while running** (a live edit): the SDK keeps the last-good curve and warns every
+  tick; `ctrl.duty()` keeps returning `Some(pct)`. Your `apply` sees a normal duty — no special
+  handling needed.
+- **Sensor-only modules** (`curve = None`) are exempt from both (no curve is expected).
+
 ## Bad Practices
 - Writing logs/debug to stdout (corrupts the protocol).
 - Unstable ids (renumbering index/sensor number) — use UUID/serial/bus-id.
