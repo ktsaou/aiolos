@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aiolos · keeper of the winds</title>
+<link rel="stylesheet" href="/aiolos.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8C%AC%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<!-- Living wind backdrop: speed/density driven by live system pressure -->
+<svg id="wind" class="wind-bg" preserveAspectRatio="xMidYMid slice" aria-hidden="true"></svg>
+
+<header class="top">
+  <div class="brand">
+    <svg class="amphora" viewBox="0 0 48 64" aria-hidden="true">
+      <defs>
+        <linearGradient id="amg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="var(--accent)"/>
+          <stop offset="1" stop-color="var(--accent-2)"/>
+        </linearGradient>
+      </defs>
+      <path d="M16 4h16l-2 6c5 3 8 9 8 16 0 12-7 22-14 22S10 38 10 26c0-7 3-13 8-16z" fill="url(#amg)" opacity="0.92"/>
+      <path d="M16 4c-5 1-9 4-9 8 0 3 2 5 5 5M32 4c5 1 9 4 9 8 0 3-2 5-5 5" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"/>
+      <path d="M14 28h20M15 34h18" stroke="var(--bg)" stroke-width="2" opacity="0.5"/>
+    </svg>
+    <div class="brand-txt">
+      <h1>AIOLOS</h1>
+      <span class="sub">keeper of the winds · <em id="fleet-sub">awaiting the anemoi…</em></span>
+    </div>
+  </div>
+
+  <div class="pressure" title="Fleet pressure: max of normalised temperature and fan duty across the fleet">
+    <svg class="rose" viewBox="0 0 80 80" aria-hidden="true">
+      <g class="rose-rays" id="rose-rays"></g>
+      <circle cx="40" cy="40" r="6" class="rose-hub"/>
+      <text x="40" y="45" id="pressure-num" class="rose-num">–</text>
+    </svg>
+    <span class="pressure-label">PRESSURE</span>
+  </div>
+
+  <div class="top-actions">
+    <span class="tick" id="tickbox">tick –</span>
+    <button id="theme" class="iconbtn" title="Toggle theme" aria-label="Toggle theme">☾</button>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs" role="tablist"></nav>
+
+<main id="view" class="view"><div class="loading">Summoning the winds…</div></main>
+
+<footer class="foot">
+  <span>Aiolos orchestrator · read-only status</span>
+  <span class="links">
+    <a href="/status.json">status.json</a> ·
+    <a href="/history.json">history.json</a> ·
+    <a href="/metrics">/metrics</a>
+  </span>
+  <span id="conn" class="conn ok">live</span>
+</footer>
+
+<script src="/aiolos.js"></script>
+</body>
+</html>
