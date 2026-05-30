@@ -31,6 +31,17 @@ const MAX_DETECT_LINE: usize = 64 * 1024;
 /// and `saturating_pow` keeps it in-bounds even for larger shifts.
 const BACKOFF_SATURATE_SHIFT: u32 = 32;
 
+/// Why an instance worker thread exited, carried OUT of the thread via its `JoinHandle` return value
+/// so the supervisor learns the reason without racing the main loop's shared-state update. (The main
+/// loop sets `last_status` only when it reaps the worker's `TickReport`; reading that in `reap_dead`
+/// to classify the exit would race a worker that posted `fatal` and exited before the reap.)
+/// `Fatal` = the module DECLARED a fatal `apply` (jump straight to the long backoff); `Ended` = any
+/// other self-exit (crash, timeout-kill, stdin EOF, or shutdown) → normal escalating backoff.
+enum WorkerExit {
+    Fatal,
+    Ended,
+}
+
 /// Exponential respawn backoff (pure, so it is unit-testable): `2^count` seconds, capped at
 /// `max_secs` (and never below 1 s so a misconfigured 0 cap can't busy-loop). aiolos retries
 /// forever (decision 15) — the delay only grows to the cap, it never gives up.
@@ -94,7 +105,7 @@ struct Supervisor {
     max_backoff: Duration,
     /// Shared channel every worker posts its async `apply` result to (drained by the main loop).
     results: mpsc::Sender<TickReport>,
-    running: HashMap<String, (mpsc::Sender<InstanceCmd>, thread::JoinHandle<()>)>,
+    running: HashMap<String, (mpsc::Sender<InstanceCmd>, thread::JoinHandle<WorkerExit>)>,
     detect_proc: Option<DetectProc>,
     last_found: Vec<FoundEntry>,
     /// Per-id crash-loop backoff: (consecutive failures, last failure time).
@@ -351,17 +362,15 @@ impl Supervisor {
             .map(|(id, _)| id.clone())
             .collect();
         for id in dead {
-            // Was the last tick a module-declared fatal? If so, apply the long backoff; otherwise
-            // it crashed/timed out (backstop) → normal escalating backoff.
-            let key = self.key(&id);
-            let was_fatal = self
-                .state
-                .read()
-                .ok()
-                .and_then(|s| s.instances.get(&key).map(|e| e.last_status == "fatal"))
-                .unwrap_or(false);
+            // Take the finished worker's handle and JOIN it for its declared exit reason. The reason
+            // travels with the thread (no shared-state race vs the main loop's `last_status` update);
+            // `is_finished` is already true so `join` returns immediately. A panicked worker yields
+            // `Err` → treated as a crash (normal escalating backoff), never as a declared fatal.
+            let was_fatal = match self.running.remove(&id) {
+                Some((_tx, handle)) => matches!(handle.join(), Ok(WorkerExit::Fatal)),
+                None => false, // can't happen (id came from `running`), but never misclassify as fatal
+            };
             warn!(module=%self.module_name, id=%id, fatal=was_fatal, "instance worker exited — will respawn (backoff)");
-            self.running.remove(&id);
             self.remove_instance_state(&id);
             if was_fatal {
                 self.record_fatal(&id);
@@ -437,9 +446,8 @@ impl Supervisor {
         let id_for_thread = id.clone();
         let key = self.key(&id);
         let results = self.results.clone();
-        let handle = thread::spawn(move || {
-            worker(inst, cmd_rx, &module_name, &id_for_thread, key, results);
-        });
+        let handle =
+            thread::spawn(move || worker(inst, cmd_rx, &module_name, &id_for_thread, key, results));
 
         self.running.insert(id.clone(), (cmd_tx, handle));
         info!(module=%self.module_name, id=%id, restart=restart_count, "instance spawned");
@@ -498,8 +506,11 @@ fn worker(
     id: &str,
     key: String,
     results: mpsc::Sender<TickReport>,
-) {
+) -> WorkerExit {
     let _active = ActiveGuard::new();
+    // Default exit reason is a plain end (crash/timeout/EOF/shutdown). Only a DECLARED fatal apply
+    // upgrades it to `Fatal`, which the supervisor reads via `join` to choose the long backoff.
+    let mut exit = WorkerExit::Ended;
     loop {
         match cmd_rx.recv() {
             Err(_) => break, // all senders dropped
@@ -517,6 +528,7 @@ fn worker(
                     latency,
                 });
                 if fatal {
+                    exit = WorkerExit::Fatal;
                     break;
                 }
             }
@@ -529,6 +541,7 @@ fn worker(
     }
     drop(inst); // reap child + restore via EOF for any non-shutdown exit
                 // `_active` drops here -> ACTIVE_INSTANCES decremented (also on panic unwind).
+    exit
 }
 
 #[cfg(test)]
