@@ -288,6 +288,11 @@ fn dispatch_due(
     let now = Instant::now();
     let mut s = state.write().unwrap_or_else(|e| e.into_inner());
 
+    // Heartbeat: advance the wake counter every base_tick, unconditionally. `aiolos_tick` is the
+    // orchestrator liveness signal, so it must NOT depend on a result being reaped — else it would
+    // stall whenever every instance is slow/hung, faking a dead orchestrator to a liveness monitor.
+    s.tick_count = wake_count;
+
     // Reconcile scheduler slots with the live instance set (the supervisor owns `instances`):
     // drop slots for instances that vanished so they never leak.
     let live: HashSet<String> = s.instances.keys().cloned().collect();
@@ -377,7 +382,6 @@ fn reap_results(
     apply_results(
         &mut state.write().unwrap_or_else(|e| e.into_inner()),
         reports,
-        wake_count,
     );
 }
 
@@ -387,7 +391,7 @@ fn reap_results(
 /// orphan a stale blackboard entry that nothing prunes again — routed to consumers forever. Gating
 /// on liveness prevents that. Each report also clears the instance's `busy` flag (it is idle again)
 /// and records its latency, so the scheduler can re-dispatch it when next due.
-fn apply_results(s: &mut AppState, reports: Vec<TickReport>, wake_count: u64) {
+fn apply_results(s: &mut AppState, reports: Vec<TickReport>) {
     for r in reports {
         let TickReport {
             key,
@@ -415,7 +419,6 @@ fn apply_results(s: &mut AppState, reports: Vec<TickReport>, wake_count: u64) {
             }
         }
     }
-    s.tick_count = wake_count;
 }
 
 /// For each instance, if its module has `input=<peer...>`, gather every named peer's instances'
@@ -639,7 +642,6 @@ mod tests {
                 report("mod:a", TickStatus::Ok, mk(50)),
                 report("mod:ghost", TickStatus::Ok, mk(99)),
             ],
-            1,
         );
 
         assert!(
@@ -666,11 +668,10 @@ mod tests {
                 skipped_busy: 0,
             },
         );
-        apply_results(&mut s, vec![report("mod:a", TickStatus::Ok, Vec::new())], 5);
+        apply_results(&mut s, vec![report("mod:a", TickStatus::Ok, Vec::new())]);
         let slot = &s.sched["mod:a"];
         assert!(!slot.busy, "worker posted -> instance is idle again");
         assert_eq!(slot.last_latency, Some(Duration::from_millis(7)));
-        assert_eq!(s.tick_count, 5);
     }
 
     #[test]

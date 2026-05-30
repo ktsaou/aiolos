@@ -79,11 +79,21 @@ impl Anemos for NvidiaPowercap {
         let limits = gpu
             .power_limits()
             .map_err(|e| anyhow::anyhow!("GPU power limits unreadable (cannot power-cap): {e}"))?;
+        // Adopt a pre-existing cap. NVML power limits PERSIST across process death, so if a SIGKILLed
+        // predecessor (e.g. the orchestrator's timeout-kill) left this GPU BELOW its firmware default,
+        // a fresh process must OWN that and restore it — otherwise `apply_lift`'s `!capped` early
+        // return would strand the GPU capped during normal operation (only `aiolos restore` on systemd
+        // stop would ever fix it). We adopt only a reduction (`current < default`, an actual cap) so we
+        // never undo an operator's deliberate higher-than-default limit. After a CLEAN exit the
+        // predecessor already restored the default, so `current == default` and we adopt nothing.
+        let already_capped = limits.current_mw < limits.default_mw;
         tracing::info!(
             uuid = %gpu.uuid(),
             default_mw = limits.default_mw,
+            current_mw = limits.current_mw,
             min_mw = limits.min_mw,
             max_mw = limits.max_mw,
+            already_capped,
             "opened GPU for power-cap; recorded firmware default limit"
         );
         Ok(Box::new(GpuCap {
@@ -91,11 +101,15 @@ impl Anemos for NvidiaPowercap {
             default_mw: limits.default_mw,
             min_mw: limits.min_mw,
             policy: Policy::load(),
-            capped: false,
-            applied_cap_mw: None,
-            // Nothing owed at open: we never take control until a trigger actually caps. `apply_cap`
-            // arms this; `restore` is then a clean no-op until we have capped at least once.
-            restore_armed: false,
+            // Adopt the predecessor's stranded cap so the next `Lift` (or shutdown) restores it; an
+            // ongoing event still dedupes to the same target in `apply_cap`. A clean open adopts none.
+            capped: already_capped,
+            applied_cap_mw: already_capped.then_some(AppliedCap {
+                requested_mw: limits.current_mw,
+                actual_mw: limits.current_mw,
+            }),
+            // Owe a restore iff we adopted a cap; `apply_cap` re-arms when this process caps.
+            restore_armed: already_capped,
         }))
     }
 
