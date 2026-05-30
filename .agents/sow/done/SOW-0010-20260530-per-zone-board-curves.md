@@ -2,9 +2,13 @@
 
 ## Status
 
-Status: open
+Status: completed
 
-Sub-state: idea captured 2026-05-30. Not started. Gate at activation.
+Sub-state: completed 2026-05-30. Per-zone board-fan curves implemented internal to `asrock16-2t`
+(commit 161560d). The uniform path is live and validated at the 2026-05-30 cutover; the per-zone split
+is built + unit-tested but inactive (no `*.cpu/*.case` curve files deployed — uniform mode by
+default). A set-duty payload bug introduced here (upper 8 bytes not mirrored) was found at cutover and
+fixed in bee990e. nvfd retired.
 
 ## Requirements
 
@@ -108,26 +112,49 @@ zone duty is still 8 per-fan bytes through the existing `0xd6` path; readings ke
     lazily-built `zones` field and `reset_zone_dampers()` (mirrors the SDK `ctrl.reset()` on a
     release tick). Outcome unit tests added.
 - Build/clippy(all-targets)/fmt clean; `cargo test --workspace --no-run` compiles. Not executed on
-  hardware (production cooler is `nvfd`; user runs the on-board validation).
+  hardware at authoring time (production cooler was `nvfd`).
+- **Cutover 2026-05-30:** deployed + cut over from nvfd. The board fans failed `set-duty` with BMC
+  completion code `0xcc` because `duty_payload` left bytes 8–15 at `0x01` instead of mirroring bytes
+  0–7 — the BMC requires the upper half to mirror the lower. Hardware-confirmed via `ipmitool` raw
+  `0x3a 0xd6` (mirrored payload → success). Fixed in **bee990e** (`out[i+8]=out[i]` per fan) and the
+  test renamed to `duty_payload_per_fan_mirrors_each_fan_into_both_halves`; the board fans then drove
+  correctly (RPM ~1100–2400, no faults). The per-fan duty payload was introduced by this SOW, so the
+  bug is recorded here as a pre-completion fix (not a post-completion regression).
 
 ## Validation
 - Acceptance — per-zone split: covered by unit tests (`per_fan_duties` → FAN1/2=cpu, FAN3–8=case;
-  zone driving reading) + the live mode decision in `apply`. On-hardware check (CPU-only vs GPU/NVMe
-  load raising the correct zone; `0xd6` all-manual-non-zero honoured) is **pending the user's
-  hardware run** — this branch is built in an isolated worktree and must not drive the live fans.
+  zone driving reading) + the live mode decision in `apply`. At the 2026-05-30 cutover the **uniform**
+  path runs live and drives all 8 fans correctly (after the duty-mirror fix). The **per-zone** split
+  is **not active** — no `asrock16-2t.cpu.curve.json` / `.case.curve.json` are deployed, so
+  `both_present()==false` and the board runs uniform mode; the CPU-only-vs-GPU/NVMe zone behaviour is
+  built + unit-tested but not yet exercised on hardware (an optional operator step: drop the two zone
+  curve files).
 - Back-compat: with no zone files, `both_present()==false` → the uniform path is byte-for-byte the
   prior behaviour (`set_all_fans`); shipped `asrock16-2t.curve.json` and packaging unchanged.
-- `0xd6` rule: `duty_payload` floors every controllable byte to ≥1 and holds tach slots at `0x01`
-  (test `duty_payload_per_fan_places_each_fan_and_floors_tach_slots`).
+- `0xd6` rule: `duty_payload` floors every controllable byte to ≥1 and **mirrors each fan's duty into
+  both 16-byte halves** (bytes 0–7 and 8–15), as the BMC requires (test
+  `duty_payload_per_fan_mirrors_each_fan_into_both_halves`). The original "hold tach slots at `0x01`"
+  form was wrong — the BMC rejected it with `0xcc` — and was corrected at cutover (bee990e); see the
+  Execution Log.
 - Fail-safe: zone-blind / no-usable-curve paths route through the existing `release_or_error`;
   restore/Drop/`restore` untouched.
 - Reviewers: not run in-worktree (parallel-agent constraint); the user consolidates review at merge.
 
 ## Outcome
-Pending.
+**Completed 2026-05-30.** Per-zone board-fan control (two `Controller`s, per-fan `0xd6` duties,
+zone-blind release) ships in `asrock16-2t` (161560d). Live behaviour at cutover: the uniform path
+drives all eight fans correctly after the duty-mirror fix (bee990e); the zone split is byte-for-byte
+back-compatible and stays dormant until the operator deploys `*.cpu/*.case` curve files. Moved to
+`done/`.
 
 ## Lessons Extracted
-Pending.
+- The ROME2D16-2T BMC requires the `0x3a 0xd6` set-duty payload to **mirror** each fan's duty into
+  both 16-byte halves; a per-fan rewrite touching only bytes 0–7 is rejected with `0xcc`. Any change
+  to the duty payload must keep the mirror — and be hardware-checked, since the unit tests passed the
+  broken form.
+- Compile-only validation in an isolated worktree cannot catch a BMC-contract bug like this: the
+  cutover was the first time real `0xd6` writes happened. Hardware smoke of the actuator path is
+  mandatory before declaring a board-control SOW done.
 
 ## Followup
 None yet.

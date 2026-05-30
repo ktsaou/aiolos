@@ -2,9 +2,12 @@
 
 ## Status
 
-Status: open
+Status: completed
 
-Sub-state: idea captured 2026-05-30. Not started. Gate at activation.
+Sub-state: completed 2026-05-30. Fan-fault detection (state machine + sibling-boost compensation +
+`fault` reading + warn) implemented (commit 161560d) and live in `asrock16-2t`. Caveat: a deliberate
+physical fan stall was NOT exercised on hardware (intrusive on a production board); detection rests on
+unit tests + the fail-safe (siblings boost). Local alerting only — webhook/Netdata is the follow-on.
 
 ## Requirements
 
@@ -96,8 +99,10 @@ Evidence reviewed:
 ## Validation
 - Acceptance — detection: unit-tested state machine (confirm only after grace + N ticks; clear on
   RPM return; no false positive on unreadable tach or low duty). The `"fault":true` reading field +
-  warn surface it (status page/metrics can render it). A real/simulated stall is **pending the
-  user's hardware run**.
+  warn surface it; live at the 2026-05-30 cutover all eight board fans report healthy RPM (no fault).
+  A deliberate physical stall was **not exercised** (intrusive on a production board) — detection
+  rests on the unit tests + the fail-safe direction (siblings boost); tracked as an optional operator
+  test.
 - Acceptance — compensation: `compensate` unit tests show same-zone survivors → 100%, other zone and
   the dead fan untouched.
 - No false positives: grace + hysteresis + present-RPM-only rule (tests `low_duty_never_faults`,
@@ -107,10 +112,17 @@ Evidence reviewed:
 - Reviewers: not run in-worktree (parallel-agent constraint); the user consolidates review at merge.
 
 ## Outcome
-Pending.
+**Completed 2026-05-30.** The fault state machine, sibling-boost compensation, per-fan `fault`
+reading, and warn ship in `asrock16-2t` (161560d) and run live; all board fans currently read healthy
+RPM. Scope was local alerting (reading + warn); webhook/Netdata delivery remains a documented
+follow-on. Residual: a deliberate on-hardware stall test was not performed (intrusive) — covered by
+unit tests and the fail-safe (siblings to 100%) meanwhile. Moved to `done/`.
 
 ## Lessons Extracted
-Pending.
+- Fault detection must require a *present* RPM below threshold after a grace window — an unreadable
+  tach or a low commanded duty must hold state, not trip — or transient/idle conditions false-positive.
+- The fail-safe for a stalled fan is to boost its zone siblings to 100%, never to cut cooling; that
+  keeps a detection bug on the safe side.
 
 ## Followup
 None yet.

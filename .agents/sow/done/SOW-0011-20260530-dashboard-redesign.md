@@ -2,10 +2,13 @@
 
 ## Status
 
-Status: open
+Status: completed
 
-Sub-state: requested 2026-05-30. Not started. Gate at activation. Contains one quick bug-fix that
-can be pulled out and shipped immediately (see ANSI escape, below).
+Sub-state: completed 2026-05-30. Themed multi-tab dashboard + Prometheus `/metrics` implemented in
+`status_page.rs` with embedded assets (commit 21ea223); the ANSI-escape fix (c48c5c9) shipped earlier.
+Live and serving at the cutover; a browser `ERR_CONNECTION_RESET` was then fixed (cf639a6, drain the
+full request + 30 s write timeout). User visual confirmation of the rendered page is the only soft
+residual.
 
 ## Requirements
 
@@ -144,16 +147,23 @@ All module-reported strings are HTML-escaped (existing `esc`) and ANSI-stripped 
   in stderr tails; curve reader reads points + sensitivity and rejects path traversal
   (`../`, `a/b`, `a.b`); reading aggregation prefers `driving` and takes maxima; percent-decode /
   module-param parsing.
-- NOT run live here (production safety: no binaries executed in this worktree). User to run
-  `cargo test` and open the page on `status_bind` to watch the live dashboard.
+- Live at the 2026-05-30 cutover: all assets serve over HTTP 200 (`/` ~2.6 KB, `/aiolos.css` ~11.5 KB,
+  `/aiolos.js` ~27 KB, `/status.json`). A browser `net::ERR_CONNECTION_RESET` on `/aiolos.js` was
+  traced to the hand-rolled server reading only the first 2 KB of each request then closing (RST on
+  unread bytes) and fixed in cf639a6 (drain the full request + 30 s write timeout); curl could not
+  reproduce it pre-fix and serves cleanly post-fix. Final user visual confirmation of the rendered
+  dashboard (hard-refresh) is the only soft residual.
 - Acceptance criteria: no raw escape codes (ANSI fix on master + defensive strip) ✓; themed
   multi-tab dashboard (home/module/curve/time-series/health) ✓; dynamic from the live set ✓;
   animated SVGs driven by pressure + curve operating point + time-series ✓; dependency-light /
   self-served / read-only ✓.
 
 ## Outcome
-Dashboard + Prometheus endpoint implemented in `status_page.rs` + embedded assets; build/clippy/fmt
-clean, tests compile, JS syntax-checks. Awaiting the user's live visual + cutover validation.
+**Completed 2026-05-30.** The themed, dynamic, animated multi-tab dashboard (home/module/curve/
+time-series/health) + Prometheus `/metrics` ship in `status_page.rs` with embedded assets and run live;
+the ANSI-escape fix (c48c5c9) and the `ERR_CONNECTION_RESET` fix (cf639a6) are both in. All assets
+serve 200. Residual: final visual confirmation in the user's browser (hard-refresh) — the server-side
+cause was fixed but could not be reproduced with curl. Moved to `done/`.
 
 ## Lessons Extracted
 - The dashboard can stay 100% inside `status_page.rs`: a self-owned ring buffer + a read-only

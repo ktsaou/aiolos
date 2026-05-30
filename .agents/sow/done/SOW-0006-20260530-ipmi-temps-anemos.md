@@ -2,10 +2,11 @@
 
 ## Status
 
-Status: open
+Status: completed
 
-Sub-state: idea captured from the 2026-05-30 server inspection. Not started. Full Pre-Implementation
-Gate to be written at activation.
+Sub-state: completed 2026-05-30. `ipmi-temps` sensor-only anemos implemented (commit e75726f),
+statically validated, and validated on hardware at the 2026-05-30 cutover — it reports 10 live
+board/CPU/DIMM/NIC temps that fold into the `asrock16-2t` driving max. nvfd retired.
 
 ## Requirements
 
@@ -153,7 +154,8 @@ Acceptance criteria mapping:
 - "'ns'/unavailable sensors skipped (never 0/garbage)" → `read_sensor` `available` flag honoured;
   unit-tested via `temp_celsius`. ✔
 - "verified on hardware: readings match `ipmitool sdr type Temperature`; a warm DIMM/NIC raises the
-  board fans" → **deferred to the user's on-hardware test** (cannot run on this production server). ⏳
+  board fans" → **validated at the 2026-05-30 cutover**: 10 live temps (CPU1/2, MB1/2, CARD_SIDE,
+  LAN, …) reported `status=ok` and fold into the asrock driving max. ✔
 - "isolation preserved (sensor-only, own process); no secrets in artifacts" → separate module/own
   process; sensor numbers are board constants, inband IPMI needs no IP/credentials → no secrets. ✔
 
@@ -166,11 +168,14 @@ documents the sensor-only pattern (curve None, no-op restore) this module follow
 convention introduced.
 
 ## Outcome
-Implemented and statically validated; on-hardware validation pending the user's combined test run.
-SOW left in `pending/` per the activation brief (not moved to `done/`).
+**Completed 2026-05-30.** `ipmi-temps` runs live in `/opt/aiolos` reporting CPU1/CPU2, MB1/MB2,
+CARD_SIDE, LAN and the other board sensors (10 readings, `status=ok`); these route into the
+`asrock16-2t` driving max alongside GPU + NVMe temps, so a warm LAN/DIMM raises the board fans via the
+shared driving-max path. Moved to `done/`.
 
 ## Lessons Extracted
-Pending.
+- A static, verified sensor table (exact numbers + labels) is more robust than an SDR-repo walk for a
+  known board; a per-sensor 100 ms read timeout keeps a laggy BMC from blowing the apply budget.
 
 ## Followup
 - **Worst-case tick budget:** 22 sensors × 100 ms OBS_TIMEOUT = up to ~2.2 s if the BMC is
@@ -181,7 +186,7 @@ Pending.
   across ticks. (asrock's batch is ≤ 9 calls and stays well under; this larger DIMM table is the
   reason to track it.)
 - On-hardware validation (readings vs `ipmitool sdr type Temperature`; warm DIMM/NIC raising the
-  board fans) is deferred to the user's combined cut-over test.
+  board fans) — done at the 2026-05-30 cutover (10 temps live, folding into the board driving max).
 
 ## Regression Log
 None yet.

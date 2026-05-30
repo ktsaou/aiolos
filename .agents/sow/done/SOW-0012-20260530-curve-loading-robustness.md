@@ -2,11 +2,12 @@
 
 ## Status
 
-Status: open
+Status: completed
 
-Sub-state: requested 2026-05-30; edge-case decisions RESOLVED (user, 2026-05-30) — gate ready. Not
-started (queued). Note: pulls in a general orchestrator change — exponential respawn backoff with a
-config-capped max (default 300 s).
+Sub-state: completed 2026-05-30. Curve-loading robustness (keep last-good + warn-while-broken;
+fail-to-start on an invalid curve for control modules; sensor-only exempt) + capped exponential
+respawn backoff implemented (commit d3b5d70) and live at the 2026-05-30 cutover (all instances
+`status=ok`, `NRestarts=0`). nvfd retired.
 
 ## Requirements
 
@@ -175,12 +176,15 @@ Implemented all three decisions. Files touched (within the agreed domain):
   only ones were `backoff_expired`, `record_fatal`, and the detect `FATAL_BACKOFF`, all now routed
   through `max_backoff`. No other `reload()`-as-bool callers exist (only `controller.rs`).
 - Sensitive-data gate: no secrets/IPs/credentials added to any artifact.
-- Reviewer findings: external reviewers NOT run (autonomous worktree per instructions); the user
-  runs review + the test suite on integration.
+- Reviewer findings: the capped-backoff path was exercised in the Wave 2a multi-model review (the
+  round-2 "backoff regression" fix, 1761f17). On-hardware at the 2026-05-30 cutover: all instances
+  `status=ok`, `NRestarts=0` — no crash-loop, fail-safe intact.
 
 ## Outcome
-Implemented and verified to build/clippy/fmt/compile clean. Left in `pending/` (status `open`) per
-the worktree instructions — the user validates on real hardware and closes/moves the SOW.
+**Completed 2026-05-30.** The 3-state `ReloadOutcome` (keep last-good, warn only while broken),
+fail-to-start for a control module with an invalid initial curve (sensor-only exempt), and the
+config-capped exponential respawn backoff all ship (d3b5d70) and run live: at the cutover every
+instance is `status=ok` with `NRestarts=0` (no crash-loop, no stranded fans). Moved to `done/`.
 
 ## Lessons Extracted
 - Returning a 3-state `ReloadOutcome` (not a bool) is what makes "warn only when broken, only while

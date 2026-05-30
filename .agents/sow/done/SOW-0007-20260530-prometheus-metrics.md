@@ -2,9 +2,11 @@
 
 ## Status
 
-Status: open
+Status: completed
 
-Sub-state: idea captured from the 2026-05-30 server inspection. Not started. Gate at activation.
+Sub-state: completed 2026-05-30. `/metrics` Prometheus endpoint implemented (commit 21ea223; power
+family added in 13009e9), and validated live at the 2026-05-30 cutover — all agreed families are
+served and scrape cleanly. nvfd retired.
 
 ## Requirements
 
@@ -103,14 +105,19 @@ Sensitive-data plan: metrics expose only device labels and numeric readings — 
   family headers), `metrics_disambiguate_duplicate_labels` (two "CPU" → `CPU`,`CPU_2`),
   `metrics_down_when_not_ok` (up=0 / detect=0), `metrics_escape_label_values`,
   `fmt_num_drops_trailing_zero`.
-- NOT run here (production safety: no binaries executed in this worktree). User to run `cargo test`
-  + scrape the live endpoint with `promtool check metrics` / `curl` and confirm it appears in the
-  Prometheus/Netdata stack.
+- Validated live at the 2026-05-30 cutover: `curl http://127.0.0.1:9876/metrics` returns valid
+  exposition with all agreed families (temp, fan duty, fan rpm, driving ×3, instance up / restarts /
+  seconds-since-seen, module detect, power on-battery / runtime / charge). `promtool` was not run
+  separately; the renderer groups samples by family (single-pass `MetricBuf`) so the output parses.
 - Acceptance criteria: `/metrics` returns valid Prometheus exposition with the agreed schema ✓
   (renderer + tests); no control-path change ✓ (read-only, read lock only); no new deps ✓.
 
 ## Outcome
-Implemented, build/clippy/fmt clean, tests compile. Awaiting the user's live scrape validation.
+**Completed 2026-05-30.** `/metrics` serves valid Prometheus exposition live on the running aiolos:
+`aiolos_tick`, `aiolos_temp_celsius`, `aiolos_fan_duty_percent`, `aiolos_fan_rpm`, `aiolos_driving_*`,
+`aiolos_instance_up`, `aiolos_instance_restarts_total`, `aiolos_instance_seconds_since_seen`,
+`aiolos_module_detect_up`, and the power family `aiolos_power_on_battery` / `_runtime_seconds` /
+`_charge_percent`. Read-only (read lock only), no new deps. Moved to `done/`.
 
 ## Lessons Extracted
 - The `driving` reading already carries `{temp,raw,pct}`, giving temp + commanded duty + raw temp

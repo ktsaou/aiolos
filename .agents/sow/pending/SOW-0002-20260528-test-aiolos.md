@@ -3,7 +3,12 @@
 ## Status
 
 Status: open
-Sub-state: pending; depends on SOW-0001 implementation chunks landing.
+Sub-state: open (partial). The automated suite landed under SOW-0001/0003 and is green
+(`cargo test --workspace` + the orchestrator integration tests); ad-hoc on-hardware validation was
+done at the 2026-05-30 cutover (all 7 instances `status=ok`, fans tracking, fail-safe restore via
+systemd `ExecStopPost aiolos restore`, `NRestarts=0`). REMAINING engineering: a written on-hardware
+manual runbook (protocol smoke test; asrock claim/duty/release; fan restore-on-exit) and an idle-RSS
+measurement to back the leanness claim. Kept open.
 
 ## Requirements
 

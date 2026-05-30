@@ -2,12 +2,14 @@
 
 ## Status
 
-Status: open
+Status: completed
 
-Sub-state: idea captured 2026-05-30. Not started. **Depends on two foundational SOWs surfaced by
-this one:** SOW-0013 (decoupled per-anemos scheduler — for fast, low-latency power reaction) and
-SOW-0014 (typed module kinds + `input=` validation — so `power-state` is a distinct, validated input
-kind that a power-control module requires). Build those first.
+Sub-state: completed 2026-05-30. `nut` power-state sensor + `nvidia-powercap` reactor implemented
+(commit a7640e5; renamed gpu-powercap→nvidia-powercap in d2fc89b) and merged via Wave 2a integration
+(6-round external review). `nut` is live, reporting the `pr3000-nova` UPS. Caveat: the GPU power-cap
+action is **operator-disabled** (the host runs a deliberate 400 W cap; nvidia-powercap would restore
+the 600 W firmware default on AC), so the cap/restore was NOT exercised on hardware. SOW-0013 shipped;
+SOW-0014 (typed inputs) remains open and is not required for this SOW's correctness.
 
 ## Requirements
 
@@ -143,16 +145,28 @@ Off-hardware (this build):
   operator `nut.conf` (shipped commented).
 - Artifact gate: specs added (2) + protocol annotation; packaging + workspace updated.
 
-Pending (operator, on-hardware): per-GPU detect; a real or simulated on-battery event caps to
-`cap_pct`% and AC-restore/`gpu-powercap restore`/SIGTERM each restore the firmware default (verified
-by reading the limit after exit); confirm `nut` reads the live `pr3000-nova` UPS. Blocked items
-SOW-0013 (scheduler) / SOW-0014 (typed inputs) compose later and are not required for correctness.
+On-hardware (2026-05-30 cutover): `nut` reads the live `pr3000-nova` UPS — `status=ok`, the
+`power-state` reading shows `online`, `on_battery:false`, `charge:100`, `runtime_s≈5241`,
+`input_voltage≈229 V`, surfaced as the `aiolos_power_*` metrics. The `nvidia-powercap` **cap action
+was not exercised**: the operator keeps the GPUs at a 400 W cap and nvidia-powercap is commented out
+in the registry (it would restore 600 W on AC) — see the `aiolos.conf` note. The cap/lift decision
+logic is covered by 23 unit tests; a real on-battery cap event remains an optional operator test if
+the module is ever enabled with a configurable baseline (cross-refs SOW-0015).
 
 ## Outcome
-Pending.
+**Completed 2026-05-30.** The `nut` power-state sensor ships and runs live (UPS state + `aiolos_power_*`
+metrics). The `nvidia-powercap` reactor (NVML cap/restore, every-exit-path + `Drop` fail-safe, UPS
+on-battery trigger, 23 unit tests) ships and is review-converged, but is **operator-disabled** by the
+400 W-cap decision, so its cap action has not fired on hardware. Re-enabling it safely needs a
+configurable baseline (so it can cap *below* 400 W during a UPS event without restoring 600 W) — that,
+plus the thermal trigger, is SOW-0015. Moved to `done/`.
 
 ## Lessons Extracted
-Pending.
+- A power-cap reactor must adopt a pre-existing operator cap, not assume the firmware default is the
+  baseline: on this host the GPUs run a deliberate 400 W cap, so "restore to default (600 W)" is the
+  wrong fail-safe — the reason the module ships disabled until it gains a configurable baseline.
+- Restore-on-every-exit-path (and `Drop`) via direct panic-safe `stderr` writes is the load-bearing
+  guarantee for an actuator that changes a hardware power limit.
 
 ## Followup
 None yet.

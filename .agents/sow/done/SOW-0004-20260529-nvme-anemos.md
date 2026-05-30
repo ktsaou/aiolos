@@ -2,11 +2,12 @@
 
 ## Status
 
-Status: paused
+Status: completed
 
-Sub-state: code merged to `master` (commit 5ad7828); 3-round external review converged (5/5 ready
-to ship). PAUSED pending USER on-hardware validation + cutover approval before completion (the only
-remaining work is user-gated runtime testing). SOW-0005 is the active in-progress SOW.
+Sub-state: completed 2026-05-30. Code merged to `master` (commit 5ad7828); 3-round external review
+converged (5/5 ready to ship); validated on hardware at the 2026-05-30 production cutover — `nvme`
+runs live in `/opt/aiolos`, both drives report per-sensor temps, and those temps route into the
+`asrock16-2t` driving max via `module:id` keying. nvfd retired.
 
 ## Requirements
 
@@ -319,7 +320,11 @@ Tests or equivalent validation (compile-only — NOT executed):
   `cargo test --workspace --no-run` compiles all unit + integration tests. Nothing was run.
 
 Real-use evidence:
-- PENDING — user-gated on-hardware run/cutover (the C `nvfd` keeps cooling GPUs meanwhile).
+- **On-hardware cutover 2026-05-30:** aiolos deployed to `/opt/aiolos` and restarted (nvfd retired);
+  active/running, `NRestarts=0`, scheduler past tick 80k, all 7 instances `status=ok`. The two `nvme`
+  instances report `Composite`/`Sensor 1`/`Sensor 2` temps; the routed NVMe max appears as the asrock
+  `temp/NVMe` reading (e.g. 53 °C) folded into the board driving temperature. Multi-input `module:id`
+  routing confirmed live: asrock shows distinct GPU + NVMe + own-CPU temps.
 
 Reviewer findings (5 external models: GLM-5.1, MiMo-V2.5-Pro, Kimi-K2.6, Qwen3.6-Plus,
 MiniMax-M2.7; full-scope, read-only, iterated):
@@ -363,15 +368,18 @@ Reviewer follow-up mapping (non-blocking, future-host robustness — Kimi/Qwen, 
 
 ## Outcome
 
-**Code-complete and review-converged (3 rounds, 5 models, unanimous READY TO SHIP); NOT yet
-runtime-validated.** Per user constraint (production GPUs at risk) nothing was run/installed/tested:
-verification is compile + lint + format + external review only. The SOW stays **in-progress** until
-the user runs the on-hardware validation (protocol smoke test + observed cooling) and approves
-cutover; the C `nvfd` keeps cooling the GPUs until then. Not committed (awaiting user).
+**Completed 2026-05-30.** Code merged (5ad7828), review-converged (3 rounds, 5 models, unanimous
+READY TO SHIP), and validated on hardware at the production cutover: `nvme` runs as a sensor-only
+anemos, both drives' temps route into the `asrock16-2t` board-fan driving max via `module:id` keying,
+and the board fans respond to the combined GPU + NVMe + CPU/board picture. aiolos replaced `nvfd` as
+the production cooler. The no-hwmon-limp / silent-missing-source future-host robustness notes remain
+tracked follow-ups (below), not blockers on this host (both drives expose hwmon).
 
 ## Lessons Extracted
 
-Pending.
+- Keying routed inputs by `module:id` (not bare id) is what lets a consumer attribute and separately
+  report multiple producers (GPU vs NVMe); a `:`-bearing source name is then inert by construction
+  (it matches no module), which doubles as the guard against prefix-match ambiguity.
 
 ## Followup
 

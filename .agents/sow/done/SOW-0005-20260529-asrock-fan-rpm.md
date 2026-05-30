@@ -2,10 +2,11 @@
 
 ## Status
 
-Status: in-progress
+Status: completed
 
-Sub-state: code-complete; 4-round external review converged (5/5 ready to ship); awaiting USER
-on-hardware validation before completion. Not committed.
+Sub-state: completed 2026-05-30. Code merged (6040e9e); 4-round external review converged (5/5 ready
+to ship); validated on hardware at the 2026-05-30 cutover — `asrock16-2t` reports each board fan's
+real tachometer RPM and a true `0xda` pwm readback, live on the status page and `/metrics`.
 
 ## Requirements
 
@@ -245,9 +246,12 @@ Tests or equivalent validation (compile-only — NOT executed):
   `cargo test --workspace --no-run` compiles all unit tests. Nothing was run.
 
 Real-use evidence:
-- PENDING — user-gated on-hardware run. Must confirm: RPMs match `ipmitool sdr type Fan`; tach reads
-  correctly while fans are claimed-manual (the read-only probes ran with `nvfd` in control); apply
-  latency on the live BMC.
+- **On-hardware cutover 2026-05-30:** `asrock16-2t` runs live in `/opt/aiolos` and reports per-fan
+  `{pwm, rpm}` for all eight board fans (non-zero tach while the fans are claimed-manual), surfaced on
+  the status page and as `aiolos_fan_rpm` in `/metrics`; apply stays within its timeout (scheduler
+  past tick 80k, `status=ok`, `NRestarts=0`). Note: the per-fan *set-duty* path had a separate payload
+  bug (upper 8 bytes not mirrored) introduced by SOW-0010 and fixed at cutover (bee990e) — see
+  SOW-0010; the RPM/readback path delivered by this SOW was unaffected.
 
 Reviewer findings (5 external models, full-scope, read-only, 4 rounds — iterated to unanimous):
 - Round 1: design correct; fixed factor-cache retry, negative→omit RPM, doc, + live-verified tests;
@@ -273,17 +277,19 @@ Artifact maintenance gate:
 
 ## Outcome
 
-**Code-complete and review-converged (4 rounds, 5 models, unanimous READY TO SHIP); NOT yet
-runtime-validated.** Per the user constraint nothing was run/installed/tested — verification is
-compile + lint + format + external review. Two reviewer "blockers" (the R_exp/B_exp swap and the
-`& 0x03` mask) were proven false against the IPMI spec, ipmitool, and live hardware, and pinned with
-guard tests. The SOW stays **in-progress** until the user runs the on-hardware validation (RPMs vs
-`ipmitool`, tach-while-claimed-manual, apply latency) and approves; `nvfd` keeps cooling the GPUs
-meanwhile. Not committed (awaiting user).
+**Completed 2026-05-30.** Code merged (6040e9e), review-converged (4 rounds, 5 models, unanimous
+READY TO SHIP — the R_exp/B_exp swap and `& 0x03` mask "blockers" were proven false against the IPMI
+spec, ipmitool, and live hardware, and pinned with guard tests), and validated at the production
+cutover: all eight board fans report real RPM + a true pwm readback, live on the status page and
+`/metrics`, within the apply timeout. aiolos replaced `nvfd` as the production cooler.
 
 ## Lessons Extracted
 
-Pending.
+- A truthful `pwm` comes from reading the OEM `0xda` duty back, not echoing the commanded percent;
+  decoding RPM needs the per-sensor IPMI Reading Factors (M/B/exponents), validated against a known
+  live sensor (VOLT_3VSB → 3.42 V vs ipmitool) before trusting the fan numbers.
+- A reviewer "blocker" that contradicts live hardware is a false positive: pin the correct behaviour
+  with a guard test (the M/B mask, the R/B exponent order) rather than conceding to the model.
 
 ## Followup
 

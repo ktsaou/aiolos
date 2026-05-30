@@ -2,10 +2,12 @@
 
 ## Status
 
-Status: open
+Status: completed
 
-Sub-state: designed with the user 2026-05-30 (semantics agreed). Not started. Foundational
-orchestrator change; SOW-0009 (and faster cooling response generally) depend on it.
+Sub-state: completed 2026-05-30. Decoupled per-anemos scheduler (100 ms base tick, per-module
+every/timeout, async result channel, at-most-one-apply-in-flight, generation guard) implemented
+(commit 922e703) and merged via Wave 2a integration (6-round external review). Live at the cutover —
+scheduler past tick 80k, all 7 instances `status=ok`, `NRestarts=0`. nvfd retired.
 
 ## Requirements
 
@@ -164,8 +166,10 @@ before any cutover (operator-gated, like SOW-0004/0005).
 - Sensitive-data gate: none written (no BMC IP/creds/serials in code, tests, specs, or conf).
 - Same-failure search: no other lockstep `tick`/`timeout` consumers remain (grepped); the only
   `< tick`/`< heartbeat` contract statements were in the two specs + the protocol skill, all fixed.
-- Reviewer findings: none run by this subagent (no external reviewers per the task). The user's
-  review/cutover gate remains (nvfd keeps cooling until aiolos is cut over).
+- Reviewer findings: converged through the Wave 2a multi-model review (6 rounds; fixes include the
+  reap_dead fatal-backoff race ca07776, the scheduler slot lifecycle 9f5f588, and the stale-result
+  generation guard 84513e6). On-hardware at the 2026-05-30 cutover: scheduler past tick 80k, all 7
+  instances `status=ok`, `NRestarts=0`; a slow/hung anemos is delayed, never killing a healthy sibling.
 
 ### Follow-ups identified
 - Surface `AppState.sched` (latency / skipped_busy / busy) on the status page + `/metrics`
@@ -173,10 +177,18 @@ before any cutover (operator-gated, like SOW-0004/0005).
 - Curve EMA/`sensitivity` retuning guidance for sub-second cadences (doc-only; live-tunable).
 
 ## Outcome
-Pending.
+**Completed 2026-05-30.** aiolos now wakes on a 100 ms base tick and does only non-blocking work:
+it dispatches a fresh `apply` to each idle, due anemos and reaps async results from the per-anemos
+worker threads via one shared channel; at most one apply is in flight per anemos (slow → delayed, not
+skipped/queued), and only a per-anemos `timeout` breach kills+restores. A `generation` guard discards
+stale results across a respawn. Live and stable at the cutover (tick > 80k, `NRestarts=0`). Moved to
+`done/`.
 
 ## Lessons Extracted
-Pending.
+- Decoupling the wake period (base tick) from each module's cadence, with at-most-one-apply-in-flight
+  and delay-not-skip, makes a slow/hung anemos harmless to its siblings without a thread per tick.
+- An async result carried back over a channel must carry a `generation` (restart_count) so a result
+  that finishes after its instance was respawned is discarded, not applied to the new generation.
 
 ## Followup
 None yet.
