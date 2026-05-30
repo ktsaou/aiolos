@@ -22,6 +22,10 @@ const DEFAULT_STATUS_BIND: &str = "0.0.0.0:9876";
 const DEFAULT_TICK_SECS: u64 = 3;
 const DEFAULT_TIMEOUT_SECS: u64 = 2;
 const DEFAULT_DETECT_EVERY_SECS: u64 = 10;
+/// Cap for the exponential respawn backoff (a module is retried forever, but never slower than this).
+const DEFAULT_MAX_BACKOFF_SECS: u64 = 300;
+/// A `max_backoff` below this is meaningless (it would defeat the exponential ramp) — clamped up.
+const MIN_MAX_BACKOFF_SECS: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -32,6 +36,9 @@ pub struct Config {
     pub timeout: Duration,
     /// How often `detect` is re-run for hotplug reconciliation.
     pub detect_every: Duration,
+    /// Upper bound on the per-instance exponential respawn backoff. aiolos never gives up — it keeps
+    /// retrying a crashed/declared-fatal instance, but never slower than this (default 300 s).
+    pub max_backoff: Duration,
     /// `host:port` the read-only status page binds to.
     pub status_bind: String,
     /// Directory holding module binaries (`<bin_dir>/<module>`).
@@ -45,6 +52,7 @@ impl Default for Config {
             tick: Duration::from_secs(DEFAULT_TICK_SECS),
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             detect_every: Duration::from_secs(DEFAULT_DETECT_EVERY_SECS),
+            max_backoff: Duration::from_secs(DEFAULT_MAX_BACKOFF_SECS),
             status_bind: DEFAULT_STATUS_BIND.to_string(),
             bin_dir: PathBuf::from(DEFAULT_BIN_DIR),
         }
@@ -84,6 +92,17 @@ impl Config {
                     "tick" => tick_secs = parse_secs(key, val)?,
                     "timeout" => timeout_secs = parse_secs(key, val)?,
                     "detect_every" => cfg.detect_every = Duration::from_secs(parse_secs(key, val)?),
+                    "max_backoff" => {
+                        let secs = parse_secs(key, val)?;
+                        let clamped = secs.max(MIN_MAX_BACKOFF_SECS);
+                        if clamped != secs {
+                            warn!(
+                                requested = secs,
+                                clamped, "max_backoff too small; clamping up to the minimum"
+                            );
+                        }
+                        cfg.max_backoff = Duration::from_secs(clamped);
+                    }
                     "status_bind" => cfg.status_bind = val.to_string(),
                     other => warn!(key = %other, "unknown global directive ignored"),
                 }
@@ -161,6 +180,7 @@ mod tests {
         assert_eq!(c.tick, Duration::from_secs(3));
         assert_eq!(c.timeout, Duration::from_secs(2));
         assert_eq!(c.detect_every, Duration::from_secs(10));
+        assert_eq!(c.max_backoff, Duration::from_secs(300));
         assert_eq!(c.status_bind, "0.0.0.0:9876");
         assert!(c.registry.is_empty());
     }
@@ -172,6 +192,7 @@ mod tests {
 tick=5
 timeout=3
 detect_every=20
+max_backoff=120
 status_bind=127.0.0.1:9000
 
 nvidia
@@ -181,6 +202,7 @@ asrock16-2t  input=nvidia   # board fans follow GPU temps
         assert_eq!(c.tick, Duration::from_secs(5));
         assert_eq!(c.timeout, Duration::from_secs(3));
         assert_eq!(c.detect_every, Duration::from_secs(20));
+        assert_eq!(c.max_backoff, Duration::from_secs(120));
         assert_eq!(c.status_bind, "127.0.0.1:9000");
         assert_eq!(c.registry.len(), 2);
         assert_eq!(c.registry[0].module_name, "nvidia");
@@ -208,6 +230,17 @@ asrock16-2t  input=nvidia   # board fans follow GPU temps
     #[test]
     fn bad_global_value_errors() {
         assert!(Config::parse("tick=abc").is_err());
+        assert!(Config::parse("max_backoff=abc").is_err());
+    }
+
+    #[test]
+    fn max_backoff_clamped_up_and_parsed() {
+        // A too-small max_backoff is clamped up to the minimum (it must not defeat the ramp).
+        let c = Config::parse("max_backoff=0").unwrap();
+        assert_eq!(c.max_backoff, Duration::from_secs(1));
+        // A larger explicit value is honoured verbatim.
+        let c = Config::parse("max_backoff=600").unwrap();
+        assert_eq!(c.max_backoff, Duration::from_secs(600));
     }
 
     #[test]

@@ -68,6 +68,7 @@ fn main() -> Result<()> {
         tick_s = cfg.tick.as_secs(),
         timeout_s = cfg.timeout.as_secs(),
         detect_every_s = cfg.detect_every.as_secs(),
+        max_backoff_s = cfg.max_backoff.as_secs(),
         status_bind = %cfg.status_bind,
         bin_dir = %cfg.bin_dir.display(),
         modules = cfg.registry.len(),
@@ -107,6 +108,7 @@ fn main() -> Result<()> {
                 Arc::clone(&state),
                 cfg.bin_dir.clone(),
                 cfg.detect_every,
+                cfg.max_backoff,
             ),
             respawns: 0,
             last_spawn: Instant::now(),
@@ -176,6 +178,7 @@ fn respawn_dead_supervisors(
             Arc::clone(state),
             cfg.bin_dir.clone(),
             cfg.detect_every,
+            cfg.max_backoff,
         );
         s.last_spawn = Instant::now();
     }
