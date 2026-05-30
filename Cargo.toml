@@ -6,11 +6,14 @@ members = [
     "tech/nvml",       # level-1 tech: NVML GPU access
     "tech/hwmon",      # level-1 tech: hwmon sysfs sensors
     "tech/nvme",       # level-1 tech: NVMe enumeration + per-drive temps
+    "tech/nut",        # level-1 tech: NUT/upsc UPS client (read-only)
     "aiolos",          # orchestrator
     "anemoi/nvidia",   # level-3 anemos
     "anemoi/asrock16-2t",
     "anemoi/nvme",     # level-3 anemos (sensor-only: NVMe temps)
     "anemoi/ipmi-temps", # level-3 anemos (sensor-only: BMC board/CPU/DIMM/NIC temps)
+    "anemoi/nut",      # level-3 anemos (sensor-only: UPS / utility-power state)
+    "anemoi/gpu-powercap", # level-3 anemos (curve-less control: cap GPU power on utility-power loss)
 ]
 resolver = "2"
 

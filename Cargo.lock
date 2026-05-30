@@ -38,6 +38,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "anemoi-gpu-powercap"
+version = "0.1.0"
+dependencies = [
+ "anemos",
+ "anyhow",
+ "nvml",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "anemoi-ipmi-temps"
 version = "0.1.0"
 dependencies = [
@@ -45,6 +56,17 @@ dependencies = [
  "anyhow",
  "ipmi",
  "serde_json",
+]
+
+[[package]]
+name = "anemoi-nut"
+version = "0.1.0"
+dependencies = [
+ "anemos",
+ "anyhow",
+ "nut",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -214,6 +236,10 @@ checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys",
 ]
+
+[[package]]
+name = "nut"
+version = "0.1.0"
 
 [[package]]
 name = "nvme"

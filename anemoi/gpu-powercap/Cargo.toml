@@ -1,0 +1,17 @@
+[package]
+name = "anemoi-gpu-powercap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "gpu-powercap"
+path = "src/main.rs"
+
+[dependencies]
+anemos = { path = "../../anemos" }   # level-2 SDK (lifecycle/signals/logging + traits)
+nvml = { path = "../../tech/nvml" }  # level-1 tech (NVML GPU access incl. power-limit get/set/restore)
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
