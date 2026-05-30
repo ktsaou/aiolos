@@ -63,6 +63,8 @@ Open decisions:
   orchestrator has each module's declaration (before spawning `run` instances).
 - **Multiplicity:** can a module `require` more than one type, or produce several? (Default: produce a
   set; require zero-or-one — keeps validation simple. Revisit if a consumer needs two input kinds.)
+  **Concrete case:** SOW-0015 (`nvidia-powercap` thermal trigger) requires BOTH `power-state` AND
+  `temp` — the first real two-input consumer. So `requires` must support a **set**, not zero-or-one.
 - **Type registry:** the canonical set of reading/role types (`temp`, `fan`, `power-state`, …) and how
   new ones are added (open string vs a closed enum).
 - **Strictness:** the user chose **fail** (not warn) on a mismatch — confirm fail-hard at startup
