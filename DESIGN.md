@@ -276,10 +276,11 @@ The protocol is language-agnostic; any anemos may be written in any language lat
 `etc/<anemos>.curve.json` — temperature → duty %, linear-interpolated, clamped, hold-outside, plus
 an optional `"sensitivity"` knob (EMA α, 0–1) for noise smoothing. Default (both modules):
 ```json
-{"35": 35, "80": 100, "sensitivity": 0.5}
+{"30": 30, "80": 100, "sensitivity": 0.5}
 ```
-- **Floor 35% / ceiling 100%:** below 35 °C → 35%, above 80 °C → 100%. The curve NEVER yields below
-  35% — a wrong/low sensor reading can't stop or minimise the fans in manual mode.
+- **Floor 30% / ceiling 100%:** below 30 °C → 30%, above 80 °C → 100%. The curve NEVER yields below
+  30% — a wrong/low sensor reading can't stop or minimise the fans in manual mode. (30% matches the
+  board's firmware idle; it lowered from the original 35% — supersedes SOW-0001 #16.)
 - **`sensitivity`** (EMA α): lower = smoother / less reactive to noisy spikes; higher = more
   responsive. Live-reloaded each tick (no restart). A single bad reading is diluted to ≈ α·Δ.
 - The file is re-read every tick, so curve and sensitivity edits take effect on the next tick.

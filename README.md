@@ -89,19 +89,19 @@ Each module reads its curve **on every tick** (edit it live; no restart). A curv
 to fan duty, linear-interpolated and clamped, with an EMA "sensitivity" knob:
 
 ```json
-{ "35": 35, "80": 100, "sensitivity": 0.5 }
+{ "30": 30, "80": 100, "sensitivity": 0.5 }
 ```
 
-- **≤ 35 °C → 35 %**, **≥ 80 °C → 100 %**, linear between. The 35 % floor means a single bad/low
-  sensor reading can never stop or minimise the fans.
+- **≤ 30 °C → 30 %**, **≥ 80 °C → 100 %**, linear between. The 30 % floor (matching the board's
+  firmware idle) means a single bad/low sensor reading can never stop or minimise the fans.
 - **`sensitivity`** is the EMA weight (0–1). Lower = smoother / less reactive to noisy spikes
   (e.g. jittery AMD `Tctl`); higher = snappier. A small deadband suppresses fan "hunting".
 
 | Temp | Duty |
 |-----:|-----:|
-| ≤35 °C | 35% |
-| 50 °C | 57% |
-| 65 °C | 78% |
+| ≤30 °C | 30% |
+| 50 °C | 58% |
+| 65 °C | 79% |
 | ≥80 °C | 100% |
 
 ---

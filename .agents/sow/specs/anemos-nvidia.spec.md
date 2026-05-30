@@ -56,10 +56,11 @@ the curve is missing/empty the module holds firmware/default control rather than
 Temperature °C → fan %, linear-interpolated, clamped, hold-outside, plus a `sensitivity` key (the
 live EMA α, not a curve point):
 ```json
-{"35":35,"80":100,"sensitivity":0.5}
+{"30":30,"80":100,"sensitivity":0.5}
 ```
-Default (decision SOW-0001 #16): ≤35 °C → 35 %, ≥80 °C → 100 %, linear between — a **35 % floor**
-so a wrong low reading can never stop/minimise the fans. `sensitivity` (0.5 default; lower =
+Default: ≤30 °C → 30 %, ≥80 °C → 100 %, linear between — a **30 % floor** so a wrong low reading can
+never stop/minimise the fans. (30 % matches the board's firmware idle; lowered from the original
+35 % — supersedes SOW-0001 #16.) `sensitivity` (0.5 default; lower =
 smoother/less spike-sensitive, higher = more responsive) is reloaded every tick.
 
 ## Acceptance criteria

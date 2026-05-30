@@ -25,7 +25,8 @@ Three reuse levels exist so a module carries only its device logic:
    Depend on the ones you need; add a new one for a new technology.
 2. **Level-2 `anemos` SDK**: owns the lifecycle (`anemos::run` — CLI dispatch, signals, logging,
    the protocol stdio loops, the restore-on-shutdown/EOF/signal wiring), the signal-aware
-   `StdinReader`, the `Controller` (temp→duty: curve + EMA + deadband + 35% floor), and the
+   `StdinReader`, the `Controller` (temp→duty: curve + EMA + deadband; the floor is the curve's
+   lowest point, default 30%), and the
    `Anemos`/`Device` traits. **All of this is inherited — never copy it.**
 3. **Level-3 (your module)**: implement `Anemos` (detect / open / restore_all) + `Device`
    (apply / restore), and a `main()` of `anemos::run(ModuleInfo { .. }, MyAnemos::new())`.
@@ -90,7 +91,7 @@ impl Anemos for Demo {
 impl Device for Dev {
     fn apply(&mut self, _inputs: Option<&Inputs>, ctrl: &mut Controller) -> Applied {
         let temp = self.read_temp();                 // your tech crate
-        match ctrl.duty(temp).pct {                  // SDK: curve + EMA + deadband + 35% floor
+        match ctrl.duty(temp).pct {                  // SDK: curve + EMA + deadband (30% curve floor)
             Some(p) => { if let Err(e) = self.set(p) { self.restore_dev(); return Applied::error(e.to_string()); } }
             None    => self.set_default(),           // empty curve -> firmware/auto
         }
