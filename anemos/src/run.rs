@@ -245,6 +245,10 @@ fn init_logging() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        // An anemos's stderr is always captured by aiolos (status page + journal), never a user
+        // terminal — emit plain text so no ANSI colour escapes (`\x1b[2m` …) leak into the captured
+        // tail. (tracing's default auto-detect can still enable them here; force them off.)
+        .with_ansi(false)
         .init();
 }
 
