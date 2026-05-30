@@ -163,7 +163,7 @@ impl FanControl for nvml_wrapper::Device<'_> {
 /// `min > max` cannot happen on real hardware; if it ever did, `u32::clamp` would panic, so guard it.
 pub fn clamp_power_limit(requested_mw: u32, min_mw: u32, max_mw: u32) -> u32 {
     if min_mw > max_mw {
-        return max_mw; // degenerate constraints: prefer the lower (safer) bound
+        return max_mw; // degenerate constraints (min > max): max_mw is the numerically SMALLER value here, so return it as the safer (lower) bound
     }
     requested_mw.clamp(min_mw, max_mw)
 }

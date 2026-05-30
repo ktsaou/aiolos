@@ -98,7 +98,10 @@ fn main() -> Result<()> {
 
     // Single shared results channel: every worker posts its async `apply` result here; the main loop
     // drains it non-blockingly each base tick (SOW-0013). The receiver lives only in main; each
-    // supervisor (and thus each worker) gets a clone of the sender.
+    // supervisor (and thus each worker) gets a clone of the sender. Unbounded by design, but bounded
+    // in practice: at most one apply is in flight per instance, so the queue depth between drains is
+    // <= the instance count, and the main loop drains every base_tick (100ms) — far faster than it
+    // fills. (A bounded channel would add backpressure we never want on the fail-safe result path.)
     let (results_tx, results_rx) = mpsc::channel::<TickReport>();
 
     // Supervisor per module, tracked so the watchdog can respawn one whose thread dies (panics).
@@ -127,7 +130,7 @@ fn main() -> Result<()> {
     loop {
         if SHUTDOWN_FLAG.load(Ordering::Acquire) {
             info!("signal received — graceful shutdown");
-            graceful_shutdown(&state);
+            graceful_shutdown(&state, cfg.max_apply_timeout());
             break;
         }
 
@@ -311,6 +314,9 @@ fn dispatch_due(
             to_send.push((key, inputs, cmd_tx, sched.timeout));
         } else if slot.busy {
             // Due-but-busy is the delay-not-skip case worth counting; not-yet-due is just waiting.
+            // NB: increments once per WAKE while due+busy (not once per missed `every` window), so it
+            // scales with base_tick — read it as a relative "chronically slow?" signal, not an
+            // absolute missed-dispatch count.
             if matches!(slot.last_dispatch, Some(t) if now.saturating_duration_since(t) >= sched.every)
             {
                 slot.skipped_busy = slot.skipped_busy.saturating_add(1);
@@ -400,7 +406,7 @@ fn apply_results(s: &mut AppState, reports: Vec<TickReport>, wake_count: u64) {
         if let Some(e) = s.instances.get_mut(&key) {
             e.last_status = result.status.as_str().to_string();
             e.last_error = result.error;
-            e.last_seen_tick = wake_count;
+            e.last_seen = Instant::now();
             if is_ok {
                 e.last_readings = result.readings.clone();
             }
@@ -476,7 +482,7 @@ fn summarize_readings(readings: &[Reading]) -> String {
         .join(" ")
 }
 
-fn graceful_shutdown(state: &Arc<RwLock<AppState>>) {
+fn graceful_shutdown(state: &Arc<RwLock<AppState>>, max_apply_timeout: Duration) {
     let txs: Vec<mpsc::Sender<InstanceCmd>> = {
         let s = state.read().unwrap_or_else(|e| e.into_inner());
         s.instances.values().map(|e| e.cmd_tx.clone()).collect()
@@ -485,8 +491,13 @@ fn graceful_shutdown(state: &Arc<RwLock<AppState>>) {
     for tx in &txs {
         let _ = tx.send(InstanceCmd::Shutdown);
     }
-    // Wait (bounded) for every worker to restore its device and exit.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Wait (bounded) for every worker to restore its device and exit. A worker mid-`apply` only sees
+    // the Shutdown once its in-flight apply finishes (up to its `timeout`), then runs its own ~2 s
+    // restore grace — so the deadline must outlive `max_apply_timeout + that grace`, or we'd exit
+    // before a slow module confirms restore. (Stdin EOF would still restore it, but we prefer to
+    // confirm.) A 5 s floor keeps fast configs unchanged.
+    let deadline =
+        Instant::now() + (max_apply_timeout + Duration::from_secs(2)).max(Duration::from_secs(5));
     while ACTIVE_INSTANCES.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
     }
@@ -548,7 +559,10 @@ pub struct InstanceEntry {
     pub last_error: Option<String>,
     pub last_readings: Vec<Reading>,
     pub restart_count: u32,
-    pub last_seen_tick: u64,
+    /// Wall-clock of this instance's last reported result (initialised to spawn time). Drives the
+    /// cadence-independent `seconds_since_seen` staleness metric — SOW-0013 turned the tick into a
+    /// 100 ms wake, so a tick-count staleness was no longer a stable unit.
+    pub last_seen: Instant,
     pub cmd_tx: mpsc::Sender<InstanceCmd>,
     pub stderr_tail: StderrTail,
 }
@@ -612,7 +626,7 @@ mod tests {
                 last_error: None,
                 last_readings: Vec::new(),
                 restart_count: 0,
-                last_seen_tick: 0,
+                last_seen: Instant::now(),
                 cmd_tx: tx,
                 stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             },
@@ -709,7 +723,7 @@ mod tests {
                 last_error: None,
                 last_readings: Vec::new(),
                 restart_count: 0,
-                last_seen_tick: 0,
+                last_seen: Instant::now(),
                 cmd_tx: tx,
                 stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             },
@@ -770,7 +784,7 @@ mod tests {
                     last_error: None,
                     last_readings: Vec::new(),
                     restart_count: 0,
-                    last_seen_tick: 0,
+                    last_seen: Instant::now(),
                     cmd_tx: tx,
                     stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
                 },

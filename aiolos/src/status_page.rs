@@ -197,8 +197,7 @@ struct InstanceJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
     restart_count: u32,
-    last_seen_tick: u64,
-    ticks_since_seen: u64,
+    seconds_since_seen: u64,
     readings: &'a [Reading],
     stderr_tail: Vec<String>,
 }
@@ -229,8 +228,7 @@ fn render_json(state: &Arc<RwLock<AppState>>) -> String {
             status: &i.last_status,
             error: i.last_error.as_deref(),
             restart_count: i.restart_count,
-            last_seen_tick: i.last_seen_tick,
-            ticks_since_seen: tick.saturating_sub(i.last_seen_tick),
+            seconds_since_seen: i.last_seen.elapsed().as_secs(),
             // Defensive ANSI strip: stale tails captured before the SDK's `.with_ansi(false)` fix
             // could still carry escape codes; never let them reach the UI.
             readings: &i.last_readings,
@@ -517,8 +515,8 @@ fn render_metrics(state: &Arc<RwLock<AppState>>) -> String {
             i.restart_count
         ));
         m.stale.push(format!(
-            "aiolos_instance_ticks_since_seen{{{base}}} {}",
-            s.tick_count.saturating_sub(i.last_seen_tick)
+            "aiolos_instance_seconds_since_seen{{{base}}} {}",
+            i.last_seen.elapsed().as_secs()
         ));
 
         // Disambiguate duplicate (kind,label) within an instance (e.g. two "CPU" sockets) by
@@ -568,6 +566,40 @@ fn render_metrics(state: &Arc<RwLock<AppState>>) -> String {
                         ));
                     }
                 }
+                // SOW-0009 power readings: `powercap` = nvidia-powercap control state; `power-state`
+                // = nut UPS state. Booleans are exported as 0/1 gauges via `bnum`.
+                "powercap" => {
+                    if let Some(c) = bnum(r, "capped") {
+                        m.pc_capped
+                            .push(format!("aiolos_powercap_capped{{{full}}} {}", fmt_num(c)));
+                    }
+                    if let Some(v) = num(r, "limit_mw") {
+                        m.pc_limit
+                            .push(format!("aiolos_powercap_limit_mw{{{full}}} {}", fmt_num(v)));
+                    }
+                    if let Some(v) = num(r, "draw_mw") {
+                        m.pc_draw
+                            .push(format!("aiolos_powercap_draw_mw{{{full}}} {}", fmt_num(v)));
+                    }
+                }
+                "power-state" => {
+                    if let Some(b) = bnum(r, "on_battery") {
+                        m.ps_on_battery
+                            .push(format!("aiolos_power_on_battery{{{full}}} {}", fmt_num(b)));
+                    }
+                    if let Some(v) = num(r, "runtime_s") {
+                        m.ps_runtime.push(format!(
+                            "aiolos_power_runtime_seconds{{{full}}} {}",
+                            fmt_num(v)
+                        ));
+                    }
+                    if let Some(v) = num(r, "charge") {
+                        m.ps_charge.push(format!(
+                            "aiolos_power_charge_percent{{{full}}} {}",
+                            fmt_num(v)
+                        ));
+                    }
+                }
                 _ => {}
             }
         }
@@ -591,6 +623,13 @@ struct MetricBuf {
     restarts: Vec<String>,
     stale: Vec<String>,
     detect_up: Vec<String>,
+    // SOW-0009 power series.
+    pc_capped: Vec<String>,
+    pc_limit: Vec<String>,
+    pc_draw: Vec<String>,
+    ps_on_battery: Vec<String>,
+    ps_runtime: Vec<String>,
+    ps_charge: Vec<String>,
 }
 
 impl MetricBuf {
@@ -653,9 +692,9 @@ impl MetricBuf {
         );
         emit(
             out,
-            "aiolos_instance_ticks_since_seen",
+            "aiolos_instance_seconds_since_seen",
             "gauge",
-            "Ticks since the instance last reported (staleness).",
+            "Seconds since the instance last reported (staleness).",
             &self.stale,
         );
         emit(
@@ -664,6 +703,48 @@ impl MetricBuf {
             "gauge",
             "1 if the module's last detect was ok, else 0.",
             &self.detect_up,
+        );
+        emit(
+            out,
+            "aiolos_powercap_capped",
+            "gauge",
+            "1 if aiolos is currently capping this GPU's power limit, else 0.",
+            &self.pc_capped,
+        );
+        emit(
+            out,
+            "aiolos_powercap_limit_mw",
+            "gauge",
+            "Effective GPU power limit in milliwatts.",
+            &self.pc_limit,
+        );
+        emit(
+            out,
+            "aiolos_powercap_draw_mw",
+            "gauge",
+            "Current GPU power draw in milliwatts.",
+            &self.pc_draw,
+        );
+        emit(
+            out,
+            "aiolos_power_on_battery",
+            "gauge",
+            "1 if this UPS is on battery (utility power lost), else 0.",
+            &self.ps_on_battery,
+        );
+        emit(
+            out,
+            "aiolos_power_runtime_seconds",
+            "gauge",
+            "Estimated UPS runtime remaining in seconds.",
+            &self.ps_runtime,
+        );
+        emit(
+            out,
+            "aiolos_power_charge_percent",
+            "gauge",
+            "UPS battery charge percent.",
+            &self.ps_charge,
         );
     }
 }
@@ -687,6 +768,15 @@ fn emit(out: &mut String, name: &str, kind: &str, help: &str, lines: &[String]) 
 /// Read a numeric reading field as f64 (ints or floats).
 fn num(r: &Reading, key: &str) -> Option<f64> {
     r.fields.get(key).and_then(|v| v.as_f64())
+}
+
+/// Read a JSON boolean field as a Prometheus 0/1 gauge value (`num` only handles JSON numbers, and
+/// `as_f64()` returns `None` for a bool).
+fn bnum(r: &Reading, key: &str) -> Option<f64> {
+    r.fields
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .map(|b| if b { 1.0 } else { 0.0 })
 }
 
 /// Format an f64 for Prometheus: drop the trailing `.0` for whole numbers, else plain decimal.
@@ -792,6 +882,7 @@ mod tests {
     use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::mpsc;
+    use std::time::Instant;
 
     fn mk_instance(
         module: &str,
@@ -809,7 +900,7 @@ mod tests {
             last_error: None,
             last_readings: readings,
             restart_count: 0,
-            last_seen_tick: 0,
+            last_seen: Instant::now(),
             cmd_tx: tx,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
         }

@@ -16,6 +16,16 @@ pub struct RegistryEntry {
     pub unknown_directives: Vec<String>,
 }
 
+impl RegistryEntry {
+    /// A module name is routable only if it is non-empty and contains no `:`. The blackboard keys
+    /// readings by `module:id`, so a `:` in the name would make a source prefix match the wrong
+    /// module. `Config::parse` drops a non-routable line loudly; the invariant lives here so any
+    /// caller building a registry directly can enforce it too.
+    pub fn name_is_routable(&self) -> bool {
+        !self.module_name.is_empty() && !self.module_name.contains(':')
+    }
+}
+
 /// Parse one already-trimmed, non-empty, non-comment module line.
 pub fn parse_module_line(line: &str) -> RegistryEntry {
     let mut tokens = line.split_whitespace();

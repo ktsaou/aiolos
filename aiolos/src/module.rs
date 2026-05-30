@@ -442,7 +442,7 @@ impl Supervisor {
                     last_error: None,
                     last_readings: Vec::new(),
                     restart_count,
-                    last_seen_tick: 0,
+                    last_seen: Instant::now(),
                     cmd_tx: cmd_tx.clone(),
                     stderr_tail: tail,
                 },

@@ -535,7 +535,7 @@ function viewHealth() {
       el('td', { text: i.name }),
       el('td', {}, [el('span', { class: 'status-pill ' + (ok ? 'ok' : 'bad'), text: i.status })]),
       el('td', { text: String(i.restart_count) }),
-      el('td', { text: String(i.ticks_since_seen) }),
+      el('td', { text: i.seconds_since_seen + 's' }),
       el('td', {}, [el('div', { class: 'tail', text: (i.stderr_tail || []).join('\n') })]),
     ]));
   }

@@ -186,7 +186,10 @@ impl GpuCap {
     /// unchanged limit is never re-commanded every tick. Returns the limit in effect (mW).
     fn apply_cap(&mut self, target_mw: u32, reason: CapReason) -> anyhow::Result<u32> {
         // Dedupe on the REQUESTED target so an unchanged request is never re-issued. Report the
-        // previously-applied (clamped) limit without another NVML write.
+        // previously-applied (clamped) limit without another NVML write. Trade-off: if a GPU's
+        // accepted [min,max] window shifted at runtime (some expose thermal-dependent limits), an
+        // unchanged request would not be re-clamped — acceptable, as the cap is coarse battery
+        // protection, not a precise setpoint.
         if let Some(applied) = self.applied_cap_mw {
             if applied.requested_mw == target_mw {
                 return Ok(applied.actual_mw);

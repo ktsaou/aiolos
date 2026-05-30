@@ -107,6 +107,16 @@ impl Config {
             })
     }
 
+    /// The largest per-anemos `apply` timeout across the registry (default if none). Used to size the
+    /// graceful-shutdown grace so the orchestrator outlives the slowest possible in-flight apply.
+    pub fn max_apply_timeout(&self) -> Duration {
+        self.schedules
+            .values()
+            .map(|s| s.timeout)
+            .max()
+            .unwrap_or(Duration::from_millis(DEFAULT_MODULE_TIMEOUT_MS))
+    }
+
     /// Load and parse the config from `AIOLOS_CONF` (or the default path).
     pub fn load() -> Result<Self> {
         let conf_path = std::env::var("AIOLOS_CONF").unwrap_or_else(|_| DEFAULT_CONF.to_string());
@@ -163,10 +173,10 @@ impl Config {
             }
 
             let entry = parse_module_line(line);
-            // A module name with `:` would make the `module:id` routing key ambiguous (a source
-            // prefix could match the wrong module). Reject the line loudly rather than route wrong.
-            if entry.module_name.contains(':') {
-                warn!(module = %entry.module_name, "module name contains ':' (breaks input routing keys) — ignoring this module line");
+            // A non-routable name (empty, or `:` which would make the `module:id` routing key
+            // ambiguous) is rejected loudly rather than routed wrong. Invariant on RegistryEntry.
+            if !entry.name_is_routable() {
+                warn!(module = %entry.module_name, "module name is not routable (empty or contains ':') — ignoring this module line");
                 continue;
             }
             cfg.registry.push(entry);
