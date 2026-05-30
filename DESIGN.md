@@ -261,6 +261,9 @@ The protocol is language-agnostic; any anemos may be written in any language lat
   non-zero anyway).
 - Release (fail-safe): `0x3a 0xd8` + sixteen `0x00`  (BMC reclaims auto)
 - Query duty: `0x3a 0xda`
+- Per-fan RPM (SOW-0005): standard IPMI on `FAN1_1..FAN8_1` (sensors `0x60..0x67`) — cache the
+  conversion factors via `Get Sensor Reading Factors` (`0x04/0x23`) at open, then `Get Sensor
+  Reading` (`0x04/0x2d`) each tick (no SDR-repo walk). Read-only; reported as each fan's `rpm`.
 - Temps: `TEMP_CPU1/2`, `TEMP_MB1/2`, `TEMP_CARD_SIDE1`, `TEMP_DDR4_*` via IPMI sensor reads
   (or CPU temp via `k10temp` sysfs).
 - **fail-safe:** EOF/shutdown → release (all `0xd8`=0x00). Critical: while claimed, the BMC's

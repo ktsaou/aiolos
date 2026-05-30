@@ -4,18 +4,40 @@
 //! lives in the `ipmi` crate.
 
 use anyhow::{bail, Result};
-use ipmi::Ipmi;
+use ipmi::{Ipmi, SensorFactors, SensorReading};
+use std::time::Duration;
 
 const NETFN_OEM: u8 = 0x3a;
 const CMD_FAN_MODE: u8 = 0xd8; // claim (0x01×16) / release (0x00×16)
 const CMD_SET_DUTY: u8 = 0xd6;
 const CMD_QUERY_DUTY: u8 = 0xda;
 
-/// The board's fan controller: an IPMI handle plus whether we currently hold manual control (so we
-/// claim ONCE, not every tick).
+/// Short per-call timeout for the read-only observability reads (RPM tachs + duty readback). Keeps
+/// the whole observability batch well under the orchestrator's apply deadline even on a slow BMC: a
+/// laggy sensor just degrades to "no reading" rather than dominating the tick. Control commands
+/// (claim/set/release) keep the full default IPMI timeout — they must be reliable, not fast.
+/// The observability batch is bounded by construction to ≤ 9 IPMI calls per tick (≤ 1 per fan +
+/// the duty readback — see `read_fan_rpms`), so at 100 ms each the worst case is ~0.9 s, well under
+/// the default 2 s apply deadline, while a healthy BMC (single-digit-ms reads) keeps ~10–20× headroom.
+const OBS_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Tachometer sensor numbers for FAN1_1..FAN8_1 (Entity 29, Fan Device) — verified on this board.
+/// FAN1/FAN2 are the Noctua CPU coolers (low RPM), FAN3–FAN8 the 120 mm case fans. The `FAN*_2`
+/// (`0x68..0x6F`) and `FAN_PSU*` (`0x70/0x71`) sensors report "No Reading" here and are not read.
+const FAN_SENSORS: [u8; 8] = [0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67];
+
+/// Observability snapshot: the per-fan duty readback (`0xda`, or `None` if it failed) and each
+/// fan's `(label, RPM-or-None)`.
+type FanStatus = (Option<Vec<u8>>, Vec<(String, Option<i32>)>);
+
+/// The board's fan controller: an IPMI handle, whether we currently hold manual control (so we
+/// claim ONCE, not every tick), and the per-fan tach conversion factors. Each fan's factors are
+/// fetched lazily and cached once known (they are constant for these linear sensors); a fan still
+/// `None` is retried on later ticks, so a transient BMC hiccup on the first read is not permanent.
 pub struct Board {
     ipmi: Ipmi,
     claimed: bool,
+    fan_factors: [Option<SensorFactors>; 8],
 }
 
 impl Board {
@@ -23,6 +45,7 @@ impl Board {
         Ok(Board {
             ipmi: Ipmi::open()?,
             claimed: false,
+            fan_factors: [None; 8],
         })
     }
 
@@ -58,6 +81,69 @@ impl Board {
     pub fn query_duty(&mut self) -> Result<Vec<u8>> {
         self.ipmi.raw(NETFN_OEM, CMD_QUERY_DUTY, &[])
     }
+
+    /// Best-effort: fetch and cache every fan's conversion factors once, at instance bind, so the
+    /// first `apply` tick is no heavier than the rest (8 factor reads happen here, off the tick's
+    /// deadline). Failures are left `None` and retried by `read_fan_rpms`. Short-timeout, read-only.
+    pub fn prefetch_fan_factors(&mut self) {
+        for (i, &sensor) in FAN_SENSORS.iter().enumerate() {
+            if self.fan_factors[i].is_none() {
+                self.fan_factors[i] = self.ipmi.read_sensor_factors(sensor, 0, OBS_TIMEOUT).ok();
+            }
+        }
+    }
+
+    /// Read-only observability snapshot under the short `OBS_TIMEOUT`: the live per-fan duty (the
+    /// `0xda` readback, or `None` if it failed) and each fan's tachometer RPM. Never touches fan
+    /// control; a slow/unreadable sensor degrades to `None`, never blowing the caller's tick.
+    pub fn read_fan_status(&mut self) -> FanStatus {
+        let duty = self
+            .ipmi
+            .raw_with_timeout(NETFN_OEM, CMD_QUERY_DUTY, &[], OBS_TIMEOUT)
+            .ok();
+        (duty, self.read_fan_rpms())
+    }
+
+    /// Each fan's tachometer RPM via standard IPMI sensor reads (`FAN1..FAN8`). At most **one** IPMI
+    /// call per fan per tick: if a fan's constant conversion factors aren't cached yet (prefetch
+    /// failed), fetch them this tick and report no RPM until the next one — so even a cold cache
+    /// never does factor+sensor in the same tick (the whole observability batch stays ≤ 9 calls).
+    /// A fan whose sensor is unavailable or errors yields `None`. Short-timeout, read-only.
+    fn read_fan_rpms(&mut self) -> Vec<(String, Option<i32>)> {
+        FAN_SENSORS
+            .iter()
+            .enumerate()
+            .map(|(i, &sensor)| {
+                let rpm = match self.fan_factors[i] {
+                    Some(f) => fan_rpm(Some(f), self.ipmi.read_sensor(sensor, OBS_TIMEOUT).ok()),
+                    None => {
+                        // Factors unknown -> fetch them now (one call); RPM comes next tick. The
+                        // reading byte (0) is immaterial for a linear sensor.
+                        self.fan_factors[i] =
+                            self.ipmi.read_sensor_factors(sensor, 0, OBS_TIMEOUT).ok();
+                        None
+                    }
+                };
+                (format!("FAN{}", i + 1), rpm)
+            })
+            .collect()
+    }
+}
+
+/// Convert a tach sensor reading to RPM, or `None` when the factors are missing, the reading
+/// failed, the sensor reports its value as unavailable, or the conversion is negative (which would
+/// indicate bad factors / a firmware bug — omit it rather than report a nonsensical RPM). Pure
+/// (unit-testable without hardware).
+fn fan_rpm(factors: Option<SensorFactors>, reading: Option<SensorReading>) -> Option<i32> {
+    let (f, r) = (factors?, reading?);
+    if !r.available {
+        return None;
+    }
+    let rpm = f.convert(r.raw).round();
+    if rpm < 0.0 {
+        return None;
+    }
+    Some(rpm as i32)
 }
 
 // ---- fan-control policy (trait-based so it is unit-testable without hardware) ----
@@ -201,6 +287,71 @@ mod tests {
         assert!(
             !b.claimed,
             "must never be left claimed-manual without a fresh duty"
+        );
+    }
+
+    #[test]
+    fn fan_rpm_converts_only_a_valid_reading() {
+        // Verified board factors: M=100, B=0, exps=0 -> RPM = raw*100.
+        let f = SensorFactors {
+            m: 100,
+            b: 0,
+            b_exp: 0,
+            r_exp: 0,
+        };
+        let avail = SensorReading {
+            raw: 6,
+            available: true,
+        };
+        assert_eq!(fan_rpm(Some(f), Some(avail)), Some(600));
+
+        // Edge raw values still convert linearly.
+        assert_eq!(
+            fan_rpm(
+                Some(f),
+                Some(SensorReading {
+                    raw: 0,
+                    available: true
+                })
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            fan_rpm(
+                Some(f),
+                Some(SensorReading {
+                    raw: 255,
+                    available: true
+                })
+            ),
+            Some(25500)
+        );
+
+        // Unavailable / missing reading / missing factors -> None (never a wrong RPM).
+        let unavail = SensorReading {
+            raw: 6,
+            available: false,
+        };
+        assert_eq!(fan_rpm(Some(f), Some(unavail)), None);
+        assert_eq!(fan_rpm(Some(f), None), None);
+        assert_eq!(fan_rpm(None, Some(avail)), None);
+
+        // A negative conversion (bad factors) is omitted, not reported as a nonsensical RPM.
+        let neg = SensorFactors {
+            m: -100,
+            b: 0,
+            b_exp: 0,
+            r_exp: 0,
+        };
+        assert_eq!(
+            fan_rpm(
+                Some(neg),
+                Some(SensorReading {
+                    raw: 5,
+                    available: true
+                })
+            ),
+            None
         );
     }
 }

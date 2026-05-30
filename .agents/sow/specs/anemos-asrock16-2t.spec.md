@@ -26,24 +26,37 @@ also reads its own CPU/board sensors. One `run` instance (the board).
   across **both** EPYC sockets (labeled via `tempN_label` where present).
 - NVMe temps are relayed by the `nvme` sensor anemos (`input=nvme`): hot SSDs raise the board fans.
   Routed temps are the `"type":"temp"` records relayed in `inputs`.
-- *Board/DIMM IPMI SDR temps (`TEMP_MB1/2`, `TEMP_CARD_SIDE1`, `TEMP_DDR4_*`) and per-fan tach RPM
-  are a planned enhancement (require SDR repository decoding) — **SOW-0005** covers per-fan RPM.
-  They are not yet in the driving max; CPU + GPU + NVMe dominate cooling demand on this host.*
-- Interpolate `/opt/aiolos/etc/asrock16-2t.curve.json`; set all 8 fans (uniform); read back duty
-  via `0xda` and report it as each fan's `pwm`, alongside the temp readings and a `driving` record.
+- *Board/DIMM IPMI SDR temps (`TEMP_MB1/2`, `TEMP_CARD_SIDE1`, `TEMP_DDR4_*`) remain a planned
+  enhancement; they are not in the driving max — CPU + GPU + NVMe dominate cooling demand here.*
+- Interpolate `/opt/aiolos/etc/asrock16-2t.curve.json`; set all 8 fans (uniform); then (observability
+  only, read AFTER the control decision) report each fan's `{pwm, rpm}`: `pwm` from the `0xda` duty
+  readback (falling back to the commanded pct if unavailable), `rpm` from the fan's tachometer
+  (omitted if the sensor is unreadable). Reported alongside the temp readings and a `driving` record.
+- **Per-fan RPM (SOW-0005):** read via standard IPMI sensor commands on `FAN1_1..FAN8_1` (sensor
+  numbers `0x60..0x67`). The linear conversion factors come from `Get Sensor Reading Factors`
+  (`0x04/0x23`) — **prefetched at instance open** and cached (constant for these linear sensors;
+  verified on this board: M=100, B=0, exponents 0 → `RPM = raw·100`; a fan whose prefetch failed is
+  retried lazily on later ticks) — then `Get Sensor Reading` (`0x04/0x2d`) each tick. This avoids
+  walking the SDR repository. All observability reads (RPM + the `0xda` duty readback) use a **short
+  timeout** so a slow/unresponsive BMC degrades a reading to "absent" rather than blowing the apply
+  deadline; control commands keep the full IPMI timeout. `FAN*_2`/`FAN_PSU*` report "No Reading" and
+  are skipped. The raw byte is treated as unsigned (universal for fan tach). RPM is read-only; a
+  sensor failure never affects fan control or fails the tick.
 - **Fan model (default): uniform** — apply `curve(driving_temp)` to all 8 fans. CPU fans following
   the global max is intended (more case airflow when GPUs are hot). *Per-fan curves
   (FAN1/2 by CPU temp, FAN3-8 by max) are a supported future option; config allows it.*
 - **Duty is always clamped non-zero** (≥1%) so a valid-but-low temperature can never send a zero
   byte (the `0xcc` claimed-but-undutied minimum trap).
 
-## IPMI control (verified) — netfn `0x3a`, inband `/dev/ipmi0`
+## IPMI control (verified) — OEM netfn `0x3a` + standard sensor netfn `0x04`, inband `/dev/ipmi0`
 | Action | Command |
 |---|---|
 | Claim (all manual) | `0x3a 0xd8` + sixteen `0x01` |
 | Set duty | `0x3a 0xd6` + sixteen bytes (per-fan %, `0x64`=100, `0x32`=50) |
 | Release (auto) | `0x3a 0xd8` + sixteen `0x00` |
 | Query duty | `0x3a 0xda` → sixteen bytes |
+| Get fan reading | `0x04 0x2d <sensor>` → `[raw, status, …]` (sensor `0x60..0x67`) |
+| Get fan factors | `0x04 0x23 <sensor> 0x00` → `[next, M_lsb, M_msb/tol, B_lsb, B_msb/acc, acc/dir, Rexp/Bexp]` |
 
 **Critical rule:** `0xd6` is accepted **only when all 16 fans are in manual mode AND all 16 duty
 bytes are non-zero.** Partial-manual or any zero byte → `0xcc invalid data field` (and unreliable
@@ -98,6 +111,8 @@ asserts, and the two ioctl numbers are asserted against the values above. CPU te
 - Receives GPU + NVMe temps via `inputs` (attributed by `module:id`); computes the driving max with
   its own CPU sensors; reports distinct `temp/GPU` and `temp/NVMe` readings.
 - Sets all fans via the verified all-manual + non-zero sequence; `0xda` readback matches.
+- Each fan reading carries `pwm` (from the `0xda` readback) and, when the tach is readable, `rpm`
+  (matching `ipmitool sdr type Fan`); an unreadable sensor omits `rpm` and never fails the tick.
 - shutdown/EOF/SIGTERM each release to BMC auto; verified by `0xda` + observing fans return to auto.
 - A persistent duty-set failure releases to BMC auto (never holds manual-but-frozen).
 - `asrock16-2t restore` releases to BMC auto and is idempotent.

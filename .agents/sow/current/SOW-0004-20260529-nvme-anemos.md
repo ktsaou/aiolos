@@ -2,10 +2,11 @@
 
 ## Status
 
-Status: in-progress
+Status: paused
 
-Sub-state: code-complete; 3-round external review converged (5/5 ready to ship); awaiting USER
-runtime testing + cutover approval before completion. Not committed.
+Sub-state: code merged to `master` (commit 5ad7828); 3-round external review converged (5/5 ready
+to ship). PAUSED pending USER on-hardware validation + cutover approval before completion (the only
+remaining work is user-gated runtime testing). SOW-0005 is the active in-progress SOW.
 
 ## Requirements
 

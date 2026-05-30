@@ -74,8 +74,9 @@ within the timeout — never wedging anything else.
   temp read can block on a wedged controller.
 - **`asrock16-2t`** — ASRockRack ROME2D16-2T chassis fans via **inband IPMI** (raw `/dev/ipmi0`
   ioctls, zero extra deps). Driven by `max(GPU temps from nvidia, NVMe temps from nvme, its own CPU
-  temps via k10temp)`. Releases to BMC auto control on exit, and whenever a temperature is
-  indeterminable.
+  temps via k10temp)`. Reports each fan's real duty (`0xda` readback) and **tachometer RPM** (read
+  via standard IPMI sensor commands). Releases to BMC auto control on exit, and whenever a
+  temperature is indeterminable.
 
 In practice the two together hold a heavily-loaded dual-RTX-PRO-6000 box in the low-to-mid 60s °C at
 70–85% fan — with headroom to spare.

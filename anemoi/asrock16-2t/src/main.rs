@@ -42,8 +42,12 @@ impl Anemos for Asrock {
     }
 
     fn open(&mut self, _id: &str) -> anyhow::Result<Box<dyn Device>> {
+        let mut board = Board::open()?;
+        // Warm the per-fan tach conversion-factor cache once here (off the apply deadline) so the
+        // first tick is no heavier than the rest; any that fail are retried lazily during ticks.
+        board.prefetch_fan_factors();
         Ok(Box::new(AsrockDevice {
-            board: Board::open()?,
+            board,
             restore_armed: true,
         }))
     }
@@ -110,12 +114,24 @@ impl Device for AsrockDevice {
             "driving",
             json!({ "temp": duty.smoothed, "raw": raw, "pct": pct }),
         ));
-        for i in 0..8 {
-            readings.push(Reading::new(
-                "fan",
-                format!("FAN{}", i + 1),
-                json!({ "pwm": pct }),
-            ));
+
+        // Observability, read AFTER the control decision (and under a short timeout) so a sensor
+        // hiccup never affects cooling or fails the tick: the true per-fan duty (0xda readback) and
+        // each fan's tachometer RPM. pwm falls back to the commanded pct if the readback is
+        // unavailable; rpm is omitted if the tach is unreadable.
+        let (duty_readback, fan_rpms) = self.board.read_fan_status();
+        for (i, (label, rpm)) in fan_rpms.into_iter().enumerate() {
+            let pwm = duty_readback
+                .as_ref()
+                .and_then(|d| d.get(i))
+                .map(|&b| b as i64)
+                .unwrap_or(pct as i64);
+            let mut f = serde_json::Map::new();
+            f.insert("pwm".to_string(), json!(pwm));
+            if let Some(r) = rpm {
+                f.insert("rpm".to_string(), json!(r));
+            }
+            readings.push(Reading::new("fan", label, json!(f)));
         }
         Applied::ok(readings)
     }
