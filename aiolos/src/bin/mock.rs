@@ -6,8 +6,9 @@
 //!   MOCK_<MOD>_IDS        comma list of detect ids (default "thing0")
 //!   MOCK_<MOD>_IDS2       ids to switch to after SWITCH_MS (tests hotplug add/remove)
 //!   MOCK_<MOD>_SWITCH_MS  ms after start to switch IDS -> IDS2
-//!   MOCK_<MOD>_BEHAVIOR   ok | hang | partial | error | exit   (run mode, default ok)
+//!   MOCK_<MOD>_BEHAVIOR   ok | slow | hang | partial | error | exit   (run mode, default ok)
 //!   MOCK_<MOD>_TEMP       °C this module reports (default 50)
+//!   MOCK_<MOD>_SLOW_MS    apply duration for the `slow` behavior, ms (default 800)
 //!   MOCK_<MOD>_WORKDIR    dir for observable side-effect marker files
 //!
 //! Side-effect markers (under WORKDIR), used by tests instead of HTTP (no port binding):
@@ -139,6 +140,25 @@ fn run_loop(module: &str, id: &str) {
                 write_marker(module, id, "lastinput", &in_max.unwrap_or(-1).to_string());
 
                 match behavior.as_str() {
+                    // Sleep a configurable time, then reply ok normally. Exercises delay-not-skip:
+                    // the apply completes (within a generous timeout) but takes longer than `every`,
+                    // so the instance's effective period stretches to ~SLOW_MS without skipping.
+                    "slow" => {
+                        let slow_ms: u64 = envk(module, "SLOW_MS")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(800);
+                        std::thread::sleep(Duration::from_millis(slow_ms));
+                        let mut readings =
+                            vec![Reading::new("temp", "self", json!({ "temp": temp }))];
+                        if let Some(m) = in_max {
+                            readings.push(Reading::new(
+                                "temp",
+                                "from_input",
+                                json!({ "temp": m, "in_temp": m }),
+                            ));
+                        }
+                        emit_line(Applied::ok(readings).to_line());
+                    }
                     "hang" => loop {
                         std::thread::sleep(Duration::from_secs(60));
                     },

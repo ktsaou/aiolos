@@ -62,8 +62,10 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
 - **`restore` one-shot:** every module implements `<module> restore` — restore ALL its devices and
   exit, idempotently. Verb is uniform across anemoi so `aiolos restore` (systemd ExecStopPost) can
   call it without naming modules.
-- **Timeout:** aiolos kills a module that doesn't answer within `timeout` (< heartbeat). Modules
-  must never assume they won't be `SIGKILL`ed mid-operation.
+- **Timeout:** aiolos kills a module that doesn't answer within its **per-module `timeout`**
+  (SOW-0013: each anemos runs on its own cadence/`every` and its own `timeout`, which may exceed the
+  scheduler `base_tick`). A slow-but-answering apply is delayed, not killed. Modules must never
+  assume they won't be `SIGKILL`ed mid-operation.
 
 ## Best Practices
 - Read stdin line-by-line with a generous buffer; parse with serde_json into typed structs.

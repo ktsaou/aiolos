@@ -12,7 +12,7 @@ mod status_page;
 
 use anyhow::Result;
 use config::Config;
-use instance::{InstanceCmd, TickResult, TickStatus};
+use instance::{InstanceCmd, TickReport, TickStatus};
 use protocol::{Inputs, Reading};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Command, Stdio};
@@ -65,8 +65,7 @@ fn main() -> Result<()> {
     }
 
     info!(
-        tick_s = cfg.tick.as_secs(),
-        timeout_s = cfg.timeout.as_secs(),
+        base_tick_ms = cfg.base_tick.as_millis() as u64,
         detect_every_s = cfg.detect_every.as_secs(),
         max_backoff_s = cfg.max_backoff.as_secs(),
         status_bind = %cfg.status_bind,
@@ -97,6 +96,11 @@ fn main() -> Result<()> {
         .map(|e| (e.module_name.clone(), e.inputs.clone()))
         .collect();
 
+    // Single shared results channel: every worker posts its async `apply` result here; the main loop
+    // drains it non-blockingly each base tick (SOW-0013). The receiver lives only in main; each
+    // supervisor (and thus each worker) gets a clone of the sender.
+    let (results_tx, results_rx) = mpsc::channel::<TickReport>();
+
     // Supervisor per module, tracked so the watchdog can respawn one whose thread dies (panics).
     let mut supervisors: Vec<SupervisorHandle> = cfg
         .registry
@@ -109,16 +113,16 @@ fn main() -> Result<()> {
                 cfg.bin_dir.clone(),
                 cfg.detect_every,
                 cfg.max_backoff,
+                results_tx.clone(),
             ),
             respawns: 0,
             last_spawn: Instant::now(),
         })
         .collect();
 
-    let tick = cfg.tick;
-    let timeout = cfg.timeout;
-    let mut next_tick = Instant::now() + tick;
-    let mut tick_count: u64 = 0;
+    let base_tick = cfg.base_tick;
+    let mut next_wake = Instant::now() + base_tick;
+    let mut wake_count: u64 = 0;
 
     loop {
         if SHUTDOWN_FLAG.load(Ordering::Acquire) {
@@ -129,18 +133,22 @@ fn main() -> Result<()> {
 
         // Watchdog: if a supervisor thread died (panicked), respawn it (its Drop already cleaned up
         // its instances, so the fresh supervisor re-detects from a clean slate). Backoff-bounded.
-        respawn_dead_supervisors(&mut supervisors, &state, &cfg);
+        respawn_dead_supervisors(&mut supervisors, &state, &cfg, &results_tx);
 
         let now = Instant::now();
-        if now < next_tick {
-            // Sleep in short steps so a signal is noticed promptly between ticks.
-            thread::sleep((next_tick - now).min(Duration::from_millis(200)));
+        if now < next_wake {
+            // Sleep in short steps so a signal is noticed promptly between wakes. Capped so a large
+            // base_tick still polls the shutdown flag often.
+            thread::sleep((next_wake - now).min(Duration::from_millis(100)));
             continue;
         }
-        next_tick = now + tick;
-        tick_count += 1;
+        next_wake = now + base_tick;
+        wake_count += 1;
 
-        heartbeat(&state, &input_map, timeout, tick_count);
+        // (1) Drain any results workers posted since the last wake (async rendezvous), then
+        // (2) dispatch a fresh apply to every instance that is due and idle. Both are non-blocking.
+        reap_results(&state, &results_rx, wake_count);
+        dispatch_due(&state, &input_map, &cfg, wake_count);
     }
 
     info!("aiolos exiting");
@@ -161,6 +169,7 @@ fn respawn_dead_supervisors(
     supervisors: &mut [SupervisorHandle],
     state: &Arc<RwLock<AppState>>,
     cfg: &Config,
+    results_tx: &mpsc::Sender<TickReport>,
 ) {
     let shutting_down = SHUTDOWN_FLAG.load(Ordering::Acquire);
     for s in supervisors.iter_mut() {
@@ -179,6 +188,7 @@ fn respawn_dead_supervisors(
             cfg.bin_dir.clone(),
             cfg.detect_every,
             cfg.max_backoff,
+            results_tx.clone(),
         );
         s.last_spawn = Instant::now();
     }
@@ -243,102 +253,160 @@ fn run_restore(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-type Snapshot = Vec<(String, mpsc::Sender<InstanceCmd>)>;
-type InputsMap = HashMap<String, Option<Inputs>>;
+/// Decide whether to dispatch a fresh `apply` to one instance this wake (pure, so it is
+/// unit-testable). The two SOW-0013 gates: the worker must be **idle** (at most one apply in flight
+/// — a busy anemos is delayed, never queued) AND the instance must be **due**
+/// (`now - last_dispatch >= every`; never-dispatched is due immediately).
+fn should_dispatch(
+    busy: bool,
+    last_dispatch: Option<Instant>,
+    now: Instant,
+    every: Duration,
+) -> bool {
+    if busy {
+        return false;
+    }
+    match last_dispatch {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= every,
+    }
+}
 
-/// One heartbeat: fan out `apply` to every instance, then collect replies under one shared
-/// deadline, then update state + blackboard. No instance waits on another.
-fn heartbeat(
+/// Non-blocking dispatch pass (SOW-0013): for every live instance, if it is due and idle, build its
+/// inputs from the CURRENT blackboard and send one `Tick` (marking it busy). A busy instance is
+/// skipped (delayed to a later wake, never queued) and its skip counter bumped. Never blocks: the
+/// `cmd_tx` send is to an unbounded channel an idle worker is already waiting on.
+fn dispatch_due(
     state: &Arc<RwLock<AppState>>,
     input_map: &HashMap<String, Vec<String>>,
-    timeout: Duration,
-    tick_count: u64,
+    cfg: &Config,
+    wake_count: u64,
 ) {
-    // Snapshot instances + build each one's inputs from the PREVIOUS tick's blackboard.
-    let (snapshot, inputs_map): (Snapshot, InputsMap) = {
-        let s = state.read().unwrap_or_else(|e| e.into_inner());
-        let snapshot = s
-            .instances
-            .iter()
-            .map(|(k, v)| (k.clone(), v.cmd_tx.clone()))
-            .collect();
-        let inputs_map = build_inputs(&s, input_map);
-        (snapshot, inputs_map)
-    };
+    let now = Instant::now();
+    let mut s = state.write().unwrap_or_else(|e| e.into_inner());
 
-    // Fan out.
-    let backstop = Instant::now() + timeout + Duration::from_secs(1);
-    let mut pending: Vec<(String, mpsc::Receiver<TickResult>)> = Vec::new();
-    for (key, cmd_tx) in snapshot {
-        let inputs = inputs_map.get(&key).cloned().flatten();
-        if let Some(ref inp) = inputs {
-            info!(tick = tick_count, to = %key, inputs = %summarize_inputs(inp), "routing inputs");
-        }
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        if cmd_tx
-            .send(InstanceCmd::Tick {
-                timeout,
-                inputs,
-                reply: reply_tx,
-            })
-            .is_ok()
-        {
-            pending.push((key, reply_rx));
+    // Reconcile scheduler slots with the live instance set (the supervisor owns `instances`):
+    // drop slots for instances that vanished so they never leak.
+    let live: HashSet<String> = s.instances.keys().cloned().collect();
+    s.sched.retain(|k, _| live.contains(k));
+
+    // Snapshot the dispatch decisions (key, inputs, cmd_tx, timeout) under the read of the
+    // blackboard, then send after — keeping the critical section tight and lock-discipline simple.
+    let mut to_send: Vec<(String, Option<Inputs>, mpsc::Sender<InstanceCmd>, Duration)> =
+        Vec::new();
+    let inputs_map = build_inputs(&s, input_map);
+
+    let keys: Vec<String> = s.instances.keys().cloned().collect();
+    for key in keys {
+        let (module_name, cmd_tx) = {
+            let e = &s.instances[&key];
+            (e.module_name.clone(), e.cmd_tx.clone())
+        };
+        let sched = cfg.schedule_for(&module_name);
+        let slot = s.sched.entry(key.clone()).or_default();
+        if should_dispatch(slot.busy, slot.last_dispatch, now, sched.every) {
+            let inputs = inputs_map.get(&key).cloned().flatten();
+            slot.busy = true;
+            slot.last_dispatch = Some(now);
+            to_send.push((key, inputs, cmd_tx, sched.timeout));
+        } else if slot.busy {
+            // Due-but-busy is the delay-not-skip case worth counting; not-yet-due is just waiting.
+            if matches!(slot.last_dispatch, Some(t) if now.saturating_duration_since(t) >= sched.every)
+            {
+                slot.skipped_busy = slot.skipped_busy.saturating_add(1);
+            }
         }
     }
+    drop(s); // release the lock before the (non-blocking) sends + logging
 
-    // Collect (bounded by the shared backstop).
-    let mut results: Vec<(String, TickResult)> = Vec::new();
-    for (key, reply_rx) in pending {
-        let remaining = backstop.saturating_duration_since(Instant::now());
-        if let Ok(result) = reply_rx.recv_timeout(remaining) {
-            results.push((key, result));
-        } else {
-            warn!(key=%key, "no heartbeat reply within backstop");
+    for (key, inputs, cmd_tx, timeout) in to_send {
+        if let Some(ref inp) = inputs {
+            info!(wake = wake_count, to = %key, inputs = %summarize_inputs(inp), "routing inputs");
         }
+        if cmd_tx.send(InstanceCmd::Tick { timeout, inputs }).is_err() {
+            // The worker is gone (it exited between snapshot and send). Clear busy so the slot
+            // doesn't wedge; the supervisor will remove the instance and we'll prune the slot.
+            if let Some(slot) = state
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .sched
+                .get_mut(&key)
+            {
+                slot.busy = false;
+            }
+        }
+    }
+}
+
+/// Non-blocking reap pass (SOW-0013): drain every `TickReport` workers posted since the last wake
+/// and fold each into shared state. A worker becomes idle the moment it posts, so clearing `busy`
+/// here lets the next due wake re-dispatch a FRESH apply (run-latest-when-free, never replay).
+fn reap_results(
+    state: &Arc<RwLock<AppState>>,
+    results_rx: &mpsc::Receiver<TickReport>,
+    wake_count: u64,
+) {
+    // Collect everything currently queued without blocking.
+    let reports: Vec<TickReport> = results_rx.try_iter().collect();
+    if reports.is_empty() {
+        return;
     }
 
     // Log each result (outside the write lock) so the journal shows readings the parent received.
-    for (key, r) in &results {
+    for r in &reports {
         info!(
-            tick = tick_count,
-            instance = %key,
-            status = r.status.as_str(),
-            error = r.error.as_deref().unwrap_or(""),
-            readings = %summarize_readings(&r.readings),
-            "tick result",
+            wake = wake_count,
+            instance = %r.key,
+            status = r.result.status.as_str(),
+            latency_ms = r.latency.as_millis() as u64,
+            error = r.result.error.as_deref().unwrap_or(""),
+            readings = %summarize_readings(&r.result.readings),
+            "apply result",
         );
     }
 
-    // Apply the collected results to shared state (extracted + unit-tested in `apply_results`).
     apply_results(
         &mut state.write().unwrap_or_else(|e| e.into_inner()),
-        results,
-        tick_count,
+        reports,
+        wake_count,
     );
 }
 
-/// Fold tick results into shared state. Updates per-instance status/readings AND the blackboard
-/// ONLY for instances that still exist: a supervisor may have removed (and blackboard-pruned) this
-/// instance between the heartbeat's snapshot and now, so re-inserting its readings would orphan a
-/// stale blackboard entry that nothing prunes again — routed to consumers forever. Gating both on
-/// liveness prevents that.
-fn apply_results(s: &mut AppState, results: Vec<(String, TickResult)>, tick_count: u64) {
-    for (key, r) in results {
-        let is_ok = r.status == TickStatus::Ok;
+/// Fold async `apply` results into shared state. Updates per-instance status/readings/latency AND
+/// the blackboard ONLY for instances that still exist: a supervisor may have removed (and
+/// blackboard-pruned) this instance between dispatch and now, so re-inserting its readings would
+/// orphan a stale blackboard entry that nothing prunes again — routed to consumers forever. Gating
+/// on liveness prevents that. Each report also clears the instance's `busy` flag (it is idle again)
+/// and records its latency, so the scheduler can re-dispatch it when next due.
+fn apply_results(s: &mut AppState, reports: Vec<TickReport>, wake_count: u64) {
+    for r in reports {
+        let TickReport {
+            key,
+            result,
+            latency,
+        } = r;
+        let is_ok = result.status == TickStatus::Ok;
+
+        // The worker posted -> it is idle again. Clear busy + record latency even if the instance
+        // entry was just removed (the slot is pruned next dispatch pass either way).
+        if let Some(slot) = s.sched.get_mut(&key) {
+            slot.busy = false;
+            slot.last_latency = Some(latency);
+        }
+
         if let Some(e) = s.instances.get_mut(&key) {
-            e.last_status = r.status.as_str().to_string();
-            e.last_error = r.error;
-            e.last_seen_tick = tick_count;
+            e.last_status = result.status.as_str().to_string();
+            e.last_error = result.error;
+            e.last_seen_tick = wake_count;
             if is_ok {
-                e.last_readings = r.readings.clone();
+                e.last_readings = result.readings.clone();
             }
-            if is_ok && !r.readings.is_empty() {
-                s.blackboard.insert(key, r.readings);
+            if is_ok && !result.readings.is_empty() {
+                s.blackboard.insert(key, result.readings);
             }
         }
     }
-    s.tick_count = tick_count;
+    s.tick_count = wake_count;
 }
 
 /// For each instance, if its module has `input=<peer...>`, gather every named peer's instances'
@@ -442,6 +510,24 @@ pub struct AppState {
     pub blackboard: HashMap<String, Vec<Reading>>,
     /// Per-module detect health (status + last declared error), for the status page.
     pub modules: HashMap<String, ModuleHealth>,
+    /// Per-instance scheduler state (SOW-0013): busy/idle, last dispatch, last apply latency, and
+    /// the delay-not-skip counter. Keyed by `module:id`, pruned when the instance is removed. Added
+    /// here so the status page / metrics can surface per-instance cadence health (read-only).
+    pub sched: HashMap<String, InstanceSched>,
+}
+
+/// Per-instance scheduler bookkeeping owned by the main loop (SOW-0013). `last_dispatch` is an
+/// `Instant`, so this is not serialized directly — consumers read `last_latency`/`skipped_busy`.
+#[derive(Default, Clone)]
+pub struct InstanceSched {
+    /// True between dispatching an `apply` and reaping its result (at most one in flight).
+    pub busy: bool,
+    /// When the most recent `apply` was dispatched (`None` until the first dispatch).
+    pub last_dispatch: Option<Instant>,
+    /// Wall-clock the most recent completed `apply` took (round-trip incl. kill on timeout).
+    pub last_latency: Option<Duration>,
+    /// How many times a dispatch was delayed because the instance was still busy (due-but-busy).
+    pub skipped_busy: u64,
 }
 
 /// A module's last detect outcome, as declared by the module (ok/error/fatal/unresponsive/…).
@@ -489,12 +575,24 @@ extern "C" fn handle_signal(_sig: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use instance::TickResult;
+
+    fn report(key: &str, status: TickStatus, readings: Vec<Reading>) -> TickReport {
+        TickReport {
+            key: key.to_string(),
+            result: TickResult {
+                status,
+                error: None,
+                readings,
+            },
+            latency: Duration::from_millis(7),
+        }
+    }
 
     #[test]
     fn apply_results_does_not_resurrect_a_removed_instances_blackboard_entry() {
         // Race guard: a result arriving for an instance the supervisor already removed must NOT
         // re-create a blackboard entry (which nothing would prune again -> stale routed forever).
-        use instance::TickStatus;
         use protocol::Reading;
         use serde_json::json;
 
@@ -517,14 +615,13 @@ mod tests {
             },
         );
 
-        let mk = |t: i64| TickResult {
-            status: TickStatus::Ok,
-            error: None,
-            readings: vec![Reading::new("temp", "GPU", json!({ "temp": t }))],
-        };
+        let mk = |t: i64| vec![Reading::new("temp", "GPU", json!({ "temp": t }))];
         apply_results(
             &mut s,
-            vec![("mod:a".into(), mk(50)), ("mod:ghost".into(), mk(99))],
+            vec![
+                report("mod:a", TickStatus::Ok, mk(50)),
+                report("mod:ghost", TickStatus::Ok, mk(99)),
+            ],
             1,
         );
 
@@ -536,6 +633,57 @@ mod tests {
             !s.blackboard.contains_key("mod:ghost"),
             "a removed instance must NOT get a (resurrected) blackboard entry"
         );
+    }
+
+    #[test]
+    fn apply_results_clears_busy_and_records_latency() {
+        // Reaping a worker's report marks the instance idle again (so it can be re-dispatched) and
+        // records the apply latency for surfacing.
+        let mut s = AppState::default();
+        s.sched.insert(
+            "mod:a".into(),
+            InstanceSched {
+                busy: true,
+                last_dispatch: Some(Instant::now()),
+                last_latency: None,
+                skipped_busy: 0,
+            },
+        );
+        apply_results(&mut s, vec![report("mod:a", TickStatus::Ok, Vec::new())], 5);
+        let slot = &s.sched["mod:a"];
+        assert!(!slot.busy, "worker posted -> instance is idle again");
+        assert_eq!(slot.last_latency, Some(Duration::from_millis(7)));
+        assert_eq!(s.tick_count, 5);
+    }
+
+    #[test]
+    fn should_dispatch_gates_on_due_and_idle() {
+        let now = Instant::now();
+        let every = Duration::from_secs(1);
+
+        // Never dispatched + idle -> due immediately.
+        assert!(should_dispatch(false, None, now, every));
+        // Busy is never dispatched (at most one apply in flight; delayed, not queued).
+        assert!(!should_dispatch(true, None, now, every));
+        // Idle but not yet due -> wait.
+        let half_ago = now - every / 2;
+        assert!(!should_dispatch(false, Some(half_ago), now, every));
+        // Idle and the full `every` has elapsed -> due.
+        let full_ago = now - every;
+        assert!(should_dispatch(false, Some(full_ago), now, every));
+        // Busy AND due -> still not dispatched (delay-not-skip).
+        assert!(!should_dispatch(true, Some(full_ago), now, every));
+    }
+
+    #[test]
+    fn should_dispatch_respects_every_equal_base_tick() {
+        // With every == base_tick (the floor), an instance is due every wake once idle.
+        let now = Instant::now();
+        let every = Duration::from_millis(100);
+        let one_tick_ago = now - every;
+        assert!(should_dispatch(false, Some(one_tick_ago), now, every));
+        // Just dispatched this wake -> not due yet.
+        assert!(!should_dispatch(false, Some(now), now, every));
     }
 
     #[test]
