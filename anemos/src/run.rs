@@ -81,8 +81,7 @@ pub fn run_with<A: Anemos>(
                 eprintln!("run requires <ID>");
                 std::process::exit(1);
             };
-            run_loop(&info, &mut anemos, id);
-            0
+            run_loop(&info, &mut anemos, id)
         }
         "restore" => {
             anemos.restore_all();
@@ -127,16 +126,25 @@ fn detect_loop<A: Anemos>(anemos: &mut A) {
     }
 }
 
-fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) {
+/// Drive one `run <id>` instance. Returns the process exit code: `0` on a clean stop, non-zero when
+/// a control module could not start because its curve was invalid (SOW-0012 decision 2).
+fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) -> i32 {
     // A sensor-only module (no curve configured) controls no device and ignores the controller in
-    // `apply`; only a control module warns when its curve is missing/empty (device stays on
-    // firmware/auto until a valid curve exists). The controller is constructed regardless (cheap)
-    // so the `Device::apply(ctrl)` contract is uniform.
+    // `apply`. A CONTROL module (curve configured) MUST have a usable curve to start: if the initial
+    // load failed (missing / invalid JSON / no usable points) it must NOT regulate — it surfaces a
+    // protocol `fatal` (so the reason shows on the status page) and exits non-zero, leaving the
+    // device under firmware/auto control (SOW-0012). aiolos respawns it with capped exponential
+    // backoff. The controller is constructed regardless (cheap) so the `Device::apply(ctrl)`
+    // contract is uniform.
     let curve = curve_path(info);
     let curve_configured = curve.is_some();
     let mut ctrl = Controller::new(curve.unwrap_or_default());
-    if curve_configured && ctrl.curve_is_empty() {
-        error!(module = info.name, path=%ctrl.path(), "curve missing/empty — device stays on firmware/auto until a valid curve exists");
+    if curve_configured {
+        if let Some(reason) = ctrl.initial_curve_error() {
+            error!(module = info.name, path=%ctrl.path(), reason = reason.as_str(), "invalid curve at startup — refusing to regulate; device stays on firmware/auto");
+            // Never open the device. Surface the reason as a protocol `fatal` and exit non-zero.
+            return startup_curve_fatal_loop(info, &format!("curve invalid: {}", reason.as_str()));
+        }
     }
 
     let mut dev: Option<Box<dyn Device>> = match anemos.open(id) {
@@ -154,7 +162,7 @@ fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) {
             if let Some(d) = dev.as_mut() {
                 d.restore();
             }
-            return;
+            return 0; // device restored; this is a clean fail-safe exit, not a startup failure
         }
     };
     loop {
@@ -214,6 +222,45 @@ fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) {
     // restoring Drop) is the final restore net on panic/early-exit. A `Device` impl SHOULD ensure
     // its underlying resource restores on drop (the shipped nvidia/asrock devices do, via the tech
     // handle's Drop).
+    0
+}
+
+/// A control module whose curve was invalid at startup: it never opened the device (so there is
+/// nothing to restore — the device stays on firmware/auto). It keeps the protocol half-duplex
+/// contract — answering each `apply` with a structured `fatal` so the reason reaches the status page
+/// — then exits non-zero so aiolos respawns it on the capped exponential backoff. A graceful
+/// `shutdown` ends it cleanly (exit 0); EOF/signal (parent gone) ends it with the same non-zero code
+/// (it never started regulating). Returns the process exit code.
+fn startup_curve_fatal_loop(info: &ModuleInfo, reason: &str) -> i32 {
+    let mut stdin = match StdinReader::new() {
+        Ok(s) => s,
+        // Can't even read stdin: nothing to restore (device never opened); exit non-zero.
+        Err(e) => {
+            error!(module = info.name, error=%e, "stdin setup failed");
+            return 1;
+        }
+    };
+    loop {
+        match stdin.next_event(STEP) {
+            Event::Line(line) => match Request::from_line(line.trim()) {
+                // First (and any) apply: declare fatal with the reason, then exit non-zero. The
+                // supervisor records the declared-fatal and respawns on the long (capped) backoff.
+                Ok(Request::Apply { .. }) => {
+                    emit_line(Applied::fatal(format!("startup: {reason}")).to_line());
+                    return 1;
+                }
+                // aiolos asked us to stop: nothing was regulated, so this is a clean stop.
+                Ok(Request::Shutdown) => {
+                    emit_line(Applied::ok_empty().to_line());
+                    return 0;
+                }
+                Ok(Request::Detect) => eprintln!("unexpected detect in run mode"),
+                Err(e) => eprintln!("malformed request: {e}"),
+            },
+            // Parent gone or signalled before any apply: never regulated; nothing to restore.
+            Event::Shutdown | Event::Eof => return 1,
+        }
+    }
 }
 
 /// Resolve the curve path, or `None` for a sensor-only module (no curve configured). The env
@@ -281,5 +328,52 @@ mod tests {
         // way it ends with the curve filename.
         let p = curve_path(&info).expect("a curved module resolves a path");
         assert!(p.ends_with("nvidia.curve.json"), "got {p}");
+    }
+
+    #[test]
+    fn a_control_module_with_an_invalid_curve_detects_a_startup_error() {
+        // SOW-0012 decision 2: a control module (curve configured) whose curve cannot load must NOT
+        // regulate. run_loop gates on `curve_configured && ctrl.initial_curve_error().is_some()`;
+        // verify both halves: the module IS curve-configured, and an unreadable curve is flagged.
+        let info = ModuleInfo {
+            name: "nvidia",
+            curve_default_path: Some("/nonexistent/aiolos-startup-fatal.curve.json"),
+            curve_env_filename: None,
+        };
+        let path = curve_path(&info).expect("control module has a curve path");
+        let ctrl = Controller::new(path);
+        assert!(
+            ctrl.initial_curve_error().is_some(),
+            "an invalid startup curve must be flagged so run_loop fails to start"
+        );
+    }
+
+    #[test]
+    fn a_sensor_only_module_is_exempt_from_the_startup_curve_check() {
+        // A sensor-only module (curve = None) has no curve path, so `curve_configured` is false and
+        // run_loop never enters the startup-fatal branch — it regulates nothing and is unaffected.
+        let info = ModuleInfo {
+            name: "nvme",
+            curve_default_path: None,
+            curve_env_filename: None,
+        };
+        assert!(
+            curve_path(&info).is_none(),
+            "a sensor-only module is never subject to the startup curve check"
+        );
+    }
+
+    #[test]
+    fn startup_fatal_applied_line_is_well_formed_protocol() {
+        // The line a startup-invalid control module emits on `apply` must be valid protocol JSON
+        // with status fatal and the curve reason (so it surfaces on the status page).
+        let line = Applied::fatal("startup: curve invalid: file missing or unreadable")
+            .to_line()
+            .unwrap();
+        let parsed = Applied::from_line(&line).unwrap();
+        assert_eq!(parsed.status, Status::Fatal);
+        assert!(parsed.error.as_deref().unwrap().contains("curve"));
+        // stdout protocol-only: exactly one JSON object, no embedded newline.
+        assert!(!line.contains('\n'));
     }
 }

@@ -38,6 +38,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "anemoi-ipmi-temps"
+version = "0.1.0"
+dependencies = [
+ "anemos",
+ "anyhow",
+ "ipmi",
+ "serde_json",
+]
+
+[[package]]
 name = "anemoi-nvidia"
 version = "0.1.0"
 dependencies = [

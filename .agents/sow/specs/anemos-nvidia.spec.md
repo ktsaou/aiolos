@@ -49,8 +49,17 @@ fan control PERSISTS after the process exits — the driver does NOT auto-revert
 mandatory and is also wired into the `Gpu` value's `Drop` (covers panic unwinding). A direct
 `SIGKILL` cannot restore in-process; `aiolos restore` (systemd ExecStopPost) is the net, and the
 orchestrator otherwise respawns the instance, which re-takes control. The configured curve must be
-more aggressive than firmware default so a failure degrades to the (safe, lazier) firmware curve. If
-the curve is missing/empty the module holds firmware/default control rather than commanding 0%.
+more aggressive than firmware default so a failure degrades to the (safe, lazier) firmware curve.
+
+**Curve loading (SOW-0012).** Two distinct cases:
+- **Invalid curve at startup** (missing file, invalid JSON, or no usable points): the module
+  **refuses to start** — it never takes manual control, declares `{"status":"fatal","error":"startup:
+  curve …"}` on its first `apply` (so the reason surfaces on the status page), and exits non-zero.
+  The GPU stays on firmware/default; aiolos respawns on the `max_backoff` cap until a valid curve
+  appears.
+- **Curve breaks while running** (file becomes unreadable / invalid / empty during a live edit): the
+  module **keeps the last-good curve** and logs a warning **every tick** while it stays broken — an
+  in-progress edit never blips the fans. (It never commands 0%.)
 
 ## Config — `/opt/aiolos/etc/nvidia.curve.json`
 Temperature °C → fan %, linear-interpolated, clamped, hold-outside, plus a `sensitivity` key (the

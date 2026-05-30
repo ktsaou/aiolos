@@ -12,7 +12,7 @@ GPUs, temperatures, IPMI, or curves — all device knowledge lives in anemoi.
 `/opt/aiolos/etc/aiolos.conf`. Module lines: one anemos per line with optional `key=value`
 directives. Global lines: a bare `key=value` whose first token contains `=`.
 ```
-# globals (defaults): tick=3, timeout=2, detect_every=10, status_bind=0.0.0.0:9876
+# globals (defaults): tick=3, timeout=2, detect_every=10, max_backoff=300, status_bind=0.0.0.0:9876
 nvidia
 nvme
 asrock16-2t  input=nvidia input=nvme
@@ -25,9 +25,10 @@ asrock16-2t  input=nvidia input=nvme
 - A **module name MUST NOT contain `:`** (the blackboard/routing key is `module:id`, so a `:` in the
   name would make source prefix-matching ambiguous). A module line with a `:` in its name is
   rejected at parse time with a warning and does not run.
-- Globals: `tick`, `timeout`, `detect_every` (integer seconds), `status_bind` (`host:port`).
-  Invariant `0 < timeout < tick` is enforced by clamping (and `tick` is floored to 2s so an
-  integer `timeout` can be smaller).
+- Globals: `tick`, `timeout`, `detect_every`, `max_backoff` (integer seconds), `status_bind`
+  (`host:port`). Invariant `0 < timeout < tick` is enforced by clamping (and `tick` is floored to 2s
+  so an integer `timeout` can be smaller). `max_backoff` caps the exponential respawn backoff
+  (default 300 s; clamped up to ≥ 1 s).
 - Module binaries: `<bin_dir>/<name>` (default `/opt/aiolos/bin`). Per-module config:
   `/opt/aiolos/etc/<name>.*`. Paths overridable via env (`AIOLOS_CONF`, `AIOLOS_BIN_DIR`) for
   testing/packaging.
@@ -40,7 +41,7 @@ asrock16-2t  input=nvidia input=nvme
      down vanished ones (empty `found` legitimately tears all down).
    - `error` → keep the current instances (a transient fault is NOT "no devices"), surface the
      reason, recycle the detect process, retry next cycle.
-   - `fatal` → keep instances, surface loudly, retry only on a long backoff (~300 s).
+   - `fatal` → keep instances, surface loudly, retry only on a long backoff (the `max_backoff` cap).
    - **unresponsive/crashed** (no reply / dead detect process) — backstop only: recycle it, keep
      instances (last good `found` is retained so reconcile never tears down on a detect outage).
    A `detect` process that exits is respawned. NVML/IPMI handles are initialised once per process
@@ -54,11 +55,18 @@ asrock16-2t  input=nvidia input=nvme
    guarantee). A response line larger than 256 KiB is treated as a protocol violation and killed.
    A leading optional `hello` line is consumed/skipped.
 4. **apply result handling:** `ok` → store readings (+ blackboard). `error` → keep the instance,
-   surface the reason, retry next tick. `fatal` (module-declared) → respawn on a **long backoff**.
-   Missed deadline / process exit / protocol violation → `SIGKILL` if needed and respawn with per-id
-   crash-loop backoff (backstop). The module's own shutdown/EOF path performs the device-safe
-   restore. When an instance is removed (vanished or dead) its blackboard entry is pruned, so stale
-   readings are never relayed as `inputs`.
+   surface the reason, retry next tick. `fatal` (module-declared) → respawn on a **long backoff**
+   (jumps straight to the `max_backoff` cap). Missed deadline / process exit / protocol violation →
+   `SIGKILL` if needed and respawn with per-id **exponential** crash-loop backoff (2,4,8,… seconds,
+   capped at `max_backoff`; backstop). aiolos **never gives up** — it retries forever, only ever
+   slowing to the cap. The module's own shutdown/EOF path performs the device-safe restore. When an
+   instance is removed (vanished or dead) its blackboard entry is pruned, so stale readings are
+   never relayed as `inputs`.
+   - A **control module that cannot load a usable curve at startup** declares this `fatal` on its
+     first `apply` (so the reason reaches the status page) and exits non-zero, leaving its device
+     under firmware/auto; the supervisor then respawns it on the `max_backoff` cap (see the
+     anemos specs' fail-safe sections). A *runtime* curve breakage is NOT fatal — the module keeps
+     its last-good curve and warns.
 5. **Shutdown (SIGTERM):** close every instance's stdin → modules restore + exit → reap → exit.
    Modules ALSO self-restore on the SIGTERM they receive directly (see below), so shutdown is
    robust even without the orchestrator's orchestration.
@@ -105,6 +113,7 @@ harmless to others — orphaned, siblings keep ticking.)
 | `tick` | 3 s |
 | `timeout` | 2 s (must be < tick; clamped if not) |
 | `detect_every` | 10 s |
+| `max_backoff` | 300 s (cap on the exponential respawn backoff; clamped up to ≥ 1 s) |
 | `status_bind` | `0.0.0.0:9876` (user decision SOW-0001 #7; set `127.0.0.1:9876` to restrict) |
 
 ## Acceptance criteria
