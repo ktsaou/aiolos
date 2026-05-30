@@ -208,13 +208,16 @@ fn release_payload() -> [u8; 16] {
     [0x00; 16]
 }
 
-/// 16 duty bytes for the 8 fans. Bytes 0–7 = FAN1..FAN8 (each `pcts[i]` clamped to 1..=100 so no
-/// byte is ever zero — a zero byte → `0xcc invalid data field` and the claimed-but-undutied minimum
-/// trap). Bytes 8–15 are unused tach slots, held non-zero (`0x01`) as the board requires.
+/// 16 duty bytes for the 8 fans. The ROME2D16-2T requires each fan's duty in BOTH halves: bytes 0–7
+/// = FAN1..FAN8 and bytes 8–15 MIRROR them. A non-mirrored (or low) tail byte → `0xcc invalid data
+/// field` — hardware-verified on this board: an `0x01`/`0x0a` tail is rejected, an equal-to-head tail
+/// is accepted. Each `pcts[i]` is clamped to 1..=100 (a zero byte also trips the 0xcc trap).
 fn duty_payload(pcts: &[i32; 8]) -> [u8; 16] {
-    let mut out = [0x01u8; 16];
+    let mut out = [0u8; 16];
     for (i, &pct) in pcts.iter().enumerate() {
-        out[i] = pct.clamp(0, 100).max(1) as u8;
+        let v = pct.clamp(0, 100).max(1) as u8;
+        out[i] = v;
+        out[i + 8] = v;
     }
     out
 }
@@ -231,7 +234,7 @@ mod tests {
 
     #[test]
     fn duty_is_never_zero() {
-        // Uniform: every controllable fan byte == pct, tach slots (8..16) held non-zero.
+        // Uniform: BOTH halves mirror the duty; 0 -> 1 so no byte is ever zero (0xcc trap).
         assert_eq!(duty_payload(&[0; 8]), [1u8; 16]); // 0% -> 1 (avoid 0xcc trap)
         assert_eq!(duty_payload(&[-5; 8]), [1u8; 16]);
         assert_eq!(duty_payload(&[50; 8]), [50u8; 16]);
@@ -240,14 +243,16 @@ mod tests {
     }
 
     #[test]
-    fn duty_payload_per_fan_places_each_fan_and_floors_tach_slots() {
-        // Per-zone duties: bytes 0-7 = FAN1..FAN8 (clamped 1..=100), bytes 8-15 stay 0x01.
+    fn duty_payload_per_fan_mirrors_each_fan_into_both_halves() {
+        // Per-zone duties: bytes 0-7 = FAN1..FAN8 (clamped 1..=100); bytes 8-15 MIRROR them (the board
+        // rejects a non-mirrored tail with 0xcc).
         let p = duty_payload(&[30, 30, 75, 75, 75, 75, 75, 75]);
         assert_eq!(&p[0..8], &[30, 30, 75, 75, 75, 75, 75, 75]);
-        assert_eq!(&p[8..16], &[1u8; 8], "unused tach slots must stay non-zero");
-        // A zero / negative per-fan duty is still floored to 1 (never a zero byte).
+        assert_eq!(&p[8..16], &[30, 30, 75, 75, 75, 75, 75, 75], "tail must mirror the head");
+        // A zero / negative per-fan duty is still floored to 1 (never a zero byte), in both halves.
         let z = duty_payload(&[0, -1, 100, 150, 1, 50, 50, 50]);
         assert_eq!(&z[0..8], &[1, 1, 100, 100, 1, 50, 50, 50]);
+        assert_eq!(&z[8..16], &[1, 1, 100, 100, 1, 50, 50, 50]);
     }
 
     /// A mock fan bus for testing the `regulate` policy without /dev/ipmi0.
