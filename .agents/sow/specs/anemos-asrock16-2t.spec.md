@@ -89,11 +89,13 @@ the net for a hard kill. HW thermal throttle (~90 °C) is the hardware backstop.
 Driving °C → fan %, linear-interpolated, clamped, hold-outside, plus a `sensitivity` key (the live
 EMA α, not a curve point):
 ```json
-{"30":30,"80":100,"sensitivity":0.5}
+{"50":30,"80":100,"sensitivity":0.5}
 ```
-Default: ≤30 °C → 30 %, ≥80 °C → 100 %, linear between — a **30 % floor** so a wrong low reading can
-never stop/minimise the fans. (30 % matches the board's firmware idle; lowered from the original
-35 % — supersedes SOW-0001 #16.) `sensitivity` (0.5 default) is reloaded every
+Default: ≤50 °C → 30 %, ≥80 °C → 100 %, linear between — a **30 % floor** so a wrong low reading can
+never stop/minimise the fans. The board floors until **50 °C** (not 30 °C like the GPU curve)
+because its driving sensors — DIMM/NVMe/board/LAN — idle at ~45–50 °C, so flooring at 30 °C would
+keep the chassis fans needlessly high. GPU heat still drives the fans up via the routed `max`.
+(30 % matches the board's firmware idle; supersedes SOW-0001 #16.) `sensitivity` (0.5 default) is reloaded every
 tick. (Per-fan/per-zone curves remain a possible future extension; the shipped model is uniform.)
 
 ## Implementation note (language/binding)

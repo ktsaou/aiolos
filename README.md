@@ -104,6 +104,10 @@ to fan duty, linear-interpolated and clamped, with an EMA "sensitivity" knob:
 | 65 °C | 79% |
 | ≥80 °C | 100% |
 
+> The **board** module (`asrock16-2t`) ships `{ "50": 30, "80": 100 }` instead — its driving sensors
+> (DIMM/NVMe/board/LAN) idle at ~45–50 °C, so it holds the 30% floor until 50 °C; GPU heat still
+> drives it up via the routed max.
+
 ---
 
 ## Install & run

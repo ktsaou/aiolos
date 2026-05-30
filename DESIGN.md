@@ -274,13 +274,16 @@ The protocol is language-agnostic; any anemos may be written in any language lat
 ## 13. Config — curves + smoothing
 
 `etc/<anemos>.curve.json` — temperature → duty %, linear-interpolated, clamped, hold-outside, plus
-an optional `"sensitivity"` knob (EMA α, 0–1) for noise smoothing. Default (both modules):
+an optional `"sensitivity"` knob (EMA α, 0–1) for noise smoothing. Per-module defaults: `nvidia`
+`{"30":30,"80":100}`; `asrock16-2t` `{"50":30,"80":100}` — the board idles warmer (DIMM/NVMe/board/
+LAN ~45–50 °C), so it holds the 30% floor until 50 °C, then ramps (GPU heat still drives it up via
+the routed max). Example:
 ```json
 {"30": 30, "80": 100, "sensitivity": 0.5}
 ```
-- **Floor 30% / ceiling 100%:** below 30 °C → 30%, above 80 °C → 100%. The curve NEVER yields below
-  30% — a wrong/low sensor reading can't stop or minimise the fans in manual mode. (30% matches the
-  board's firmware idle; it lowered from the original 35% — supersedes SOW-0001 #16.)
+- **Floor = the lowest curve point (30% on both modules); ceiling 100%.** The curve NEVER yields
+  below its floor — a wrong/low sensor reading can't stop or minimise the fans in manual mode. (30%
+  matches the board's firmware idle; lowered from the original 35% — supersedes SOW-0001 #16.)
 - **`sensitivity`** (EMA α): lower = smoother / less reactive to noisy spikes; higher = more
   responsive. Live-reloaded each tick (no restart). A single bad reading is diluted to ≈ α·Δ.
 - The file is re-read every tick, so curve and sensitivity edits take effect on the next tick.
