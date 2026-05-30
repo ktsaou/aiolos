@@ -1,0 +1,16 @@
+[package]
+name = "anemoi-ipmi-temps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ipmi-temps"
+path = "src/main.rs"
+
+[dependencies]
+anemos = { path = "../../anemos" }   # level-2 SDK (lifecycle/signals/logging/protocol + traits)
+ipmi = { path = "../../tech/ipmi" }  # level-1 tech (inband IPMI transport + sensor read/factors)
+serde_json = { workspace = true }
+anyhow = { workspace = true }

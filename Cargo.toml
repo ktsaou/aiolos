@@ -10,6 +10,7 @@ members = [
     "anemoi/nvidia",   # level-3 anemos
     "anemoi/asrock16-2t",
     "anemoi/nvme",     # level-3 anemos (sensor-only: NVMe temps)
+    "anemoi/ipmi-temps", # level-3 anemos (sensor-only: BMC board/CPU/DIMM/NIC temps)
 ]
 resolver = "2"
 
