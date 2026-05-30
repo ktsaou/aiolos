@@ -518,7 +518,13 @@ fn worker(
                 let started = Instant::now();
                 let res = inst.tick(timeout, inputs);
                 let latency = started.elapsed();
-                let fatal = res.status.is_fatal();
+                // `is_fatal()` = "exit and respawn" (a declared fatal OR a backstop:
+                // timeout/dead/protocol). The backoff CLASS is narrower: only a module-DECLARED fatal
+                // jumps to the long backoff; the backstops keep the normal escalating backoff.
+                // Collapsing them would strand a one-off timeout on the max_backoff cap (no fan
+                // control for up to that long) — so classify with `is_declared_fatal()`, not exit-ness.
+                let should_exit = res.status.is_fatal();
+                let declared_fatal = res.status.is_declared_fatal();
                 // Post the result back to the scheduler. If the receiver is gone (shutdown), just
                 // exit. A fatal result still gets posted (so status/blackboard update) before we
                 // break to let the supervisor respawn us.
@@ -527,8 +533,10 @@ fn worker(
                     result: res,
                     latency,
                 });
-                if fatal {
-                    exit = WorkerExit::Fatal;
+                if should_exit {
+                    if declared_fatal {
+                        exit = WorkerExit::Fatal;
+                    }
                     break;
                 }
             }

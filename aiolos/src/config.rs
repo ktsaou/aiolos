@@ -215,6 +215,12 @@ fn build_schedules(
                 }
             } else if let Some(v) = dir.strip_prefix("timeout=") {
                 match parse_dur_ms("timeout", v, Unit::Secs) {
+                    // A zero timeout would make EVERY apply time out -> kill + respawn the module
+                    // forever; it is never the intent (and 0 must NOT mean "infinite": an unbounded
+                    // apply would break the isolation guarantee). Treat it as unset -> keep the
+                    // default, exactly as a bad/unparsable directive does.
+                    Ok(0) => warn!(module = %entry.module_name,
+                        "timeout=0 is invalid (would time out every apply); using the default"),
                     Ok(ms) => timeout = Duration::from_millis(ms.max(MIN_MODULE_TIMEOUT_MS)),
                     Err(e) => {
                         warn!(module = %entry.module_name, error = %e, "ignoring bad timeout= directive")
@@ -401,6 +407,17 @@ asrock16-2t  input=nvidia   # board fans follow GPU temps
         let sch = c.schedule_for("m");
         assert_eq!(sch.every, Duration::from_secs(1));
         assert_eq!(sch.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn timeout_zero_falls_back_to_default_not_a_kill_loop() {
+        // `timeout=0` must NOT clamp to 1ms (which would time out every apply -> kill+respawn loop);
+        // it falls back to the default. 0 is never valid and must not mean "infinite".
+        let c = Config::parse("m timeout=0").unwrap();
+        assert_eq!(c.schedule_for("m").timeout, Duration::from_secs(5));
+        // A tiny but explicit nonzero value is the operator's own choice and is honoured.
+        let c = Config::parse("m timeout=2ms").unwrap();
+        assert_eq!(c.schedule_for("m").timeout, Duration::from_millis(2));
     }
 
     #[test]

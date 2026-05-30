@@ -6,6 +6,9 @@ Cargo.lock.orig
 # private per-user agent overrides
 *.local.md
 
+# agent worktrees (coding-agent isolation checkouts; build artifacts — never commit)
+.claude/worktrees/
+
 # editor / OS
 .DS_Store
 *.swp

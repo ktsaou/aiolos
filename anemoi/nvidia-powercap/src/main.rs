@@ -191,6 +191,12 @@ impl GpuCap {
                 return Ok(applied.actual_mw);
             }
         }
+        // Arm the restore BEFORE touching the device. If `set_power_limit` changes the hardware limit
+        // and then errors (or any step before the bookkeeping below fails), the fail-safe must still
+        // fire — a GPU must never be left capped-but-unowned (NVML limits persist after exit).
+        // Over-arming is harmless: restoring an uncapped GPU to its firmware default is an idempotent
+        // no-op. `restore_armed` is cleared only after a restore actually succeeds.
+        self.restore_armed = true;
         let actual = self.gpu.set_power_limit(target_mw)?;
         let transition = !self.capped;
         self.capped = true;
@@ -198,7 +204,6 @@ impl GpuCap {
             requested_mw: target_mw,
             actual_mw: actual,
         });
-        self.restore_armed = true; // a cap is in effect -> restore is owed
         if transition {
             tracing::warn!(
                 uuid = %self.gpu.uuid(), reason = reason.as_str(), target_mw,

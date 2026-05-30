@@ -46,12 +46,23 @@ pub enum TickStatus {
 }
 
 impl TickStatus {
-    /// Fatal results make the instance worker exit so the supervisor respawns it.
+    /// Fatal results make the instance worker exit so the supervisor respawns it. This is the broad
+    /// "exit and respawn" predicate — it covers a module-declared `Fatal` AND the backstops
+    /// (`Timeout`/`Dead`/`Protocol`).
     pub fn is_fatal(self) -> bool {
         matches!(
             self,
             TickStatus::Fatal | TickStatus::Timeout | TickStatus::Dead | TickStatus::Protocol
         )
+    }
+
+    /// Only a module-DECLARED `fatal` warrants the LONG respawn backoff (jump to `max_backoff`,
+    /// decision 15). The backstop exits (`Timeout`/`Dead`/`Protocol`) are transient and MUST keep the
+    /// normal escalating backoff, so they are deliberately excluded here. (Distinct from `is_fatal`,
+    /// which is the broader "should the worker exit?" predicate — collapsing the two would strand a
+    /// single timeout on the long-backoff cap, i.e. up to `max_backoff` with no fan control.)
+    pub fn is_declared_fatal(self) -> bool {
+        matches!(self, TickStatus::Fatal)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -459,5 +470,40 @@ fn remaining_ms(deadline: Instant, now: Instant) -> i32 {
         1 // sub-millisecond remaining: poll once more, then the deadline check ends it
     } else {
         ms.min(i32::MAX as u128) as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_fatal_means_exit_but_only_declared_fatal_takes_long_backoff() {
+        // `is_fatal` = the worker must EXIT and be respawned — a declared fatal OR a backstop.
+        for s in [
+            TickStatus::Fatal,
+            TickStatus::Timeout,
+            TickStatus::Dead,
+            TickStatus::Protocol,
+        ] {
+            assert!(s.is_fatal(), "{s:?} should make the worker exit");
+        }
+        assert!(!TickStatus::Ok.is_fatal());
+        assert!(!TickStatus::Error.is_fatal());
+
+        // `is_declared_fatal` = jump to the LONG backoff — ONLY a module-declared fatal. The backstops
+        // (timeout/dead/protocol) MUST keep the normal escalating backoff; misclassifying them would
+        // strand a one-off timeout on the max_backoff cap. This is the exact distinction the
+        // supervisor's `WorkerExit` classification relies on (regression guard).
+        assert!(TickStatus::Fatal.is_declared_fatal());
+        for s in [
+            TickStatus::Timeout,
+            TickStatus::Dead,
+            TickStatus::Protocol,
+            TickStatus::Ok,
+            TickStatus::Error,
+        ] {
+            assert!(!s.is_declared_fatal(), "{s:?} must NOT be declared-fatal");
+        }
     }
 }
