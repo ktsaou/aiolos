@@ -453,8 +453,17 @@ impl Supervisor {
         let id_for_thread = id.clone();
         let key = self.key(&id);
         let results = self.results.clone();
-        let handle =
-            thread::spawn(move || worker(inst, cmd_rx, &module_name, &id_for_thread, key, results));
+        let handle = thread::spawn(move || {
+            worker(
+                inst,
+                cmd_rx,
+                &module_name,
+                &id_for_thread,
+                key,
+                restart_count,
+                results,
+            )
+        });
 
         self.running.insert(id.clone(), (cmd_tx, handle));
         info!(module=%self.module_name, id=%id, restart=restart_count, "instance spawned");
@@ -512,6 +521,7 @@ fn worker(
     module_name: &str,
     id: &str,
     key: String,
+    generation: u32,
     results: mpsc::Sender<TickReport>,
 ) -> WorkerExit {
     let _active = ActiveGuard::new();
@@ -537,6 +547,7 @@ fn worker(
                 // break to let the supervisor respawn us.
                 let _ = results.send(TickReport {
                     key: key.clone(),
+                    generation,
                     result: res,
                     latency,
                 });

@@ -102,6 +102,11 @@ impl TickResult {
 /// surface per-instance latency and to confirm the "delay-not-skip" effective period).
 pub struct TickReport {
     pub key: String,
+    /// The spawning instance's `restart_count` (generation). The main loop discards a report whose
+    /// generation does not match the instance currently holding `key`, so a slow predecessor's late
+    /// result (posted after a same-key respawn, e.g. on a supervisor panic) can never corrupt the new
+    /// instance or clear its legitimately-busy slot.
+    pub generation: u32,
     pub result: TickResult,
     pub latency: Duration,
 }

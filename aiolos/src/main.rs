@@ -335,10 +335,10 @@ fn dispatch_due(
             info!(wake = wake_count, to = %key, inputs = %summarize_inputs(inp), "routing inputs");
         }
         if cmd_tx.send(InstanceCmd::Tick { timeout, inputs }).is_err() {
-            // The worker is gone (it exited between snapshot and send). This dispatch never happened:
-            // clear busy AND reset last_dispatch so the slot records no phantom dispatch. (The
-            // supervisor will remove the instance and its slot shortly; until then the slot reflects
-            // reality.)
+            // The worker is gone (it exited between snapshot and send). Clear busy so the slot isn't
+            // wedged, but do NOT reset last_dispatch: the instance is dead and the supervisor reaps +
+            // prunes its slot shortly. Resetting it would make `should_dispatch` re-fire every wake
+            // until the reap, pointlessly re-attempting (and re-failing) the send each time.
             if let Some(slot) = state
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
@@ -346,7 +346,6 @@ fn dispatch_due(
                 .get_mut(&key)
             {
                 slot.busy = false;
-                slot.last_dispatch = None;
             }
         }
     }
@@ -385,23 +384,31 @@ fn reap_results(
     );
 }
 
-/// Fold async `apply` results into shared state. Updates per-instance status/readings/latency AND
-/// the blackboard ONLY for instances that still exist: a supervisor may have removed (and
-/// blackboard-pruned) this instance between dispatch and now, so re-inserting its readings would
-/// orphan a stale blackboard entry that nothing prunes again — routed to consumers forever. Gating
-/// on liveness prevents that. Each report also clears the instance's `busy` flag (it is idle again)
-/// and records its latency, so the scheduler can re-dispatch it when next due.
+/// Fold async `apply` results into shared state. A report is applied ONLY if the instance currently
+/// holding its key exists AND is at the report's `generation` (`restart_count`). This discards both
+/// a result for an already-removed instance (re-inserting its readings would orphan a stale
+/// blackboard entry that nothing prunes again — routed to consumers forever) AND a slow predecessor's
+/// late result after a same-key respawn (which would otherwise corrupt the new instance and wrongly
+/// clear its legitimately-busy slot). For the owning instance, this updates status/readings/latency
+/// + blackboard and clears its `busy` flag (idle again) so the scheduler can re-dispatch when due.
 fn apply_results(s: &mut AppState, reports: Vec<TickReport>) {
     for r in reports {
         let TickReport {
             key,
+            generation,
             result,
             latency,
         } = r;
+
+        // Stale-report guard: only the instance currently holding `key`, at the SAME generation, owns
+        // this result and slot. A removed instance (None) or a dead predecessor (different generation)
+        // is discarded entirely — no apply, no busy-clear.
+        if s.instances.get(&key).map(|e| e.restart_count) != Some(generation) {
+            continue;
+        }
         let is_ok = result.status == TickStatus::Ok;
 
-        // The worker posted -> it is idle again. Clear busy + record latency even if the instance
-        // entry was just removed (the slot is pruned next dispatch pass either way).
+        // The worker posted -> it is idle again. Clear busy + record latency.
         if let Some(slot) = s.sched.get_mut(&key) {
             slot.busy = false;
             slot.last_latency = Some(latency);
@@ -597,9 +604,15 @@ mod tests {
     use super::*;
     use instance::TickResult;
 
-    fn report(key: &str, status: TickStatus, readings: Vec<Reading>) -> TickReport {
+    fn report(
+        key: &str,
+        generation: u32,
+        status: TickStatus,
+        readings: Vec<Reading>,
+    ) -> TickReport {
         TickReport {
             key: key.to_string(),
+            generation,
             result: TickResult {
                 status,
                 error: None,
@@ -639,8 +652,8 @@ mod tests {
         apply_results(
             &mut s,
             vec![
-                report("mod:a", TickStatus::Ok, mk(50)),
-                report("mod:ghost", TickStatus::Ok, mk(99)),
+                report("mod:a", 0, TickStatus::Ok, mk(50)),
+                report("mod:ghost", 0, TickStatus::Ok, mk(99)),
             ],
         );
 
@@ -659,6 +672,22 @@ mod tests {
         // Reaping a worker's report marks the instance idle again (so it can be re-dispatched) and
         // records the apply latency for surfacing.
         let mut s = AppState::default();
+        let (tx, _rx) = mpsc::channel();
+        s.instances.insert(
+            "mod:a".into(),
+            InstanceEntry {
+                module_name: "mod".into(),
+                id: "a".into(),
+                name: "a".into(),
+                last_status: "starting".into(),
+                last_error: None,
+                last_readings: Vec::new(),
+                restart_count: 0,
+                last_seen: Instant::now(),
+                cmd_tx: tx,
+                stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            },
+        );
         s.sched.insert(
             "mod:a".into(),
             InstanceSched {
@@ -668,10 +697,62 @@ mod tests {
                 skipped_busy: 0,
             },
         );
-        apply_results(&mut s, vec![report("mod:a", TickStatus::Ok, Vec::new())]);
+        apply_results(&mut s, vec![report("mod:a", 0, TickStatus::Ok, Vec::new())]);
         let slot = &s.sched["mod:a"];
         assert!(!slot.busy, "worker posted -> instance is idle again");
         assert_eq!(slot.last_latency, Some(Duration::from_millis(7)));
+    }
+
+    #[test]
+    fn apply_results_discards_a_stale_generation_report() {
+        // A slow predecessor's late result (generation 0) must NOT touch the respawned instance
+        // (generation 1): no readings stored, and its legitimately-busy slot stays busy.
+        use protocol::Reading;
+        use serde_json::json;
+        let mut s = AppState::default();
+        let (tx, _rx) = mpsc::channel();
+        s.instances.insert(
+            "mod:a".into(),
+            InstanceEntry {
+                module_name: "mod".into(),
+                id: "a".into(),
+                name: "a".into(),
+                last_status: "starting".into(),
+                last_error: None,
+                last_readings: Vec::new(),
+                restart_count: 1, // respawned -> generation 1
+                last_seen: Instant::now(),
+                cmd_tx: tx,
+                stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            },
+        );
+        s.sched.insert(
+            "mod:a".into(),
+            InstanceSched {
+                busy: true,
+                last_dispatch: Some(Instant::now()),
+                last_latency: None,
+                skipped_busy: 0,
+            },
+        );
+        // A stale report from the dead predecessor (generation 0).
+        apply_results(
+            &mut s,
+            vec![report(
+                "mod:a",
+                0,
+                TickStatus::Ok,
+                vec![Reading::new("temp", "GPU", json!({"temp": 50}))],
+            )],
+        );
+        assert!(
+            s.sched["mod:a"].busy,
+            "a stale-generation report must NOT clear the respawned instance's busy slot"
+        );
+        assert!(
+            !s.blackboard.contains_key("mod:a"),
+            "a stale-generation report must NOT store readings for the respawned instance"
+        );
     }
 
     #[test]
