@@ -2,7 +2,7 @@
 
 Status: design (SOW-0009). UPS / utility-power state **sensor** — read-only; controls NO device.
 Conforms to `aiolos-protocol.spec.md`. Its readings are routed (`input=nut`) into a power reactor
-(e.g. `gpu-powercap`) so a utility-power event triggers a declared action.
+(e.g. `nvidia-powercap`) so a utility-power event triggers a declared action.
 
 ## Purpose
 Report each monitored UPS's utility-power state for routing, as a new reading type **`power-state`**.

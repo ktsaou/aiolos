@@ -1,4 +1,4 @@
-# Spec: `gpu-powercap` anemos
+# Spec: `nvidia-powercap` anemos
 
 Status: design (SOW-0009). GPU power-limit reactor — a **curve-less CONTROL** module. Conforms to
 `aiolos-protocol.spec.md`. It is the first aiolos module that controls something other than fans,
@@ -47,7 +47,7 @@ restore.
 - `reason` ∈ {`none`,`on-battery`,`low-runtime`,`low-battery-flag`}. A failed control tick restores
   the firmware default and responds `{"status":"error","error":"…"}`.
 
-## Policy (conservative by default) — `$AIOLOS_ETC_DIR/gpu-powercap.conf` else `/opt/aiolos/etc/gpu-powercap.conf`
+## Policy (conservative by default) — `$AIOLOS_ETC_DIR/nvidia-powercap.conf` else `/opt/aiolos/etc/nvidia-powercap.conf`
 `key=value`, `#` comments; unknown keys / unparseable values are ignored (a typo never disarms the
 fail-safe). Reloaded every tick (live tuning). Keys (defaults):
 - `cap_pct=70` — cap target as a % of each GPU's firmware default limit (1..100; device min enforced).
@@ -80,6 +80,6 @@ the safe direction (more power, never less).
 - On a (real or simulated) on-battery event meeting the trigger, each GPU's power limit is capped to
   `cap_pct`% of default; on AC restore the firmware default is restored.
 - On AC the module never caps, regardless of config (verified by the decision unit tests).
-- shutdown/EOF/SIGTERM and `gpu-powercap restore` each restore the firmware default; verified by
+- shutdown/EOF/SIGTERM and `nvidia-powercap restore` each restore the firmware default; verified by
   reading the power limit after exit. A failed control tick reverts to default.
 - No secrets in committed artifacts (config holds thresholds only; UPS host lives in `nut.conf`).

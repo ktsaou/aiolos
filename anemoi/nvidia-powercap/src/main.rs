@@ -1,4 +1,4 @@
-//! gpu-powercap anemos — react to utility-power loss by capping GPU power via NVML.
+//! nvidia-powercap anemos — react to utility-power loss by capping GPU power via NVML.
 //!
 //! Level-3: device logic ONLY. The `anemos` SDK owns the lifecycle (CLI/signals/logging/protocol/
 //! restore wiring); the `nvml` tech crate owns NVML access (incl. power-limit get/set/restore).
@@ -34,24 +34,24 @@ use serde_json::json;
 fn main() -> ! {
     anemos::run(
         ModuleInfo {
-            name: "gpu-powercap",
+            name: "nvidia-powercap",
             // Curve-less control: no temperature curve. The reaction is driven by routed power
             // state, so `apply` ignores the SDK controller (None means the SDK skips the curve
             // checks; this module still controls the device).
             curve_default_path: None,
             curve_env_filename: None,
         },
-        GpuPowercap {
+        NvidiaPowercap {
             detector: Detector::new(),
         },
     )
 }
 
-struct GpuPowercap {
+struct NvidiaPowercap {
     detector: Detector,
 }
 
-impl Anemos for GpuPowercap {
+impl Anemos for NvidiaPowercap {
     fn detect(&mut self) -> Detected {
         match self.detector.enumerate() {
             Ok(gpus) => Detected::ok(

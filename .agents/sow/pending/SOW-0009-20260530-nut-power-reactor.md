@@ -121,6 +121,13 @@ Decisions (recorded 2026-05-30):
   `cargo test --workspace --no-run` all pass. Binaries (per safety rules) NOT executed; on-hardware
   power set/restore + a simulated AC-loss event remain operator-validated.
 
+### 2026-05-30 — renamed at wave2a integration
+- The control module was renamed **`gpu-powercap` → `nvidia-powercap`** (binary, crate, dir
+  `anemoi/nvidia-powercap/`, config `nvidia-powercap.conf`, registry line, install/update lists, spec
+  `anemos-nvidia-powercap.spec.md`) during the Wave 2a integration merge, per the user. This SOW's
+  narrative above keeps the original as-built name for historical fidelity; all live artifacts and the
+  spec now use `nvidia-powercap`. The forthcoming temperature trigger is tracked in SOW-0015.
+
 ## Validation
 Off-hardware (this build):
 - Acceptance (partial): the pure decision/parse/fold logic is unit-tested — UPS status parsing &

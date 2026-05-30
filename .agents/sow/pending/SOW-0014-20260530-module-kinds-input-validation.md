@@ -40,7 +40,7 @@ Proposed model (to confirm):
   `X.produces ⊇ { M.requires }`; otherwise **refuse to start** with a clear error.
 - Examples on this host: `nvme`/`ipmi-temps` → produces `[temp]`, requires none; `nvidia` → produces
   `[temp,fan]`, requires none (self-senses), controls fans; `asrock16-2t` → produces `[fan]`,
-  **requires `temp`**; `nut` → produces `[power-state]`; `gpu-powercap` → **requires `power-state`**.
+  **requires `temp`**; `nut` → produces `[power-state]`; `nvidia-powercap` → **requires `power-state`**.
 
 ### Acceptance Criteria
 - A module declares its produces/requires; the orchestrator reads it and **validates every `input=`**.

@@ -13,7 +13,7 @@ members = [
     "anemoi/nvme",     # level-3 anemos (sensor-only: NVMe temps)
     "anemoi/ipmi-temps", # level-3 anemos (sensor-only: BMC board/CPU/DIMM/NIC temps)
     "anemoi/nut",      # level-3 anemos (sensor-only: UPS / utility-power state)
-    "anemoi/gpu-powercap", # level-3 anemos (curve-less control: cap GPU power on utility-power loss)
+    "anemoi/nvidia-powercap", # level-3 anemos (curve-less control: cap GPU power on utility-power loss)
 ]
 resolver = "2"
 

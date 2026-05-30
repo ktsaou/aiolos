@@ -34,7 +34,7 @@ if systemctl is-active --quiet aiolos; then
 fi
 
 echo "--- replacing binaries ---"
-for b in aiolos nvidia asrock16-2t nvme ipmi-temps nut gpu-powercap; do
+for b in aiolos nvidia asrock16-2t nvme ipmi-temps nut nvidia-powercap; do
   run sudo install -m 0755 "target/release/${b}" "${BIN}/${b}"
 done
 

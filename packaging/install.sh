@@ -36,7 +36,7 @@ echo "--- creating directories ---"
 run sudo mkdir -p "${BIN}" "${ETC}"
 
 echo "--- installing binaries (overwrite) ---"
-for b in aiolos nvidia asrock16-2t nvme ipmi-temps nut gpu-powercap; do
+for b in aiolos nvidia asrock16-2t nvme ipmi-temps nut nvidia-powercap; do
   run sudo install -m 0755 "target/release/${b}" "${BIN}/${b}"
 done
 
@@ -55,7 +55,7 @@ install_if_absent packaging/asrock16-2t.curve.json "${ETC}/asrock16-2t.curve.jso
 # Operator config templates (fully commented — installing them changes nothing; both modules work
 # via auto-discovery / built-in defaults until the operator edits these).
 install_if_absent packaging/nut.conf               "${ETC}/nut.conf"
-install_if_absent packaging/gpu-powercap.conf      "${ETC}/gpu-powercap.conf"
+install_if_absent packaging/nvidia-powercap.conf      "${ETC}/nvidia-powercap.conf"
 
 echo "--- installing systemd unit ---"
 run sudo install -m 0644 systemd/aiolos.service /etc/systemd/system/aiolos.service

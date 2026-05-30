@@ -4,7 +4,7 @@
 //! restore wiring); the `nut` tech crate shells out to `upsc` to list UPS names and read variables.
 //! This is a **sensor-only** anemos (`ModuleInfo` curve = `None`): it reports each UPS's
 //! utility-power state as a new reading type `power-state`, routed (e.g. `input=nut`) into a reactor
-//! such as `gpu-powercap`. It controls nothing — so `apply` ignores the controller and
+//! such as `nvidia-powercap`. It controls nothing — so `apply` ignores the controller and
 //! `restore`/`restore_all` are no-ops.
 //!
 //! Which UPS(es) to monitor comes from **operator config** `nut.conf` (one id per line; `#`

@@ -7,13 +7,13 @@
 //! is opt-in (`cap_on_battery=true`). On AC restore (or when no trigger holds) the cap is lifted
 //! back to the firmware default.
 //!
-//! Config `gpu-powercap.conf` (`key=value`, `#` comments) at `$AIOLOS_ETC_DIR/gpu-powercap.conf`
-//! else `/opt/aiolos/etc/gpu-powercap.conf`. No secrets — only thresholds.
+//! Config `nvidia-powercap.conf` (`key=value`, `#` comments) at `$AIOLOS_ETC_DIR/nvidia-powercap.conf`
+//! else `/opt/aiolos/etc/nvidia-powercap.conf`. No secrets — only thresholds.
 
-const DEFAULT_CONF_PATH: &str = "/opt/aiolos/etc/gpu-powercap.conf";
-const CONF_FILENAME: &str = "gpu-powercap.conf";
+const DEFAULT_CONF_PATH: &str = "/opt/aiolos/etc/nvidia-powercap.conf";
+const CONF_FILENAME: &str = "nvidia-powercap.conf";
 
-/// Power-cap policy knobs (all overridable in `gpu-powercap.conf`).
+/// Power-cap policy knobs (all overridable in `nvidia-powercap.conf`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Policy {
     /// Cap target as a percentage of each GPU's firmware **default** limit (clamped to the device's
@@ -38,7 +38,7 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// Resolve the config path: `$AIOLOS_ETC_DIR/gpu-powercap.conf` if set, else the install default.
+    /// Resolve the config path: `$AIOLOS_ETC_DIR/nvidia-powercap.conf` if set, else the install default.
     fn conf_path() -> String {
         match std::env::var("AIOLOS_ETC_DIR") {
             Ok(dir) => format!("{dir}/{CONF_FILENAME}"),
