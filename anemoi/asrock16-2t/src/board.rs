@@ -65,15 +65,21 @@ impl Board {
         r.map(|_| ())
     }
 
-    /// Claim (if needed) and set every fan's duty to `pct`. On a persistent set failure this
-    /// RELEASES to BMC auto rather than leaving the board claimed-manual without a fresh duty.
+    /// Claim (if needed) and set every fan's duty to `pct` (uniform). On a persistent set failure
+    /// this RELEASES to BMC auto rather than leaving the board claimed-manual without a fresh duty.
     pub fn set_all_fans(&mut self, pct: i32) -> Result<()> {
-        regulate(self, pct)
+        regulate(self, &[pct; 8])
     }
 
-    fn write_duty(&mut self, pct: i32) -> Result<()> {
+    /// Claim (if needed) and set the 8 fans to per-fan duties `pcts` (FAN1..FAN8); same
+    /// claim/retry/release safety as `set_all_fans`. Used by the per-zone (SOW-0010) path.
+    pub fn set_fans_per_fan(&mut self, pcts: &[i32; 8]) -> Result<()> {
+        regulate(self, pcts)
+    }
+
+    fn write_duty(&mut self, pcts: &[i32; 8]) -> Result<()> {
         self.ipmi
-            .raw(NETFN_OEM, CMD_SET_DUTY, &duty_payload(pct))
+            .raw(NETFN_OEM, CMD_SET_DUTY, &duty_payload(pcts))
             .map(|_| ())
     }
 
@@ -148,11 +154,12 @@ fn fan_rpm(factors: Option<SensorFactors>, reading: Option<SensorReading>) -> Op
 
 // ---- fan-control policy (trait-based so it is unit-testable without hardware) ----
 
-/// Minimal fan-bus operations the regulation policy needs.
+/// Minimal fan-bus operations the regulation policy needs. `set_duty` takes the 8 per-fan duties
+/// (FAN1..FAN8); a uniform set just passes the same value eight times.
 pub trait FanBus {
     fn is_claimed(&self) -> bool;
     fn claim(&mut self) -> Result<()>;
-    fn set_duty(&mut self, pct: i32) -> Result<()>;
+    fn set_duty(&mut self, pcts: &[i32; 8]) -> Result<()>;
     fn release(&mut self) -> Result<()>;
 }
 
@@ -163,26 +170,27 @@ impl FanBus for Board {
     fn claim(&mut self) -> Result<()> {
         self.claim_manual()
     }
-    fn set_duty(&mut self, pct: i32) -> Result<()> {
-        self.write_duty(pct)
+    fn set_duty(&mut self, pcts: &[i32; 8]) -> Result<()> {
+        self.write_duty(pcts)
     }
     fn release(&mut self) -> Result<()> {
         self.release_auto()
     }
 }
 
-/// Claim-if-needed → set duty → re-claim+retry once on failure; if a duty still can't be set,
-/// **release to BMC auto** so the board is never left claimed-manual without a fresh duty.
-pub fn regulate<B: FanBus>(bus: &mut B, pct: i32) -> Result<()> {
+/// Claim-if-needed → set the 8 per-fan duties → re-claim+retry once on failure; if a duty still
+/// can't be set, **release to BMC auto** so the board is never left claimed-manual without a fresh
+/// duty. The duties are the 8 fan percentages (FAN1..FAN8); a uniform set passes `[pct; 8]`.
+pub fn regulate<B: FanBus>(bus: &mut B, pcts: &[i32; 8]) -> Result<()> {
     if !bus.is_claimed() {
         bus.claim()?; // claim failed -> nothing claimed -> safe to propagate
     }
-    if let Err(first) = bus.set_duty(pct) {
+    if let Err(first) = bus.set_duty(pcts) {
         if let Err(reclaim) = bus.claim() {
             let _ = bus.release(); // can't regulate -> hand back to BMC auto
             bail!("set failed ({first}); re-claim failed ({reclaim}); released to BMC auto");
         }
-        if let Err(second) = bus.set_duty(pct) {
+        if let Err(second) = bus.set_duty(pcts) {
             let _ = bus.release(); // still can't set a duty -> never hold manual frozen
             bail!("set failed twice ({first}; {second}); released to BMC auto");
         }
@@ -200,11 +208,15 @@ fn release_payload() -> [u8; 16] {
     [0x00; 16]
 }
 
-/// 16 duty bytes. Byte value == percent (0x64 = 100). Clamped to 1..=100 so no byte is ever zero
-/// (a zero byte → `0xcc invalid data field` and the claimed-but-undutied minimum trap).
-fn duty_payload(pct: i32) -> [u8; 16] {
-    let byte = pct.clamp(0, 100).max(1) as u8;
-    [byte; 16]
+/// 16 duty bytes for the 8 fans. Bytes 0–7 = FAN1..FAN8 (each `pcts[i]` clamped to 1..=100 so no
+/// byte is ever zero — a zero byte → `0xcc invalid data field` and the claimed-but-undutied minimum
+/// trap). Bytes 8–15 are unused tach slots, held non-zero (`0x01`) as the board requires.
+fn duty_payload(pcts: &[i32; 8]) -> [u8; 16] {
+    let mut out = [0x01u8; 16];
+    for (i, &pct) in pcts.iter().enumerate() {
+        out[i] = pct.clamp(0, 100).max(1) as u8;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -219,11 +231,23 @@ mod tests {
 
     #[test]
     fn duty_is_never_zero() {
-        assert_eq!(duty_payload(0), [1u8; 16]); // 0% -> 1 (avoid 0xcc trap)
-        assert_eq!(duty_payload(-5), [1u8; 16]);
-        assert_eq!(duty_payload(50), [50u8; 16]);
-        assert_eq!(duty_payload(100), [100u8; 16]); // 0x64
-        assert_eq!(duty_payload(150), [100u8; 16]); // clamp high
+        // Uniform: every controllable fan byte == pct, tach slots (8..16) held non-zero.
+        assert_eq!(duty_payload(&[0; 8]), [1u8; 16]); // 0% -> 1 (avoid 0xcc trap)
+        assert_eq!(duty_payload(&[-5; 8]), [1u8; 16]);
+        assert_eq!(duty_payload(&[50; 8]), [50u8; 16]);
+        assert_eq!(duty_payload(&[100; 8]), [100u8; 16]); // 0x64
+        assert_eq!(duty_payload(&[150; 8]), [100u8; 16]); // clamp high
+    }
+
+    #[test]
+    fn duty_payload_per_fan_places_each_fan_and_floors_tach_slots() {
+        // Per-zone duties: bytes 0-7 = FAN1..FAN8 (clamped 1..=100), bytes 8-15 stay 0x01.
+        let p = duty_payload(&[30, 30, 75, 75, 75, 75, 75, 75]);
+        assert_eq!(&p[0..8], &[30, 30, 75, 75, 75, 75, 75, 75]);
+        assert_eq!(&p[8..16], &[1u8; 8], "unused tach slots must stay non-zero");
+        // A zero / negative per-fan duty is still floored to 1 (never a zero byte).
+        let z = duty_payload(&[0, -1, 100, 150, 1, 50, 50, 50]);
+        assert_eq!(&z[0..8], &[1, 1, 100, 100, 1, 50, 50, 50]);
     }
 
     /// A mock fan bus for testing the `regulate` policy without /dev/ipmi0.
@@ -254,7 +278,7 @@ mod tests {
             self.claimed = true;
             Ok(())
         }
-        fn set_duty(&mut self, _pct: i32) -> Result<()> {
+        fn set_duty(&mut self, _pcts: &[i32; 8]) -> Result<()> {
             self.sets += 1;
             if self.fail_set {
                 bail!("mock set failure");
@@ -271,7 +295,7 @@ mod tests {
     #[test]
     fn regulate_ok_claims_then_sets_without_release() {
         let mut b = MockBus::new(false);
-        assert!(regulate(&mut b, 50).is_ok());
+        assert!(regulate(&mut b, &[50; 8]).is_ok());
         assert!(b.claimed && b.claims == 1 && b.sets == 1 && b.releases == 0);
     }
 
@@ -279,7 +303,7 @@ mod tests {
     fn regulate_releases_to_auto_when_duty_cannot_be_set() {
         // R2: a persistent set failure must NOT leave the board claimed-manual — release to BMC auto.
         let mut b = MockBus::new(true);
-        assert!(regulate(&mut b, 50).is_err());
+        assert!(regulate(&mut b, &[50; 8]).is_err());
         assert!(
             b.releases >= 1,
             "must release to BMC auto when it cannot set a duty"

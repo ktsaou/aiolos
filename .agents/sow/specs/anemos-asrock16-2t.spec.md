@@ -28,10 +28,13 @@ also reads its own CPU/board sensors. One `run` instance (the board).
   Routed temps are the `"type":"temp"` records relayed in `inputs`.
 - *Board/DIMM IPMI SDR temps (`TEMP_MB1/2`, `TEMP_CARD_SIDE1`, `TEMP_DDR4_*`) remain a planned
   enhancement; they are not in the driving max — CPU + GPU + NVMe dominate cooling demand here.*
-- Interpolate `/opt/aiolos/etc/asrock16-2t.curve.json`; set all 8 fans (uniform); then (observability
-  only, read AFTER the control decision) report each fan's `{pwm, rpm}`: `pwm` from the `0xda` duty
-  readback (falling back to the commanded pct if unavailable), `rpm` from the fan's tachometer
-  (omitted if the sensor is unreadable). Reported alongside the temp readings and a `driving` record.
+- Interpolate the curve and set the 8 fans (uniform OR per-zone, see **Fan model** below); then
+  (observability only, read AFTER the control decision) report each fan's `{pwm, rpm}`: `pwm` from
+  the `0xda` duty readback (falling back to the commanded duty if unavailable), `rpm` from the fan's
+  tachometer (omitted if the sensor is unreadable). A **faulted** fan additionally carries
+  `"fault":true` (see **Fan-fault detection**). Reported alongside the temp readings and a `driving`
+  record (`{"mode":"uniform","raw","temp","pct"}` or `{"mode":"zone","cpu_raw","cpu_temp","cpu_pct",
+  "case_raw","case_temp","case_pct"}`).
 - **Per-fan RPM (SOW-0005):** read via standard IPMI sensor commands on `FAN1_1..FAN8_1` (sensor
   numbers `0x60..0x67`). The linear conversion factors come from `Get Sensor Reading Factors`
   (`0x04/0x23`) — **prefetched at instance open** and cached (constant for these linear sensors;
@@ -42,11 +45,45 @@ also reads its own CPU/board sensors. One `run` instance (the board).
   deadline; control commands keep the full IPMI timeout. `FAN*_2`/`FAN_PSU*` report "No Reading" and
   are skipped. The raw byte is treated as unsigned (universal for fan tach). RPM is read-only; a
   sensor failure never affects fan control or fails the tick.
-- **Fan model (default): uniform** — apply `curve(driving_temp)` to all 8 fans. CPU fans following
-  the global max is intended (more case airflow when GPUs are hot). *Per-fan curves
-  (FAN1/2 by CPU temp, FAN3-8 by max) are a supported future option; config allows it.*
+- **Fan model — default uniform, optional per-zone (SOW-0010):**
+  - **Uniform (default):** apply `curve(max(all routed inputs, CPU))` to all 8 fans via the single
+    `asrock16-2t.curve.json`. Back-compatible; the shipped config is unchanged.
+  - **Per-zone:** when BOTH optional zone curve files load a non-empty curve, the board splits into
+    two independently-curved zones, each with its own `anemos::Controller` (own EMA/deadband/
+    sensitivity):
+    - **CPU zone** — FAN1/FAN2 (Noctua CPU coolers) driven by `max(CPU k10temp)` via
+      `asrock16-2t.cpu.curve.json`.
+    - **Case zone** — FAN3..FAN8 (120 mm case fans) driven by `max(all routed inputs)` (GPU + NVMe +
+      any future routed source) via `asrock16-2t.case.curve.json`. **CPU temp is deliberately
+      excluded from the case max** so a CPU-only spike does not blast the case fans.
+  - The per-fan duties go out through the same `0xd6` command (bytes 0–7 = FAN1..FAN8; see the
+    critical rule below). The mode is re-decided **live every tick** from the presence of the two
+    zone files (a pure config read; no control side effects), so zoning can be enabled/disabled
+    without a restart. The two zone files sit next to the main curve, derived by suffix from the
+    resolved main path so `$AIOLOS_ETC_DIR` is honoured. **Per-zone fail-safe:** because one `0xd6`
+    sets all 8 fans at once, if EITHER zone has no driving temp or no usable curve the WHOLE board
+    releases to BMC auto (identical to the uniform fail-safe — we cannot release one zone and hold
+    the other).
 - **Duty is always clamped non-zero** (≥1%) so a valid-but-low temperature can never send a zero
-  byte (the `0xcc` claimed-but-undutied minimum trap).
+  byte (the `0xcc` claimed-but-undutied minimum trap). In a per-fan `0xd6`, the 8 unused tach slots
+  (bytes 8–15) are held at `0x01`.
+
+### Fan-fault detection (SOW-0008)
+Module-local stall detection using the per-fan RPM already read each tick. A fan is *faulted* when,
+for `FAULT_TICKS` (3) consecutive ticks past a `SPINUP_GRACE_TICKS` (2) spin-up grace, it is
+commanded ≥ `FAULT_MIN_DUTY` (20 %) yet its tachometer reads a **present** RPM ≤ `FAULT_RPM_MAX`
+(100) — i.e. driven but not spinning. Rules:
+- An **unreadable** RPM (`None`) is NOT a fault (sensor read failing ≠ dead fan); it holds the
+  per-fan state (neither confirms nor clears). A present RPM above the threshold clears immediately.
+- A fan commanded below the duty threshold can legitimately read ≈0 and never faults (state resets).
+- **Surfacing:** the faulted fan's `fan` reading carries `"fault":true` and a `tracing::warn!` names
+  it. Richer delivery (webhook / Netdata `aiolos_fan_rpm==0` alarm, ties to the metrics SOW) is a
+  documented **follow-on**, not implemented here.
+- **Compensation:** on a confirmed fault, the surviving (non-faulted) fans **in the same zone** are
+  commanded 100 % on subsequent ticks (more airflow is always safe); the dead fan keeps its normal
+  commanded duty (never 0). This works in both uniform and per-zone mode (in uniform mode the two
+  zones still define which siblings get boosted). The detector evaluates the duty actually
+  *commanded* (post-compensation) against the measured RPM.
 
 ## IPMI control (verified) — OEM netfn `0x3a` + standard sensor netfn `0x04`, inband `/dev/ipmi0`
 | Action | Command |
@@ -96,7 +133,19 @@ never stop/minimise the fans. The board floors until **50 °C** (not 30 °C like
 because its driving sensors — DIMM/NVMe/board/LAN — idle at ~45–50 °C, so flooring at 30 °C would
 keep the chassis fans needlessly high. GPU heat still drives the fans up via the routed `max`.
 (30 % matches the board's firmware idle; supersedes SOW-0001 #16.) `sensitivity` (0.5 default) is reloaded every
-tick. (Per-fan/per-zone curves remain a possible future extension; the shipped model is uniform.)
+tick.
+
+### Optional per-zone curves (SOW-0010) — back-compatible
+The single `asrock16-2t.curve.json` above is the **uniform / fallback** curve and the shipped
+default. To split the board into the CPU-cooler and case-fan zones, drop **both** of these next to
+it (each a normal curve file with its own optional `sensitivity`):
+- `asrock16-2t.cpu.curve.json` — drives FAN1/FAN2 (Noctua CPU coolers) from CPU temp.
+- `asrock16-2t.case.curve.json` — drives FAN3..FAN8 (case fans) from `max(all routed inputs)`.
+
+Zone mode activates only when BOTH load a non-empty curve; otherwise the uniform curve drives all 8
+fans. The decision is live (re-read each tick), so adding/removing the files toggles zoning without a
+restart. Paths derive from the resolved main-curve path by suffix, so `$AIOLOS_ETC_DIR` is honoured.
+Example CPU-zone curve (Noctuas can floor lower than the case fans): `{"40":30,"75":100,"sensitivity":0.5}`.
 
 ## Implementation note (language/binding)
 Rust, IPMI via raw `/dev/ipmi0` ioctl — zero extra deps (user decision SOW-0001 #6). The Linux
@@ -120,3 +169,10 @@ asserts, and the two ioctl numbers are asserted against the values above. CPU te
 - A persistent duty-set failure releases to BMC auto (never holds manual-but-frozen).
 - `asrock16-2t restore` releases to BMC auto and is idempotent.
 - Never leaves fans claimed-but-undutied (the ~10–20% minimum trap).
+- **Per-zone (SOW-0010):** with both zone curve files present, a CPU-only load raises FAN1/2 without
+  over-driving FAN3–8, and GPU/NVMe heat raises FAN3–8 without over-driving FAN1/2; with the files
+  absent, behaviour is byte-for-byte the uniform default. If either zone's temp/curve is
+  indeterminable, the whole board releases to BMC auto.
+- **Fan-fault (SOW-0008):** a fan commanded ≥ 20 % reading ≈0 RPM for 3 consecutive ticks (past a
+  2-tick spin-up grace) is flagged `"fault":true` + warned, and its surviving zone siblings are
+  boosted to 100 %; an unreadable tach or a lightly-commanded fan never false-positives.

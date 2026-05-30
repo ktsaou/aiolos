@@ -2,18 +2,35 @@
 //!
 //! Level-3: device logic ONLY. The `anemos` SDK owns the lifecycle (CLI/signals/logging/curve+EMA/
 //! protocol/restore); `ipmi` is the IPMI transport; `board` is the board's OEM fan commands; `hwmon`
-//! reads CPU temps. detect → one board. apply → drive 8 fans to curve(max(GPU inputs, CPU temps)).
+//! reads CPU temps. detect → one board.
+//!
+//! apply (SOW-0010) drives the 8 fans in one of two modes, decided live each tick from the config:
+//! - **uniform** (default, back-compatible): one `curve(max(all routed inputs, CPU))` for all 8 fans
+//!   — the SDK-provided controller reading `asrock16-2t.curve.json`.
+//! - **per-zone**: when BOTH optional zone curve files load a non-empty curve, drive FAN1/2 (the
+//!   Noctua CPU coolers) from CPU temps via `asrock16-2t.cpu.curve.json`, and FAN3–8 (case fans)
+//!   from `max(all routed inputs = GPU+NVMe+…)` via `asrock16-2t.case.curve.json`. Two internal
+//!   `anemos::Controller`s (own EMA/deadband/sensitivity), commanded via the per-fan `0xd6` path.
+//!
+//! Fan-fault detection (SOW-0008): a fan commanded above a duty threshold that reads ≈0 RPM for
+//! several consecutive ticks (after a spin-up grace) is flagged (`"fault":true` reading + warn), and
+//! the surviving fans in its zone are boosted to 100% for more airflow.
+//!
 //! restore → release to BMC auto. A `query` subcommand reads the live duty (read-only diagnostic).
 
 mod board;
+mod fault;
+mod zones;
 
 use anemos::{
     Anemos, Applied, Controller, Detected, Device, ExtraCmd, FoundEntry, Inputs, ModuleInfo,
     Reading,
 };
 use board::Board;
+use fault::FanFaultTracker;
 use serde_json::json;
 use std::collections::HashMap;
+use zones::ZoneControllers;
 
 fn main() -> ! {
     let mut extra: HashMap<&'static str, ExtraCmd> = HashMap::new();
@@ -49,6 +66,10 @@ impl Anemos for Asrock {
         Ok(Box::new(AsrockDevice {
             board,
             restore_armed: true,
+            // Lazily built on the first apply, once the SDK controller reveals the curve path
+            // (so the zone curve files sit next to the main one and honour `$AIOLOS_ETC_DIR`).
+            zones: None,
+            faults: FanFaultTracker::new(),
         }))
     }
 
@@ -66,38 +87,112 @@ impl Anemos for Asrock {
 struct AsrockDevice {
     board: Board,
     restore_armed: bool,
+    /// Per-zone controllers (CPU coolers vs case fans), built lazily on the first apply from the
+    /// SDK controller's curve path. Present only when both zone curve files exist; otherwise the
+    /// uniform SDK controller drives all 8 fans.
+    zones: Option<ZoneControllers>,
+    /// Per-fan stall detector (commanded-above-threshold vs measured RPM, with grace + hysteresis).
+    faults: FanFaultTracker,
 }
 
 impl Device for AsrockDevice {
     fn apply(&mut self, inputs: Option<&Inputs>, ctrl: &mut Controller) -> Applied {
         // Routed temps arrive keyed by `module:id`; partition by source so GPU and NVMe are
-        // labelled distinctly in the readings. The driving max uses ALL routed temps (robust if
-        // more sources are wired later) plus the local CPU sensors.
+        // labelled distinctly in the readings. The uniform driving max uses ALL routed temps (robust
+        // if more sources are wired later) plus the local CPU sensors. The per-zone path (SOW-0010)
+        // splits these: CPU coolers (FAN1/2) by CPU temp; case fans (FAN3–8) by the routed-input max.
         let gpu_temps = input_temps_from(inputs, "nvidia");
         let nvme_temps = input_temps_from(inputs, "nvme");
         let cpu_temps = hwmon::read_temps("k10temp");
         let gpu_max = gpu_temps.iter().copied().max();
         let nvme_max = nvme_temps.iter().copied().max();
         let cpu_max = cpu_temps.iter().map(|(_, t)| *t).max();
-        let input_max = input_temps(inputs).into_iter().max();
+        let input_max = input_temps(inputs).into_iter().max(); // GPU+NVMe+any routed source
         let raw_driving = [input_max, cpu_max].into_iter().flatten().max();
 
-        // Without a valid temperature OR a usable curve we cannot control safely: release to BMC auto
-        // rather than hold manual control while blind (decision 9). The SDK resets the controller.
-        let Some(raw) = raw_driving else {
-            return release_or_error(&mut self.board, "indeterminable temp");
-        };
-        let duty = ctrl.duty(raw);
-        let Some(pct) = duty.pct else {
-            return release_or_error(&mut self.board, "no usable curve");
-        };
-        tracing::info!(gpu_max = ?gpu_max, nvme_max = ?nvme_max, cpu_max = ?cpu_max,
-            raw_driving = raw, smoothed_driving = duty.smoothed, commanded_pct = pct,
-            "decision: set all board fans");
+        // Build (lazily, once) the per-zone controllers next to the main curve file. The SDK
+        // controller's path reveals the etc dir + env override; we never touch the SDK controller's
+        // EMA when in zone mode.
+        let zones = self
+            .zones
+            .get_or_insert_with(|| ZoneControllers::for_main_path(ctrl.path()));
 
-        if let Err(e) = self.board.set_all_fans(pct as i32) {
-            return Applied::error(format!("set fans: {e}"));
-        }
+        // Decide the mode LIVE each tick (so dropping in / removing the zone files takes effect on
+        // the next tick): zone mode iff BOTH zone curve files load a non-empty curve. This is a pure
+        // config read; it does not perturb any controller's EMA.
+        let zone_mode = zones.both_present();
+
+        // Compensation set from PRIOR ticks: zones with a confirmed-faulted fan get their surviving
+        // fans boosted this tick. Computed before the duty math so it can override the base duties.
+        let confirmed = self.faults.confirmed();
+
+        let outcome = if zone_mode {
+            // Per-zone: each zone needs a present temp AND (guaranteed non-empty) curve; if either
+            // zone is blind we cannot split safely, so release the WHOLE board (one 0xd6 sets all 8
+            // fans — we cannot release one zone and hold the other). Mirrors the uniform fail-safe.
+            let (Some(cpu_raw), Some(case_raw)) = (cpu_max, input_max) else {
+                self.reset_zone_dampers();
+                return release_or_error(
+                    &mut self.board,
+                    "zone mode: a zone temp is indeterminable",
+                );
+            };
+            let cpu_duty = zones.cpu.duty(cpu_raw);
+            let case_duty = zones.case.duty(case_raw);
+            let (Some(cpu_pct), Some(case_pct)) = (cpu_duty.pct, case_duty.pct) else {
+                self.reset_zone_dampers();
+                return release_or_error(&mut self.board, "zone mode: no usable curve");
+            };
+            let base = zones::per_fan_duties(cpu_pct, case_pct);
+            let commanded = fault::compensate(base, &confirmed);
+            tracing::info!(
+                cpu_raw,
+                case_raw,
+                cpu_smoothed = cpu_duty.smoothed,
+                case_smoothed = case_duty.smoothed,
+                cpu_pct,
+                case_pct,
+                ?commanded,
+                ?confirmed,
+                "decision: set board fans (zone mode)"
+            );
+            if let Err(e) = self.board.set_fans_per_fan(&commanded.map(|p| p as i32)) {
+                return Applied::error(format!("set fans: {e}"));
+            }
+            ApplyOutcome::zone(
+                commanded,
+                cpu_raw,
+                case_raw,
+                cpu_duty.smoothed,
+                case_duty.smoothed,
+            )
+        } else {
+            // Uniform (default, back-compatible): one curve over max(all inputs, CPU), all 8 fans.
+            let Some(raw) = raw_driving else {
+                return release_or_error(&mut self.board, "indeterminable temp");
+            };
+            let duty = ctrl.duty(raw);
+            let Some(pct) = duty.pct else {
+                return release_or_error(&mut self.board, "no usable curve");
+            };
+            let base = [pct; 8];
+            let commanded = fault::compensate(base, &confirmed);
+            tracing::info!(gpu_max = ?gpu_max, nvme_max = ?nvme_max, cpu_max = ?cpu_max,
+                raw_driving = raw, smoothed_driving = duty.smoothed,
+                commanded_pct = pct, ?commanded, ?confirmed,
+                "decision: set all board fans (uniform)");
+            // Uniform with no active compensation -> the dedicated uniform set; a fault boost makes
+            // the duties non-uniform, so use the per-fan path in that case.
+            let set = if commanded == base {
+                self.board.set_all_fans(pct as i32)
+            } else {
+                self.board.set_fans_per_fan(&commanded.map(|p| p as i32))
+            };
+            if let Err(e) = set {
+                return Applied::error(format!("set fans: {e}"));
+            }
+            ApplyOutcome::uniform(commanded, raw, duty.smoothed, pct)
+        };
 
         let mut readings = Vec::new();
         if let Some(g) = gpu_max {
@@ -109,27 +204,33 @@ impl Device for AsrockDevice {
         for (label, t) in &cpu_temps {
             readings.push(Reading::new("temp", label.clone(), json!({ "temp": t })));
         }
-        readings.push(Reading::new(
-            "driving",
-            "driving",
-            json!({ "temp": duty.smoothed, "raw": raw, "pct": pct }),
-        ));
+        readings.push(outcome.driving_reading());
 
         // Observability, read AFTER the control decision (and under a short timeout) so a sensor
         // hiccup never affects cooling or fails the tick: the true per-fan duty (0xda readback) and
-        // each fan's tachometer RPM. pwm falls back to the commanded pct if the readback is
+        // each fan's tachometer RPM. pwm falls back to the commanded duty if the readback is
         // unavailable; rpm is omitted if the tach is unreadable.
         let (duty_readback, fan_rpms) = self.board.read_fan_status();
+        // Update the per-fan stall detector with what we COMMANDED this tick and what each tach now
+        // reads, producing the confirmed-fault set used for compensation next tick.
+        let commanded = outcome.commanded();
+        let rpms: [Option<i32>; 8] = std::array::from_fn(|i| fan_rpms.get(i).and_then(|(_, r)| *r));
+        let now_faulted = self.faults.update(&commanded, &rpms);
         for (i, (label, rpm)) in fan_rpms.into_iter().enumerate() {
             let pwm = duty_readback
                 .as_ref()
                 .and_then(|d| d.get(i))
                 .map(|&b| b as i64)
-                .unwrap_or(pct as i64);
+                .unwrap_or(commanded[i] as i64);
             let mut f = serde_json::Map::new();
             f.insert("pwm".to_string(), json!(pwm));
             if let Some(r) = rpm {
                 f.insert("rpm".to_string(), json!(r));
+            }
+            if now_faulted[i] {
+                f.insert("fault".to_string(), json!(true));
+                tracing::warn!(fan = %label, commanded = commanded[i], rpm = ?rpm,
+                    "FAN FAULT: commanded above threshold but reads ~0 RPM (stalled/failed fan)");
             }
             readings.push(Reading::new("fan", label, json!(f)));
         }
@@ -151,12 +252,101 @@ impl Device for AsrockDevice {
     }
 }
 
+impl AsrockDevice {
+    /// Reset both zone dampers when we abandon a zone-mode tick (release path), mirroring the SDK's
+    /// `ctrl.reset()` on a non-Ok tick so the per-zone EMA/deadband re-seed cleanly on recovery.
+    fn reset_zone_dampers(&mut self) {
+        if let Some(z) = self.zones.as_mut() {
+            z.cpu.reset();
+            z.case.reset();
+        }
+    }
+}
+
 impl Drop for AsrockDevice {
     fn drop(&mut self) {
         if self.restore_armed {
             if let Ok(mut b) = Board::open() {
                 let _ = b.release_auto();
             }
+        }
+    }
+}
+
+/// What the apply tick decided, carried to the readings stage: the 8 commanded duties plus the
+/// `driving` record (uniform: one curve; zone: the two zones' raw/smoothed temps).
+enum ApplyOutcome {
+    Uniform {
+        commanded: [u32; 8],
+        raw: i32,
+        smoothed: i32,
+        pct: u32,
+    },
+    Zone {
+        commanded: [u32; 8],
+        cpu_raw: i32,
+        case_raw: i32,
+        cpu_smoothed: i32,
+        case_smoothed: i32,
+    },
+}
+
+impl ApplyOutcome {
+    fn uniform(commanded: [u32; 8], raw: i32, smoothed: i32, pct: u32) -> Self {
+        ApplyOutcome::Uniform {
+            commanded,
+            raw,
+            smoothed,
+            pct,
+        }
+    }
+    fn zone(
+        commanded: [u32; 8],
+        cpu_raw: i32,
+        case_raw: i32,
+        cpu_smoothed: i32,
+        case_smoothed: i32,
+    ) -> Self {
+        ApplyOutcome::Zone {
+            commanded,
+            cpu_raw,
+            case_raw,
+            cpu_smoothed,
+            case_smoothed,
+        }
+    }
+    fn commanded(&self) -> [u32; 8] {
+        match self {
+            ApplyOutcome::Uniform { commanded, .. } | ApplyOutcome::Zone { commanded, .. } => {
+                *commanded
+            }
+        }
+    }
+    /// The `driving` reading describing this tick's control decision (mode-specific fields).
+    fn driving_reading(&self) -> Reading {
+        match self {
+            ApplyOutcome::Uniform {
+                raw, smoothed, pct, ..
+            } => Reading::new(
+                "driving",
+                "driving",
+                json!({ "mode": "uniform", "temp": smoothed, "raw": raw, "pct": pct }),
+            ),
+            ApplyOutcome::Zone {
+                cpu_raw,
+                case_raw,
+                cpu_smoothed,
+                case_smoothed,
+                commanded,
+            } => Reading::new(
+                "driving",
+                "driving",
+                json!({
+                    "mode": "zone",
+                    "cpu_raw": cpu_raw, "cpu_temp": cpu_smoothed, "cpu_pct": commanded[0],
+                    "case_raw": case_raw, "case_temp": case_smoothed, "case_pct": commanded[2],
+                }),
+            ),
         }
     }
 }
@@ -304,5 +494,48 @@ mod tests {
         // No routed inputs at all -> empty, never a panic (both helpers).
         assert!(input_temps_from(None, "nvidia").is_empty());
         assert!(input_temps(None).is_empty());
+    }
+
+    #[test]
+    fn uniform_outcome_reports_one_curve_decision() {
+        let o = ApplyOutcome::uniform([60; 8], 70, 68, 60);
+        assert_eq!(o.commanded(), [60; 8]);
+        let r = o.driving_reading();
+        assert_eq!(r.kind, "driving");
+        assert_eq!(r.fields.get("mode").unwrap(), "uniform");
+        assert_eq!(r.get_i64("pct"), Some(60));
+        assert_eq!(r.get_i64("raw"), Some(70));
+    }
+
+    #[test]
+    fn zone_outcome_reports_both_zones_from_commanded() {
+        // FAN1/2 = cpu duty (30), FAN3-8 = case duty (75); the driving record reads them back from
+        // the commanded array so a fault boost would be visible there too.
+        let commanded = zones::per_fan_duties(30, 75);
+        let o = ApplyOutcome::zone(commanded, 55, 72, 54, 70);
+        assert_eq!(o.commanded(), [30, 30, 75, 75, 75, 75, 75, 75]);
+        let r = o.driving_reading();
+        assert_eq!(r.fields.get("mode").unwrap(), "zone");
+        assert_eq!(r.get_i64("cpu_pct"), Some(30));
+        assert_eq!(r.get_i64("case_pct"), Some(75));
+        assert_eq!(r.get_i64("cpu_raw"), Some(55));
+        assert_eq!(r.get_i64("case_raw"), Some(72));
+    }
+
+    #[test]
+    fn zone_outcome_driving_reflects_a_case_fan_boost() {
+        // A confirmed case-fan fault boosts the surviving case fans to 100; the driving record's
+        // case_pct (read from commanded[2]) follows.
+        let base = zones::per_fan_duties(30, 60);
+        let mut confirmed = [false; 8];
+        confirmed[4] = true; // a case fan down -> siblings (incl. FAN3=idx2) boosted
+        let commanded = fault::compensate(base, &confirmed);
+        let o = ApplyOutcome::zone(commanded, 50, 65, 50, 64);
+        assert_eq!(o.driving_reading().get_i64("case_pct"), Some(100));
+        assert_eq!(
+            o.driving_reading().get_i64("cpu_pct"),
+            Some(30),
+            "CPU zone unaffected"
+        );
     }
 }
