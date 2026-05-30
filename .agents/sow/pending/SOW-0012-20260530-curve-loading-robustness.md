@@ -4,8 +4,9 @@
 
 Status: open
 
-Sub-state: requested 2026-05-30. Not started. Gate at activation. Behavioral change to the SDK
-fail-safe — needs the user's edge-case decisions before implementation.
+Sub-state: requested 2026-05-30; edge-case decisions RESOLVED (user, 2026-05-30) — gate ready. Not
+started (queued). Note: pulls in a general orchestrator change — exponential respawn backoff with a
+config-capped max (default 300 s).
 
 ## Requirements
 
@@ -49,23 +50,28 @@ vs the new "invalid at startup → fail." Failing to start is itself safe (firmw
 are compatible — but the exact boundary of "invalid at startup" must be decided.
 
 ## Pre-Implementation Gate
-Status: needs-user-decision (edge cases below) → then ready
+Status: ready (decisions resolved by user 2026-05-30)
 
-Open decisions (need the user):
-- **"Invalid at startup" boundary** — which of these FAIL at startup vs fall back to firmware?
-  - (a) curve file present but **unparseable JSON** → FAIL (clearly the user's intent).
-  - (b) curve file **missing** → fail, or keep the "no curve yet → firmware fallback"? (an operator
-    who hasn't deployed a curve yet vs a misconfig).
-  - (c) valid JSON but **no usable points / empty `{}`** → fail, or fallback?
-  - Recommendation: fail on (a) and (c) (a configured-but-unusable curve is an error); treat (b)
-    missing as fail too for consistency, UNLESS we want a "not yet deployed" grace.
-- **Reload warning cadence:** warn once on the good→broken transition (and again on recovery), not
-  every tick, to avoid log spam.
-- **Failure mechanism:** the run process exits non-zero on a bad startup curve → orchestrator sees it
-  die and respawns with crash-loop backoff (loud + safe), OR declare it `fatal` (long backoff).
-  Confirm the desired supervisor behavior.
-- **Reconcile SOW-0001:** this supersedes the "startup empty curve → firmware fallback" part of that
-  decision (the runtime keep-last-good fail-safe is retained).
+Resolved decisions (user, 2026-05-30):
+1. **"Invalid at startup" → FAIL on ALL three** (unparseable JSON, missing file, empty/no-usable
+   points). A control module will NOT start regulating without a valid curve. aiolos **never gives
+   up** — it retries forever (with backoff, #3) — and **the device is left under firmware control**
+   the whole time (safe). (Supersedes the SOW-0001 "startup empty → firmware fallback" semantics;
+   the *runtime* keep-last-good fail-safe is retained.)
+2. **Reload warning: log EVERY tick** while the curve file is broken/unparseable (keep last-good,
+   complain loudly each tick — not just on transition).
+3. **Failure mechanism:** the anemos returns a **structured error to aiolos** (a `fatal`
+   status+reason over the protocol) **AND exits non-zero**. aiolos respawns it with **exponential
+   backoff, capped at a config max — default 5 min (300 s)**. → introduces a new orchestrator backoff
+   policy + config global (e.g. `max_backoff=300`), applied generally to fatal/crash respawns (not
+   just curves). NB: per-anemos curve failure must still surface its reason on the status page.
+
+Implementation notes:
+- A control module with a bad startup curve should emit `{"status":"fatal","error":"curve …"}` on
+  its first `apply` (structured reason for the status page) then exit non-zero — never silently die.
+- Sensor-only modules (`curve_* = None`) remain exempt (no curve expected).
+- The exponential-backoff-with-config-cap is a general supervision change shared with SOW-0012's
+  startup-fail path and any other declared-fatal/crash respawn.
 
 ## Plan
 1. `CurveCache::reload`: distinguish "valid & unchanged" from "present-but-broken" so a broken read

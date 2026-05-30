@@ -4,7 +4,10 @@
 
 Status: open
 
-Sub-state: idea captured 2026-05-30. Not started. Gate at activation.
+Sub-state: idea captured 2026-05-30. Not started. **Depends on two foundational SOWs surfaced by
+this one:** SOW-0013 (decoupled per-anemos scheduler — for fast, low-latency power reaction) and
+SOW-0014 (typed module kinds + `input=` validation — so `power-state` is a distinct, validated input
+kind that a power-control module requires). Build those first.
 
 ## Requirements
 
