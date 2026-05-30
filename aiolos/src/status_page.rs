@@ -67,15 +67,30 @@ fn handle(
     history: &Arc<Mutex<History>>,
 ) -> Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(5)))?;
-    conn.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // Generous write timeout: a large embedded asset (the ~27 KB JS) to a slow/remote browser must not
+    // trip a short deadline mid-body (that would drop the connection and reset the resource).
+    conn.set_write_timeout(Some(Duration::from_secs(30)))?;
 
-    // We only need the request line (first line) for a read-only GET.
+    // Read the FULL request (headers up to the blank line), not just the first chunk. We only act on
+    // the request line, but closing while unread request bytes remain in the socket makes the kernel
+    // send RST instead of FIN — which a browser reports as ERR_CONNECTION_RESET on a sub-resource
+    // (curl tolerates it). A GET has no body, so the blank line ends it; cap the read as a flood guard.
+    let mut raw: Vec<u8> = Vec::with_capacity(2048);
     let mut buf = [0u8; 2048];
-    let n = conn.read(&mut buf)?;
-    if n == 0 {
+    loop {
+        let n = conn.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if raw.windows(4).any(|w| w == b"\r\n\r\n") || raw.len() > 32 * 1024 {
+            break;
+        }
+    }
+    if raw.is_empty() {
         return Ok(());
     }
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let req = String::from_utf8_lossy(&raw);
     let target = req
         .lines()
         .next()
