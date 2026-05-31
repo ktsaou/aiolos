@@ -214,7 +214,11 @@ Open decisions (recorded from the discussion; recommendations given — confirm 
   scope. *Recommend include.*
 - **D6 Migration** — clean break (flip protocol + all anemoi + aiolos + UI together; approved cutover;
   v1 fallback) vs dual-emit transition. *Recommend clean break.*
-- **D7 Module rename** — `asrock16-2t` → a functional name. **OPEN — user to choose.** Options:
+- **D7 Module rename** — `asrock16-2t` → a functional name. **DECIDED 2026-05-31: `rome2d-fans` for now**
+  (board-family tag; safer — the OEM raw-IPMI sequences stay in `board.rs`). A generic `ipmi-fans` is
+  viable later only if those exact sequences (claim / set-with-mirror / release / query+parse) move into
+  a config "board profile" — tracked as a follow-up. Rename only this outlier; other names unchanged.
+  Options considered:
   - **a (recommend): `ipmi-fans`** — parallels `ipmi-temps`; names the mechanism (fan control over IPMI).
     The board-specific OEM raw commands stay inside (`board.rs`); `detect` simply finds nothing on other
     boards. Con: a future *generic* IPMI fan module couldn't reuse the name.
@@ -251,8 +255,9 @@ components: [
 ]
 ```
 
-**Open (must be resolved before implementation):** D7 — the new module name (options a/b/c above;
-recommendation: `ipmi-fans`) and the rename-scope sub-question.
+**Open (must be resolved before implementation):** **D8** (charting tech — recommend hand-rolled SVG) and
+a final thumbs-up on the publisher/sink field shapes. **D7 decided 2026-05-31:** rename to `rome2d-fans`
+for now (only the outlier; other module names unchanged; OEM sequences stay in `board.rs`).
 
 ## Plan
 1. User confirms D1–D6 and chooses D7 (the module name).
@@ -285,6 +290,11 @@ Pending.
 
 ## Followup
 
+- **Generic `ipmi-fans` via config (deferred):** a future board-agnostic IPMI fan module whose exact OEM
+  sequences (claim / set-with-mirror / release / query + response parsing) live in a config "board
+  profile" — would let any board be supported without code. Feasible but non-trivial (byte templating +
+  the duty-mirror rule + response decode); deferred for safety, so this SOW keeps the ROME2D sequences in
+  `board.rs` under the name `rome2d-fans`. Revisit alongside the config-driven v2 direction (SOW-0014).
 - On completion, **SOW-0014** shrinks to "add the central control engine on top of this report shape"
   (decision ownership flips from modules to aiolos; same wire shape). Update its dependencies accordingly.
 - The component `class` dimension added here also fills a gap in SOW-0014's original schema (which had
