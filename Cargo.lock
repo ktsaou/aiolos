@@ -38,6 +38,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "anemoi-hwmon-temps"
+version = "0.1.0"
+dependencies = [
+ "anemos",
+ "anyhow",
+ "hwmon",
+ "serde_json",
+]
+
+[[package]]
 name = "anemoi-ipmi-temps"
 version = "0.1.0"
 dependencies = [
@@ -45,6 +55,17 @@ dependencies = [
  "anyhow",
  "ipmi",
  "serde_json",
+]
+
+[[package]]
+name = "anemoi-it87"
+version = "0.1.0"
+dependencies = [
+ "anemos",
+ "anyhow",
+ "hwmon",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,19 @@
+# aiolos registry — WORKSTATION example (BMC-less consumer board; Gigabyte Z690 UD + RTX 5090).
+#
+# The deployed registry (/opt/aiolos/etc/aiolos.conf) is HOST-SPECIFIC. `packaging/aiolos.conf` is
+# the reference host (nova: IPMI board). Copy THIS file to /opt/aiolos/etc/aiolos.conf on a
+# consumer-board host. Globals + per-module directives are documented in packaging/aiolos.conf.
+
+# --- globals ---
+status_bind=127.0.0.1:9876          # status page on localhost only (personal workstation)
+
+# --- control ---
+nvidia                              # RTX 5090 onboard fans (control + GPU temp)
+it87  input=nvidia                  # board fans via it87 sysfs PWM: CPU zone (ch1) follows coretemp,
+                                    # case zone (ch3 exhaust + ch4 intake) follows max(GPU, CPU)
+nvidia-powercap  input=nut          # cap GPU power on a utility-power event (policy in etc/nvidia-powercap.conf)
+
+# --- monitor (sensor-only; reported on the status page) ---
+nvme                                # NVMe SSD temperatures
+hwmon-temps                         # board/VRM (gigabyte_wmi), DDR5 (spd5118), NIC (r8169) temps
+nut                                 # UPS / utility-power state (auto-discovers the local upsd)

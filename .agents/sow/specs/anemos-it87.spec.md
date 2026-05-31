@@ -1,0 +1,81 @@
+# Spec: `it87` anemos
+
+Status: design (SOW-0016). Consumer-board fan **control** via the Linux `it87` hwmon driver (sysfs
+PWM) — for BMC-less boards with an ITE Super-I/O (e.g. Gigabyte Z690 UD / IT8689E). Conforms to
+`aiolos-protocol.spec.md`. The sysfs analog of `asrock16-2t`: same zone model, same fail-safe
+discipline, but `/sys/class/hwmon` PWM writes instead of IPMI.
+
+## Purpose
+Regulate this board's fans by temperature. One `run` instance (the board). It drives a
+config-declared set of PWM channels, splitting them into a **CPU zone** (the CPU-cooler headers,
+following CPU temperature) and a **case zone** (intake/exhaust, following `max(GPU, CPU)`), each via
+its own curve. GPU temperature is routed in from `nvidia` (`input=nvidia`).
+
+## detect
+- Resolve the configured chip (`it87.conf` `chip=`, default `it8689`) under `/sys/class/hwmon`.
+  Present → emit one board: `{"id":"it87","type":"board","name":"<chip> fans"}`.
+- Absent (driver not loaded / wrong name) → empty `found` (a real "nothing to manage" result, NOT
+  an error — `error` is reserved for "could not perform detect").
+
+## run <id> (apply)
+Decided LIVE each tick from config (so dropping in / removing a zone curve switches mode next tick):
+- **zone mode** (active iff BOTH `it87.cpu.curve.json` and `it87.case.curve.json` load a non-empty
+  curve): CPU-zone channels (`cpu=`, default `1`) follow `coretemp` via the CPU curve; all other
+  managed channels (`case=`, default `3,4`) follow `max(GPU routed inputs, CPU)` via the case curve.
+  Two internal `anemos::Controller`s (own EMA/deadband/sensitivity).
+- **uniform mode** (fallback): one `it87.curve.json` over `max(GPU, CPU)` for every managed channel.
+
+Per tick: put each managed channel under manual control (`pwmN_enable=1`) and command its duty
+(`pwmN = round(pct * 255 / 100)`), re-asserting manual every tick to defend against a board EC that
+reclaims SmartFan. Report:
+```json
+{"status":"ok","readings":[
+  {"type":"temp","label":"GPU","temp":63},
+  {"type":"temp","label":"Package id 0","temp":55},
+  {"type":"driving","label":"driving","mode":"zone",
+   "cpu_raw":55,"cpu_temp":54,"cpu_pct":45,"case_raw":63,"case_temp":62,"case_pct":70},
+  {"type":"fan","label":"fan1","pwm":45,"rpm":900},
+  {"type":"fan","label":"fan3","pwm":70,"rpm":1890},
+  {"type":"fan","label":"fan4","pwm":70,"rpm":1186}]}
+```
+If the driving temperature is indeterminable, or the active curve is empty, the module **releases
+every managed channel to firmware/automatic** (`pwmN_enable=2`) and replies `status:error` — it
+never holds manual-but-blind. The case zone follows `max(GPU, CPU)` (NOT GPU-only): a desktop tower
+is a single airflow chamber, so case fans respond to CPU heat too (deliberately unlike asrock's
+directed-airflow server, where the case zone excludes CPU).
+
+## Fan control mechanism (sysfs)
+Via the level-1 `hwmon` tech crate, addressing the chip's hwmon node:
+- claim manual + set duty: write `pwmN_enable=1` then `pwmN=<0..255>`;
+- restore: write `pwmN_enable=2` (firmware/automatic SmartFan);
+- observe: read `fanN_input` (RPM). Duty scales 0–100% ↔ 0–255 (nearest).
+
+## Fail-safe
+Three equivalent triggers — `shutdown`, stdin EOF, SIGTERM/SIGINT — plus the `restore` one-shot and
+a `Drop` backstop, each set every managed channel back to `pwmN_enable=2` (firmware/automatic). The
+controlled (manual) state is more aggressive than firmware auto, so "module dies → firmware
+reclaims" is the safe direction. **SIGKILL freezes the last manual duty** (sysfs PWM persists; the
+IT8689 has no hardware watchdog) — bounded safe because the SDK's 35% duty floor keeps any frozen
+value ≥ floor; systemd `ExecStopPost: aiolos restore` (which calls `it87 restore`) is the net.
+
+## Config
+- `it87.conf` (`$AIOLOS_ETC_DIR` else `/opt/aiolos/etc/`): `chip=`, `cpu=`, `case=` (1-based PWM
+  channel lists). Absent → built-in defaults (`it8689`, `cpu=1`, `case=3,4`) for the reference host.
+- Curves next to the main path: `it87.curve.json` (uniform) + `it87.cpu.curve.json` +
+  `it87.case.curve.json` (zone). Reloaded every tick (live tuning); last-good kept on a partial
+  write; an invalid curve at startup refuses to regulate (SDK SOW-0012). No secrets in any of these.
+
+## Modes
+`detect` · `run <id>` · `restore` (one-shot: set all managed channels to firmware/automatic; exits
+0 on success, non-zero if any channel could not be released; idempotent).
+
+## Acceptance criteria
+- `detect` emits the board when the chip is present; empty `found` when absent (never an error).
+- `run` drives CPU-zone channels from CPU temp and case-zone channels from `max(GPU,CPU)` per their
+  curves; verified by reading `pwmN`/`fanN_input` under CPU and GPU load.
+- `shutdown`, stdin-EOF, and SIGTERM each restore every managed channel to `pwmN_enable=2`
+  (verified by reading sysfs after exit); `it87 restore` is idempotent.
+- Indeterminable temp or empty curve → release to firmware/automatic + `status:error` (never holds
+  manual-but-blind; never commands 0%).
+- Duty 0–100% maps to raw 0–255 correctly (35%→89, 100%→255); the 35% floor holds sub-floor temps.
+- No non-JSON on stdout; no secrets in committed artifacts (channel ids are config, not secrets).

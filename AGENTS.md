@@ -17,6 +17,10 @@
   - `nvme` — sensor-only NVMe SSD temperatures via sysfs (controls nothing; routed into fan modules).
   - `asrock16-2t` — ASRockRack ROME2D16-2T board fans via IPMI (`/dev/ipmi0`), driven by GPU
     temps routed from `nvidia`, NVMe temps from `nvme`, plus its own CPU/board sensors.
+  - `it87` — consumer-board fans via the Linux `it87` sysfs PWM (BMC-less boards, e.g. Gigabyte
+    Z690 UD): CPU zone follows `coretemp`, case zone follows GPU temps routed from `nvidia`.
+  - `hwmon-temps` — sensor-only sysfs temperatures (board/VRM, DDR5, NIC) for monitoring a
+    BMC-less host (the workstation analog of the IPMI-based `ipmi-temps`).
 - Process isolation is the core guarantee: each module instance is its own OS process, so a hung
   or lost device can never stall the orchestrator or sibling modules.
 
@@ -33,11 +37,13 @@ anemos/                  L2 SDK: the run() lifecycle driver (CLI/signals/logging
                          (temp→duty: curve+EMA+deadband, 35% floor), and the Anemos/Device traits
 tech/ipmi/               L1 tech: generic inband IPMI transport (/dev/ipmi0 raw netfn/cmd)
 tech/nvml/               L1 tech: NVML GPU access (enumerate, temp, per-fan set/restore)
-tech/hwmon/              L1 tech: generic hwmon (sysfs) temperature reader
+tech/hwmon/              L1 tech: generic hwmon (sysfs) temperature reader + PWM fan control
 tech/nvme/               L1 tech: NVMe enumeration (serial) + per-drive temps (sysfs)
 aiolos/                  the orchestrator (depends only on protocol wire types)
 anemoi/nvidia/           L3 anemos: Anemos/Device impl on anemos + nvml (~10-line main + logic)
 anemoi/asrock16-2t/      L3 anemos: anemos + ipmi + hwmon; board OEM commands in src/board.rs
+anemoi/it87/             L3 anemos: anemos + hwmon; consumer-board fans via sysfs PWM (CPU/case zones)
+anemoi/hwmon-temps/      L3 anemos: sensor-only sysfs temps (anemos + hwmon); no curve, no control
 anemoi/nvme/             L3 anemos: sensor-only NVMe temps (anemos + nvme); no curve, no control
 systemd/aiolos.service
 packaging/               install.sh / update.sh
