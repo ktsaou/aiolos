@@ -270,9 +270,12 @@ Pending.
 
 ## Followup
 
-- SOW-0015 (nvidia-powercap thermal trigger) becomes a config pipeline under this model — reconcile its
-  "depends on SOW-0014 typed inputs" note at activation.
-- SOW-0009's dependency note ("SOW-0014 typed kinds") to be updated to reference this control-graph model.
+- SOW-0015 (nvidia-powercap thermal trigger): **closed 2026-05-31 and absorbed into this SOW** — under the
+  v2 model it is a config pipeline, not a separate module. Its requirements/risks are retained here as
+  design input.
+- SOW-0009 (completed): its future powercap policy — re-enabling the cap with a **configurable baseline**
+  (cap below 400 W without restoring the 600 W default) and the thermal trigger — also lands under this
+  SOW. Its stale `SOW-0014`/`SOW-0015` references were repointed here (2026-05-31).
 
 ## Regression Log
 

@@ -2,14 +2,14 @@
 
 ## Status
 
-Status: open
+Status: closed
 
-Sub-state: idea captured 2026-05-30. Not started. **Extends the `nvidia-powercap` control anemos
-introduced by SOW-0009** with a second, temperature-driven trigger. **Depends on SOW-0009**
-(the power-cap module + NVML cap/restore plumbing), **SOW-0014** (typed kinds + `input=` validation —
-the module now requires BOTH `power-state` AND `temp`, the first real multi-input consumer), and
-benefits from **SOW-0013** (low-latency scheduler). Build those first. Also folds in the agreed
-rename `gpu-powercap` → `nvidia-powercap`.
+Sub-state: closed 2026-05-31 — **superseded by SOW-0014** (the aiolos v2 dynamic control-graph model).
+Never implemented. Under v2 this thermal backstop stops being a special multi-input module and becomes
+just another config pipeline (`select kind=temperature [+ kind=power-state] → gate "fans maxed AND temp
+not falling" → curve/policy → target nvidia-powercap`). The design intent below is preserved as input to
+SOW-0014; no separate SOW is needed. (The `gpu-powercap`→`nvidia-powercap` rename already shipped under
+SOW-0009.)
 
 ## Requirements
 
@@ -161,7 +161,9 @@ None recorded yet (open SOW). Decisions 1–3 above to be resolved with the user
 Pending.
 
 ## Outcome
-Pending.
+**Closed 2026-05-31, superseded by SOW-0014.** The thermal-trigger idea is absorbed into the aiolos v2
+control-graph model as a configured pipeline; the requirements, risks, and open policy decisions here are
+retained as design input to SOW-0014. No code was written for this SOW.
 
 ## Lessons Extracted
 Pending.

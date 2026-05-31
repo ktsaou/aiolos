@@ -9,7 +9,8 @@ Sub-state: completed 2026-05-30. `nut` power-state sensor + `nvidia-powercap` re
 (6-round external review). `nut` is live, reporting the `pr3000-nova` UPS. Caveat: the GPU power-cap
 action is **operator-disabled** (the host runs a deliberate 400 W cap; nvidia-powercap would restore
 the 600 W firmware default on AC), so the cap/restore was NOT exercised on hardware. SOW-0013 shipped;
-SOW-0014 (typed inputs) remains open and is not required for this SOW's correctness.
+SOW-0014 (now the aiolos v2 control-graph model) remains open and is not required for this SOW's
+correctness — the future powercap policy (configurable baseline + thermal trigger) lands there.
 
 ## Requirements
 
@@ -128,7 +129,8 @@ Decisions (recorded 2026-05-30):
   `anemoi/nvidia-powercap/`, config `nvidia-powercap.conf`, registry line, install/update lists, spec
   `anemos-nvidia-powercap.spec.md`) during the Wave 2a integration merge, per the user. This SOW's
   narrative above keeps the original as-built name for historical fidelity; all live artifacts and the
-  spec now use `nvidia-powercap`. The forthcoming temperature trigger is tracked in SOW-0015.
+  spec now use `nvidia-powercap`. The forthcoming temperature trigger is tracked in SOW-0014 (the v2
+  control-graph model; SOW-0015 was closed into it on 2026-05-31).
 
 ## Validation
 Off-hardware (this build):
@@ -151,7 +153,8 @@ On-hardware (2026-05-30 cutover): `nut` reads the live `pr3000-nova` UPS — `st
 was not exercised**: the operator keeps the GPUs at a 400 W cap and nvidia-powercap is commented out
 in the registry (it would restore 600 W on AC) — see the `aiolos.conf` note. The cap/lift decision
 logic is covered by 23 unit tests; a real on-battery cap event remains an optional operator test if
-the module is ever enabled with a configurable baseline (cross-refs SOW-0015).
+the module is ever enabled with a configurable baseline. That policy work (configurable baseline +
+thermal trigger) now lives under SOW-0014 (the v2 control-graph model); SOW-0015 was closed into it.
 
 ## Outcome
 **Completed 2026-05-30.** The `nut` power-state sensor ships and runs live (UPS state + `aiolos_power_*`
