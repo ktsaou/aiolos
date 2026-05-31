@@ -6,7 +6,7 @@
 > regulate airflow (fans) by temperature — but `aiolos` itself knows nothing about fans,
 > GPUs, or IPMI.
 
-Status: **IMPLEMENTED (SOW-0001).** Orchestrator + `nvidia` (NVML) + `asrock16-2t` (IPMI) built and
+Status: **IMPLEMENTED (SOW-0001).** Orchestrator + `nvidia` (NVML) + `rome2d-fans` (IPMI) built and
 unit/integration-tested off-hardware. On-hardware validation + cutover from the C `nvfd` remain
 operator-gated (see `.agents/sow/`). The authoritative contracts are the specs under
 `.agents/sow/specs/`; where this rationale doc and the specs differ, the specs win.
@@ -37,11 +37,11 @@ module concerns.
 | Term | Meaning |
 |---|---|
 | **aiolos** | the orchestrator daemon (Rust) |
-| **anemos** / **anemoi** | a module binary / the modules (e.g. `nvidia`, `asrock16-2t`) |
+| **anemos** / **anemoi** | a module binary / the modules (e.g. `nvidia`, `rome2d-fans`) |
 | **instance** | one running process of an anemos, bound to one detected **ID** |
 | **registry** | config listing which anemoi to run, and their data wiring |
 | **ID** | an opaque, stable identifier a module assigns to a thing it manages (e.g. a GPU UUID) |
-| **reading** | a `{type,label,…}` record a module reports each tick (temp, pwm, rpm, …) |
+| **component** | a reported device/entity with scalar `publishers[]` and controllable `sinks[]` |
 
 ---
 
@@ -53,12 +53,12 @@ module concerns.
                 └───┬───────────────────────┬───────────────────────────────┬───────────────┘
         spawn+stdio │                        │ spawn+stdio                    │ HTTP :PORT (read-only)
             ┌───────▼────────┐      ┌────────▼─────────┐               ┌──────▼───────┐
-            │ nvidia (detect)│      │ asrock16-2t      │               │  status page │
+            │ nvidia (detect)│      │ rome2d-fans      │               │  status page │
             └───────┬────────┘      │   (detect)       │               └──────────────┘
         per GPU UUID│               └────────┬─────────┘
         ┌───────────▼───┐ ┌─────────▼──┐   1 board ID
         │ nvidia run ID0│ │nvidia run ID1│  ┌────────▼─────────────┐
-        └───────────────┘ └────────────┘    │ asrock16-2t run BOARD│  input=nvidia
+        └───────────────┘ └────────────┘    │ rome2d-fans run BOARD│  input=nvidia
                                              └──────────────────────┘
 ```
 
@@ -75,11 +75,11 @@ module concerns.
 ```
 nvidia
 nvme                             # NVMe SSD temps (sensor-only; controls nothing)
-asrock16-2t  input=nvidia input=nvme   # feed GPU + NVMe temps into this anemos
+rome2d-fans  input=nvidia input=nvme   # feed GPU + NVMe temps into this anemos
 ```
 
 Directives (extensible):
-- `input=<anemos>` — aiolos relays the named anemos's last readings into this anemos's `apply`
+- `input=<anemos>` — aiolos relays the named anemos's last components into this anemos's `apply`
   request (keyed by `module:id`). Repeatable and/or comma-listed for multiple sources.
 - `every=<dur>` / `timeout=<dur>` — per-anemos schedule overrides (SOW-0013 decoupled scheduler;
   bare number = seconds). `args=…` is future.
@@ -113,19 +113,24 @@ optional startup `hello`).
 **detect** (to a `detect` process; re-sent periodically for hotplug):
 ```json
 → {"cmd":"detect"}
-← {"found":[{"id":"GPU-5f2…","type":"GPU","name":"RTX PRO 6000"},
-            {"id":"GPU-a17…","type":"GPU","name":"RTX PRO 6000"}]}
+← {"status":"ok","found":[{"id":"GPU-5f2…","type":"GPU","name":"RTX PRO 6000",
+    "components":[{"id":"gpu","label":"GPU","class":"gpu",
+      "publishers":[{"id":"temp","label":"Temperature","kind":"temperature","unit":"C"}]}]}]}
 ```
+
+**info / collect** (SDK one-shot companion mode, not used by aiolos heartbeat): `<module> info [ID]`
+opens devices read-only (`OpenMode::Observe`), calls `Device::collect`, and emits the same
+detect-shaped response with live component values. It must not claim, set, release, or restore
+hardware.
 
 **apply** (to a `run <ID>` process when the anemos is due — aiolos wakes every `base_tick` and
 dispatches each idle, due anemos (SOW-0013); `inputs` present only if `input=` wired —
-each peer id maps to that peer's full readings array, relayed uninterpreted):
+each peer id maps to that peer's full components array, relayed uninterpreted):
 ```json
-→ {"cmd":"apply","inputs":{"GPU-5f2…":[{"type":"temp","label":"GPU","temp":63}],
-                            "GPU-a17…":[{"type":"temp","label":"GPU","temp":70}]}}
-← {"status":"ok","readings":[
-     {"type":"temp","label":"CPU1","temp":37,"pwm":50,"rpm":900},
-     {"type":"fan","label":"FAN3","pwm":60,"rpm":1900}]}
+→ {"cmd":"apply","inputs":{"nvidia:GPU-5f2…":[{"id":"gpu","label":"GPU","class":"gpu",
+    "publishers":[{"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"}]}]}}
+← {"status":"ok","components":[
+     {"id":"board","label":"ROME2D16-2T","class":"board","publishers":[…],"sinks":[…]}]}
 ```
 On trouble: `← {"status":"error","error":"device lost"}` (aiolos logs/counts; repeated → restart).
 
@@ -139,14 +144,14 @@ The `run` instance knows its own ID from argv, so `apply` need not repeat it.
 
 ## 6. Data routing (`input=`)
 
-aiolos keeps a **blackboard**: the last `readings` reported by every instance. For an anemos
-configured `input=X [Y …]`, aiolos extracts every named source's instances' readings and includes
-them as `inputs` (keyed by `module:id`, so the consumer can attribute each reading to its source
-module) in this anemos's next `apply`. aiolos does **not** interpret the values — it only relays.
+aiolos keeps a **blackboard**: the last `components` reported by every instance. For an anemos
+configured `input=X [Y …]`, aiolos extracts every named source's instances' components and includes
+them as `inputs` (keyed by `module:id`, so the consumer can attribute each component/publisher to
+its source module) in this anemos's next `apply`. aiolos does **not** interpret the values — it only relays.
 The consumer decides how to use them (max, per-zone, per-source, …). This is how GPU and NVMe temps
 reach the fan module while aiolos stays agnostic.
 
-Timing: `inputs` carry each source's **last completed** `apply` readings (one cycle stale, never
+Timing: `inputs` carry each source's **last completed** `apply` components (one cycle stale, never
 blocking on a peer) — irrelevant for thermal mass, and it keeps every instance independent (no
 ordering dependency). Under the decoupled scheduler (SOW-0013) sources and consumers run on their
 own cadences; a consumer always sees the most recent values the blackboard holds.
@@ -159,8 +164,8 @@ own cadences; a consumer always sees the most recent values the blackboard holds
 2. **Detect/reconcile** (every `detect_every`, e.g. 10 s): send `detect` → diff returned IDs
    against running instances → spawn new `run <ID>`, kill vanished ones. (Handles a GPU
    dropping off the bus and returning.)
-3. **Heartbeat** (every `tick`, e.g. 3 s): for each instance, write `apply` (with routed
-   `inputs`), then `poll` its stdout for one line within `timeout` (e.g. 2 s). Collect readings
+3. **Scheduler wake:** for each due/idle instance, write `apply` (with routed `inputs`), then the
+   worker polls its stdout for one line within that module's `timeout`. Collect components
    into the blackboard. Fan-out then collect — **no instance waits on another**.
 4. **Timeout/exit:** missed deadline or process exit → `SIGKILL` (if needed), restore handled by
    the module's own EOF path, then respawn next cycle. Backoff on crash-looping.
@@ -187,9 +192,9 @@ default, so "module dies → firmware/BMC reclaims control" is always the *safe*
 
 ## 8. State & status web page
 
-aiolos holds: registry, per-anemos detect results, per-instance last readings + status + last
+aiolos holds: registry, per-anemos detect results, per-instance last components + status + last
 error + restart count + last-seen time, captured stderr tail. It serves a **read-only** HTTP
-status page (bind localhost by default) rendering all of the above — live readings, which
+status page (bind localhost by default) rendering all of the above — live components, which
 instances are healthy, recent errors. Small, dependency-light (hand-rolled or `tiny_http`).
 
 ---
@@ -202,7 +207,7 @@ instances are healthy, recent errors. Small, dependency-light (hand-rolled or `t
   aiolos/                         # the orchestrator crate (Rust)
   anemoi/
     nvidia/                       # nvidia anemos crate (Rust)
-    asrock16-2t/                  # asrock16-2t anemos (Rust; IPMI via /dev/ipmi0 or libfreeipmi FFI)
+    rome2d-fans/                  # rome2d-fans anemos (Rust; IPMI via /dev/ipmi0 or libfreeipmi FFI)
     nvme/                         # nvme anemos (Rust; sensor-only NVMe temps via sysfs)
   systemd/aiolos.service
   packaging/                      # install.sh / update.sh
@@ -210,11 +215,11 @@ instances are healthy, recent errors. Small, dependency-light (hand-rolled or `t
 /opt/aiolos/                      # install root
   bin/aiolos
   bin/nvidia
-  bin/asrock16-2t
+  bin/rome2d-fans
   bin/nvme                        # sensor-only (no curve file)
   etc/aiolos.conf                 # registry
   etc/nvidia.curve.json           # per-module config
-  etc/asrock16-2t.curve.json
+  etc/rome2d-fans.curve.json
 ```
 systemd: `aiolos.service` (Type=simple, Restart=on-failure). The existing C `nvfd` keeps cooling
 the GPUs until aiolos is built, tested, and cut over.
@@ -227,7 +232,7 @@ the GPUs until aiolos is built, tested, and cut over.
   `serde_json`, minimal HTTP. Lean (no GC; ~low-MB binary, ~few-MB RSS), memory-safe supervisor,
   `cargo` build (no cmake/headers). Chosen for lean + safe.
 - **nvidia anemos**: Rust, `nvml-wrapper`.
-- **asrock16-2t anemos**: Rust. IPMI via raw `/dev/ipmi0` ioctl (preferred — zero extra deps) or
+- **rome2d-fans anemos**: Rust. IPMI via raw `/dev/ipmi0` ioctl (preferred — zero extra deps) or
   thin FFI to `libfreeipmi`. CPU temps may instead come from `k10temp` sysfs (trivial).
 
 The protocol is language-agnostic; any anemos may be written in any language later.
@@ -239,20 +244,20 @@ The protocol is language-agnostic; any anemos may be written in any language lat
 - **detect:** enumerate GPUs by **UUID** (stable across renumbering); emit one `found` per GPU.
 - **run <UUID>:** own `nvmlInit`; each `apply` → read this GPU's temp, interpolate
   `etc/nvidia.curve.json`, set the GPU's onboard fans (NVML `SetFanSpeed`), report
-  `readings:[{type:temp,…},{type:fan,pwm,rpm}]`.
+  `components:[{id,class,publishers:[…],sinks:[…]}]`.
 - **fail-safe:** EOF/shutdown → `SetDefaultFanSpeed` (firmware auto).
 - Curve (current production value): linear 0–80 °C → 0–100 %.
 - Fork-safety: orchestrator never holds NVML; each instance inits its own.
 
 ---
 
-## 12. Anemos: `asrock16-2t` (ASRockRack ROME2D16-2T, BMC AST2500, fw ≥ 3.03)
+## 12. Anemos: `rome2d-fans` (ASRockRack ROME2D16-2T, BMC AST2500, fw ≥ 3.03)
 
 - **detect:** emit **one** ID (the board).
 - **input=nvidia input=nvme:** receives GPU + NVMe temps from aiolos (attributed by `module:id`).
 - **run <BOARD>:** driving_temp = `max(`GPU + NVMe temps from inputs, own CPU temps, own MB/board
-  temps`)`; interpolate `etc/asrock16-2t.curve.json`; set all 8 board fans; report readings
-  (GPU and NVMe reported under distinct `temp` labels).
+  temps`)`; interpolate `etc/rome2d-fans.curve.json`; set all 8 board fans; report a board
+  component. GPU/NVMe temps are not re-published; they appear as sink `driven_by` metadata.
 - **CPU fans are real:** FAN1/FAN2 are large **Noctua CPU coolers** (low RPM by size), FAN3–FAN8
   are 120 mm case fans. User decision: all fans follow the global max (CPU fans speeding up on GPU
   heat is desirable). Default **uniform** duty = curve(driving_temp). *(Open: optional per-fan
@@ -279,7 +284,7 @@ The protocol is language-agnostic; any anemos may be written in any language lat
 
 `etc/<anemos>.curve.json` — temperature → duty %, linear-interpolated, clamped, hold-outside, plus
 an optional `"sensitivity"` knob (EMA α, 0–1) for noise smoothing. Per-module defaults: `nvidia`
-`{"30":30,"80":100}`; `asrock16-2t` `{"50":30,"80":100}` — the board idles warmer (DIMM/NVMe/board/
+`{"30":30,"80":100}`; `rome2d-fans` `{"50":30,"80":100}` — the board idles warmer (DIMM/NVMe/board/
 LAN ~45–50 °C), so it holds the 30% floor until 50 °C, then ramps (GPU heat still drives it up via
 the routed max). Example:
 ```json
@@ -300,18 +305,18 @@ the routed max). Example:
 |---|---|---|
 | 1 | `base_tick` / per-anemos `every` / `timeout` (SOW-0013 decoupled scheduler) | 100 ms / 1 s / 5 s |
 | 2 | `detect_every` (hotplug re-scan) | 10 s |
-| 3 | asrock fan model | uniform curve(max) over all 8 (per-fan optional later) |
+| 3 | rome2d-fans fan model | uniform curve(max) over all 8 (per-fan optional later) |
 | 4 | nvidia curve | 0–80 °C → 0–100 % (as today) |
-| 5 | asrock curve | 40→40, 55→60, 65→80, 75→100 |
-| 6 | sensor set for asrock max | GPU(inputs) + CPU + MB + card-side + DIMM (exclude TEMP_LAN? it floors ~45 °C) |
+| 5 | rome2d-fans curve | 40→40, 55→60, 65→80, 75→100 |
+| 6 | sensor set for rome2d-fans max | GPU(inputs) + CPU + MB + card-side + DIMM (exclude TEMP_LAN? it floors ~45 °C) |
 | 7 | status page bind | `0.0.0.0:9876` (SOW-0001 decision; configurable, `127.0.0.1` to restrict) |
 
 ---
 
 ## 15. Extensibility
 
-New behaviour = new anemos binary, any language, that implements detect/apply/shutdown over the
-line protocol and is added to the registry. The `nvme` sensor anemos (SOW-0004) is a worked example
+New behaviour = new anemos binary, any language, that implements detect/collect/apply/shutdown over
+the line protocol and is added to the registry. The `nvme` sensor anemos (SOW-0004) is a worked example
 of a **sensor-only** module — it reports temperatures and controls nothing, routed into the fan
 controller via `input=nvme`. Further examples: a `power-cap` anemos, an `alert` anemos that emails
 on threshold. aiolos needs no changes.

@@ -36,7 +36,7 @@ echo "--- creating directories ---"
 run sudo mkdir -p "${BIN}" "${ETC}"
 
 echo "--- installing binaries (overwrite) ---"
-for b in aiolos nvidia asrock16-2t it87 hwmon-temps nvme ipmi-temps nut nvidia-powercap; do
+for b in aiolos nvidia rome2d-fans it87 hwmon-temps nvme ipmi-temps nut nvidia-powercap; do
   run sudo install -m 0755 "target/release/${b}" "${BIN}/${b}"
 done
 
@@ -51,7 +51,7 @@ install_if_absent() {
 }
 install_if_absent packaging/aiolos.conf            "${ETC}/aiolos.conf"
 install_if_absent packaging/nvidia.curve.json      "${ETC}/nvidia.curve.json"
-install_if_absent packaging/asrock16-2t.curve.json "${ETC}/asrock16-2t.curve.json"
+install_if_absent packaging/rome2d-fans.curve.json "${ETC}/rome2d-fans.curve.json"
 # it87 (consumer board fans): uniform fallback + the two zone curves (zone mode active when both
 # zone curves are present) + the board-wiring template (commented; built-in defaults stand).
 install_if_absent packaging/it87.curve.json        "${ETC}/it87.curve.json"

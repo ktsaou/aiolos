@@ -1,9 +1,10 @@
 //! The anemos lifecycle driver. A module's `main()` is just:
 //! `anemos::run(anemos::ModuleInfo { .. }, MyAnemos::new())`.
 //!
-//! `run` parses argv (`detect` / `run <id>` / `restore` / optional extras), initialises logging,
-//! installs SIGTERM/SIGINT handlers, and drives the matching loop over the one-line-JSON protocol.
-//! Every `run`-mode exit path (shutdown request, stdin EOF, signal) restores the device.
+//! `run` parses argv (`detect` / `info` / `collect` / `run <id>` / `restore` / optional extras),
+//! initialises logging, installs SIGTERM/SIGINT handlers, and drives the matching loop over the
+//! one-line-JSON protocol. Every `run`-mode exit path (shutdown request, stdin EOF, signal) restores
+//! the device; `info`/`collect` opens in read-only observe mode and never restores on drop.
 
 use crate::stdio::{Event, StdinReader};
 use crate::Controller;
@@ -21,18 +22,36 @@ const STEP: Duration = Duration::from_millis(200);
 pub trait Anemos {
     /// Report the IDs this module currently manages (answers `detect`).
     fn detect(&mut self) -> Detected;
-    /// Bind one detected id for `run <id>`. `Err` => the SDK declares `fatal` (supervisor retries on
-    /// a long backoff); `Ok` => a live device the SDK will tick.
-    fn open(&mut self, id: &str) -> anyhow::Result<Box<dyn Device>>;
+    /// Bind one detected id. `mode` is `Control` for normal `run <id>` and `Observe` for read-only
+    /// collection (the `info` one-shot); observe mode MUST NOT claim/set/release hardware.
+    /// `Err` => the SDK declares `fatal` (supervisor retries on a long backoff in run mode);
+    /// `Ok` => a live device handle.
+    fn open(&mut self, id: &str, mode: OpenMode) -> anyhow::Result<Box<dyn Device>>;
     /// One-shot: restore EVERY device this module manages to firmware/auto-safe (for `aiolos restore`).
     fn restore_all(&mut self);
 }
 
+/// How an anemos opens a device handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Read-only observation. No claim/set/release and no restore-on-drop side effects.
+    Observe,
+    /// Normal controller operation. The device may be claimed/set and must restore on exit.
+    Control,
+}
+
 /// One bound device. The SDK ticks it and guarantees a restore on shutdown/EOF/signal.
 pub trait Device {
+    /// Read-only snapshot: collect sensors/readbacks and return live components without changing the
+    /// device state. This backs `<module> info` and can also be reused by sensor-only `apply`.
+    fn collect(&mut self, inputs: Option<&Inputs>) -> Applied;
+
     /// One tick: read sensors, compute a duty via `ctrl.duty(raw_temp)`, drive the device, return
-    /// readings. Declare faults via `Applied::error`/`fatal`; on error, restore the device first.
-    fn apply(&mut self, inputs: Option<&Inputs>, ctrl: &mut Controller) -> Applied;
+    /// components. Declare faults via `Applied::error`/`fatal`; on error, restore the device first.
+    fn apply(&mut self, inputs: Option<&Inputs>, _ctrl: &mut Controller) -> Applied {
+        self.collect(inputs)
+    }
+
     /// Fail-safe: restore this device to firmware/auto-safe (called on shutdown/EOF/signal).
     fn restore(&mut self);
 }
@@ -50,7 +69,7 @@ pub struct ModuleInfo {
     pub curve_env_filename: Option<&'static str>,
 }
 
-/// An optional extra one-shot subcommand a module registers (e.g. asrock `query`); receives the
+/// An optional extra one-shot subcommand a module registers (e.g. rome2d-fans `query`); receives the
 /// argv tail and returns a process exit code.
 pub type ExtraCmd = Box<dyn FnOnce(&[String]) -> i32>;
 
@@ -73,7 +92,23 @@ pub fn run_with<A: Anemos>(
     let mode = args.get(1).map(String::as_str).unwrap_or("detect");
     let code = match mode {
         "detect" => {
-            detect_loop(&mut anemos);
+            if stdin_is_tty() {
+                emit_detected(&anemos.detect());
+            } else {
+                detect_loop(&mut anemos);
+            }
+            0
+        }
+        "info" => {
+            let id = args.get(2).map(String::as_str);
+            info_once(&mut anemos, id)
+        }
+        "collect" => {
+            let id = args.get(2).map(String::as_str);
+            info_once(&mut anemos, id)
+        }
+        "schema" => {
+            emit_detected(&anemos.detect());
             0
         }
         "run" => {
@@ -114,10 +149,10 @@ fn detect_loop<A: Anemos>(anemos: &mut A) {
                 if let Some(err) = &d.error {
                     error!(status=%d.status.as_str(), error=%err, "detect");
                 }
-                emit_line(d.to_line());
+                emit_detected(&d);
             }
             Ok(Request::Shutdown) => {
-                emit_line(Applied::ok_empty().to_line());
+                emit_applied(&Applied::ok_empty());
                 break;
             }
             Ok(Request::Apply { .. }) => eprintln!("unexpected apply in detect mode"),
@@ -147,7 +182,7 @@ fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) -> i32 {
         }
     }
 
-    let mut dev: Option<Box<dyn Device>> = match anemos.open(id) {
+    let mut dev: Option<Box<dyn Device>> = match anemos.open(id, OpenMode::Control) {
         Ok(d) => Some(d),
         Err(e) => {
             error!(module = info.name, id=%id, error=%e, "open failed — instance degraded (device stays on firmware/auto)");
@@ -202,25 +237,25 @@ fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) -> i32 {
                     // backoff (re-running open) instead of limping every tick.
                     None => Applied::fatal("device unavailable for this id"),
                 };
-                emit_line(applied.to_line());
+                emit_applied(&applied);
             }
             Ok(Request::Shutdown) => {
                 if let Some(d) = dev.as_mut() {
                     d.restore();
                 }
-                emit_line(Applied::ok_empty().to_line());
+                emit_applied(&Applied::ok_empty());
                 break;
             }
             Ok(Request::Detect) => eprintln!("unexpected detect in run mode"),
             Err(e) => {
                 eprintln!("malformed request: {e}");
-                emit_line(Applied::error(format!("malformed: {e}")).to_line());
+                emit_applied(&Applied::error(format!("malformed: {e}")));
             }
         }
     }
     // `dev` drops here -> the concrete device type (or its fields, e.g. an NVML/IPMI handle with a
     // restoring Drop) is the final restore net on panic/early-exit. A `Device` impl SHOULD ensure
-    // its underlying resource restores on drop (the shipped nvidia/asrock devices do, via the tech
+    // its underlying resource restores on drop (the shipped nvidia/rome2d-fans devices do, via the tech
     // handle's Drop).
     0
 }
@@ -246,12 +281,12 @@ fn startup_curve_fatal_loop(info: &ModuleInfo, reason: &str) -> i32 {
                 // First (and any) apply: declare fatal with the reason, then exit non-zero. The
                 // supervisor records the declared-fatal and respawns on the long (capped) backoff.
                 Ok(Request::Apply { .. }) => {
-                    emit_line(Applied::fatal(format!("startup: {reason}")).to_line());
+                    emit_applied(&Applied::fatal(format!("startup: {reason}")));
                     return 1;
                 }
                 // aiolos asked us to stop: nothing was regulated, so this is a clean stop.
                 Ok(Request::Shutdown) => {
-                    emit_line(Applied::ok_empty().to_line());
+                    emit_applied(&Applied::ok_empty());
                     return 0;
                 }
                 Ok(Request::Detect) => eprintln!("unexpected detect in run mode"),
@@ -274,14 +309,81 @@ fn curve_path(info: &ModuleInfo) -> Option<String> {
     Some(resolved)
 }
 
-fn emit_line(line: serde_json::Result<String>) {
+fn info_once<A: Anemos>(anemos: &mut A, id: Option<&str>) -> i32 {
+    let mut detected = anemos.detect();
+    if detected.status != Status::Ok {
+        emit_detected(&detected);
+        return 1;
+    }
+
+    if let Some(wanted) = id {
+        detected.found.retain(|f| f.id == wanted);
+        if detected.found.is_empty() {
+            emit_detected(&Detected::fatal(format!("id not found: {wanted}")));
+            return 1;
+        }
+    }
+
+    let mut warnings = Vec::new();
+    for found in &mut detected.found {
+        match anemos.open(&found.id, OpenMode::Observe) {
+            Ok(mut dev) => {
+                let applied = dev.collect(None);
+                if applied.status == Status::Ok {
+                    if let Some(components) = applied.components {
+                        found.components = components;
+                    }
+                    if let Some(err) = applied.error {
+                        warnings.push(format!("{}: {err}", found.id));
+                    }
+                } else {
+                    warnings.push(format!(
+                        "{}: {}",
+                        found.id,
+                        applied
+                            .error
+                            .unwrap_or_else(|| format!("collect {}", applied.status.as_str()))
+                    ));
+                }
+            }
+            Err(e) => warnings.push(format!("{}: open for collect: {e}", found.id)),
+        }
+    }
+
+    if !warnings.is_empty() {
+        detected.error = Some(warnings.join("; "));
+    }
+    emit_detected(&detected);
+    if warnings.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+fn emit_detected(detected: &Detected) {
+    emit_serialized(detected.to_line());
+}
+
+fn emit_applied(applied: &Applied) {
+    emit_serialized(applied.to_line());
+}
+
+fn emit_serialized(line: serde_json::Result<String>) {
     let line = line.unwrap_or_else(|_| {
         r#"{"status":"error","error":"internal serialization error"}"#.to_string()
     });
     let mut out = std::io::stdout();
     let _ = out.write_all(line.as_bytes());
-    let _ = out.write_all(b"\n");
+    if !line.ends_with('\n') {
+        let _ = out.write_all(b"\n");
+    }
     let _ = out.flush();
+}
+
+fn stdin_is_tty() -> bool {
+    // SAFETY: `isatty` reads only the process stdin fd and has no memory safety preconditions.
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
 fn init_logging() {

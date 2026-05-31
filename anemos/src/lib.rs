@@ -1,9 +1,9 @@
 //! anemos — the level-2 SDK every anemos (module) reuses.
 //!
 //! It owns ALL the boilerplate so a module carries only its device-specific logic:
-//! - the process lifecycle driver (`run`): CLI dispatch (`detect`/`run <id>`/`restore` + optional
-//!   extra subcommands), logging init, SIGTERM/SIGINT handlers, the protocol stdio loops, and the
-//!   fail-safe restore wiring;
+//! - the process lifecycle driver (`run`): CLI dispatch (`detect`/`info`/`collect`/`run <id>`/
+//!   `restore` + optional extra subcommands), logging init, SIGTERM/SIGINT handlers, the protocol
+//!   stdio loops, and the fail-safe restore wiring;
 //! - the signal-aware stdin reader (`StdinReader`) and shutdown handlers;
 //! - the temperature→duty `Controller` (live curve reload + EMA + deadband, the 35% floor);
 //! - the `Anemos` / `Device` traits a module implements.
@@ -21,8 +21,11 @@ mod stdio;
 pub use controller::{Controller, Duty};
 pub use curve::{BrokenReason, Curve, CurveCache, ReloadOutcome};
 pub use damper::Damper;
-pub use run::{run, run_with, Anemos, Device, ExtraCmd, ModuleInfo};
+pub use run::{run, run_with, Anemos, Device, ExtraCmd, ModuleInfo, OpenMode};
 pub use stdio::{install_shutdown_handlers, shutdown_requested, Event, StdinReader};
 
 // Re-export the wire types so a level-3 anemos needs only `anemos` (+ its tech crates) as deps.
-pub use protocol::{Applied, Detected, FoundEntry, Inputs, Reading, Request, Status};
+pub use protocol::{
+    Applied, Component, Detected, DrivenBy, FoundEntry, Inputs, Publisher, Request, Sink,
+    SinkState, Status,
+};

@@ -2,7 +2,7 @@
 
 Status: design (SOW-0016). Consumer-board fan **control** via the Linux `it87` hwmon driver (sysfs
 PWM) — for BMC-less boards with an ITE Super-I/O (e.g. Gigabyte Z690 UD / IT8689E). Conforms to
-`aiolos-protocol.spec.md`. The sysfs analog of `asrock16-2t`: same zone model, same fail-safe
+`aiolos-protocol.spec.md`. The sysfs analog of `rome2d-fans`: same zone model, same fail-safe
 discipline, but `/sys/class/hwmon` PWM writes instead of IPMI.
 
 ## Purpose
@@ -27,22 +27,23 @@ Decided LIVE each tick from config (so dropping in / removing a zone curve switc
 
 Per tick: put each managed channel under manual control (`pwmN_enable=1`) and command its duty
 (`pwmN = round(pct * 255 / 100)`), re-asserting manual every tick to defend against a board EC that
-reclaims SmartFan. Report:
+reclaims SmartFan. Report one `board` component:
 ```json
-{"status":"ok","readings":[
-  {"type":"temp","label":"GPU","temp":63},
-  {"type":"temp","label":"Package id 0","temp":55},
-  {"type":"driving","label":"driving","mode":"zone",
-   "cpu_raw":55,"cpu_temp":54,"cpu_pct":45,"case_raw":63,"case_temp":62,"case_pct":70},
-  {"type":"fan","label":"fan1","pwm":45,"rpm":900},
-  {"type":"fan","label":"fan3","pwm":70,"rpm":1890},
-  {"type":"fan","label":"fan4","pwm":70,"rpm":1186}]}
+{"status":"ok","components":[{
+  "id":"board","label":"it8689","class":"board",
+  "publishers":[
+    {"id":"temp.package_id_0","label":"Package id 0","kind":"temperature","value":55,"unit":"C"},
+    {"id":"driving.cpu.duty","label":"CPU driving duty","kind":"driving-duty","value":45,"unit":"%"},
+    {"id":"fan1.duty","label":"fan1 duty","kind":"fan-duty","value":45,"unit":"%"},
+    {"id":"fan1.rpm","label":"fan1 RPM","kind":"fan-rpm","value":900,"unit":"rpm"}],
+  "sinks":[{"id":"fan1","label":"fan1","kind":"fan-duty","value":45,"unit":"%",
+    "safe":"auto","state":"claimed","driven_by":[{"from":"self","publisher":"board/cpu.temp","value":55,"unit":"C"}]}]}]}
 ```
 If the driving temperature is indeterminable, or the active curve is empty, the module **releases
 every managed channel to firmware/automatic** (`pwmN_enable=2`) and replies `status:error` — it
 never holds manual-but-blind. The case zone follows `max(GPU, CPU)` (NOT GPU-only): a desktop tower
-is a single airflow chamber, so case fans respond to CPU heat too (deliberately unlike asrock's
-directed-airflow server, where the case zone excludes CPU).
+is a single airflow chamber, so case fans respond to CPU heat too (deliberately unlike the
+directed-airflow server module, where the case zone excludes CPU).
 
 ## Fan control mechanism (sysfs)
 Via the level-1 `hwmon` tech crate, addressing the chip's hwmon node:
@@ -66,7 +67,7 @@ value ≥ floor; systemd `ExecStopPost: aiolos restore` (which calls `it87 resto
   write; an invalid curve at startup refuses to regulate (SDK SOW-0012). No secrets in any of these.
 
 ## Modes
-`detect` · `run <id>` · `restore` (one-shot: set all managed channels to firmware/automatic; exits
+`detect` · `info [id]` / `collect [id]` · `run <id>` · `restore` (one-shot: set all managed channels to firmware/automatic; exits
 0 on success, non-zero if any channel could not be released; idempotent).
 
 ## Acceptance criteria

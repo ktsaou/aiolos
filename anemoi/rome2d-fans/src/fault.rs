@@ -3,7 +3,7 @@
 //! A fan is *faulted* when, for several consecutive ticks, it is commanded above a duty threshold
 //! yet its tachometer reads ≈0 RPM — i.e. it is being driven but not spinning (stalled/failed). A
 //! spin-up grace and N-consecutive-tick hysteresis avoid false positives while a fan ramps up or a
-//! tach read momentarily glitches. Detection is module-local: asrock owns both the commanded duty
+//! tach read momentarily glitches. Detection is module-local: rome2d-fans owns both the commanded duty
 //! and the matching tach, so no orchestrator change is needed.
 //!
 //! A `None` (unreadable) RPM is **not** treated as a fault (a sensor read failing ≠ a dead fan); it
@@ -12,7 +12,7 @@
 //!
 //! On a *confirmed* fault, the surviving (non-faulted) fans in the same zone are boosted to 100% on
 //! subsequent ticks (more airflow is always safe). The faulted fan keeps its normal commanded duty
-//! (we never command 0). Surfacing is a `"fault":true` reading field + a `tracing::warn!`; richer
+//! (we never command 0). Surfacing is a `"fault":true` component field + a `tracing::warn!`; richer
 //! delivery (webhook / Netdata alarm) is a documented follow-on, not implemented here.
 
 use crate::zones::{self, Zone};
@@ -53,13 +53,13 @@ impl FanFaultTracker {
     }
 
     /// The currently *confirmed*-faulted fans (state from prior ticks). Read at the start of a tick
-    /// to drive sibling compensation, before `update` folds in this tick's reading.
+    /// to drive sibling compensation, before `update` folds in this tick's component.
     pub fn confirmed(&self) -> [bool; 8] {
         std::array::from_fn(|i| self.fans[i].confirmed)
     }
 
     /// Fold this tick's `(commanded duty, measured RPM)` per fan into the detector and return the
-    /// confirmed-fault flags AFTER the update (used to annotate the readings this tick).
+    /// confirmed-fault flags AFTER the update (used to annotate the components this tick).
     pub fn update(&mut self, commanded: &[u32; 8], rpms: &[Option<i32>; 8]) -> [bool; 8] {
         for i in 0..8 {
             self.fans[i] = step(self.fans[i], commanded[i], rpms[i]);

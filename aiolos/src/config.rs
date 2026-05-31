@@ -330,7 +330,7 @@ max_backoff=120
 status_bind=127.0.0.1:9000
 
 nvidia
-asrock16-2t  input=nvidia   # board fans follow GPU temps
+rome2d-fans  input=nvidia   # board fans follow GPU temps
 ";
         let c = Config::parse(text).unwrap();
         assert_eq!(c.base_tick, Duration::from_millis(200));
@@ -370,7 +370,7 @@ asrock16-2t  input=nvidia   # board fans follow GPU temps
     #[test]
     fn module_schedule_defaults_and_overrides() {
         let c = Config::parse(
-            "base_tick=100\nnvidia\nasrock16-2t input=nvidia every=2 timeout=8\nslow every=500ms",
+            "base_tick=100\nnvidia\nrome2d-fans input=nvidia every=2 timeout=8\nslow every=500ms",
         )
         .unwrap();
         // No directive -> defaults (every 1s, timeout 5s).
@@ -378,7 +378,7 @@ asrock16-2t  input=nvidia   # board fans follow GPU temps
         assert_eq!(nv.every, Duration::from_secs(1));
         assert_eq!(nv.timeout, Duration::from_secs(5));
         // Bare numbers on every/timeout are seconds.
-        let ar = c.schedule_for("asrock16-2t");
+        let ar = c.schedule_for("rome2d-fans");
         assert_eq!(ar.every, Duration::from_secs(2));
         assert_eq!(ar.timeout, Duration::from_secs(8));
         // ms suffix accepted on every.
@@ -450,10 +450,10 @@ asrock16-2t  input=nvidia   # board fans follow GPU temps
 
     #[test]
     fn module_name_with_dash_is_not_global() {
-        // 'asrock16-2t' contains no '=', so it is a module line, not a global.
-        let c = Config::parse("asrock16-2t").unwrap();
+        // 'rome2d-fans' contains no '=', so it is a module line, not a global.
+        let c = Config::parse("rome2d-fans").unwrap();
         assert_eq!(c.registry.len(), 1);
-        assert_eq!(c.registry[0].module_name, "asrock16-2t");
+        assert_eq!(c.registry[0].module_name, "rome2d-fans");
     }
 
     #[test]

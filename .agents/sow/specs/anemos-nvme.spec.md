@@ -1,8 +1,8 @@
 # Spec: `nvme` anemos
 
 Status: design (SOW-0004). NVMe SSD temperature **sensor** — read-only; controls NO device.
-Conforms to `aiolos-protocol.spec.md`. Its readings are routed (`input=nvme`) into a fan
-controller (e.g. `asrock16-2t`) so hot disks raise the board fans.
+Conforms to `aiolos-protocol.spec.md`. Its components are routed (`input=nvme`) into a fan
+controller (e.g. `rome2d-fans`) so hot disks raise the board fans.
 
 ## Purpose
 Report each NVMe drive's temperatures for routing. One `run` instance per physical drive, bound by
@@ -12,19 +12,22 @@ nothing to hand back to firmware).
 
 ## detect
 - Enumerate `/sys/class/nvme/nvme*` (controllers exposing a non-empty `serial`); emit one `found`
-  per drive: `{"id":"<serial>","type":"NVMe","name":"<model>"}`. Serial-sorted for stable ordering.
+  per drive: `{"id":"<serial>","type":"NVMe","name":"<model>","components":[...]}` with one
+  `drive` component schema containing temperature publishers. Serial-sorted for stable ordering.
 - Empty `found` is a real result (no NVMe drives). Non-controller entries (no `serial`) are skipped.
 
 ## run <serial>
 - Re-resolve the controller by serial each tick (so a drive that dropped and returned as a
   different `nvmeN` is still tracked by its stable serial), then read every temperature from that
   controller's own `hwmonM/` node (`tempK_input` milli-°C → °C, labelled by `tempK_label`).
-- Report one `temp` reading per sensor:
+- Report one `drive` component with one `temperature` publisher per sensor:
   ```json
-  {"status":"ok","readings":[
-    {"type":"temp","label":"Composite","temp":33},
-    {"type":"temp","label":"Sensor 1","temp":33},
-    {"type":"temp","label":"Sensor 2","temp":43}]}
+  {"status":"ok","components":[{
+    "id":"drive","label":"Samsung...","class":"ssd",
+    "publishers":[
+      {"id":"temp.composite","label":"Composite","kind":"temperature","value":33,"unit":"C"},
+      {"id":"temp.sensor_1","label":"Sensor 1","kind":"temperature","value":33,"unit":"C"},
+      {"id":"temp.sensor_2","label":"Sensor 2","kind":"temperature","value":43,"unit":"C"}]}]}
   ```
 - `inputs` are ignored (a pure sensor). If the drive is no longer present, or no temperature is
   readable, respond `{"status":"error","error":"…"}` (transient; the orchestrator reconciles via
@@ -47,7 +50,7 @@ None` in the SDK: `run_loop` then skips the curve-empty warning and `Device::app
 controller.
 
 ## Modes
-`detect` · `run <serial>` · `restore` (one-shot: **no-op** — a sensor controls nothing — exits 0;
+`detect` · `info [id]` / `collect [id]` · `run <serial>` · `restore` (one-shot: **no-op** — a sensor controls nothing — exits 0;
 idempotent; still implemented so `aiolos restore` can call it uniformly).
 
 ## Fail-safe
@@ -59,7 +62,7 @@ None. A sensor-only module has no curve file.
 
 ## Acceptance criteria
 - `detect` lists one entry per NVMe drive, id = serial, name = model; stable across re-detect.
-- `run <serial>` reports that drive's per-sensor temps within timeout; absent drive / unreadable
+- `run <serial>` reports that drive's per-sensor temperature publishers within timeout; absent drive / unreadable
   temps → `status:error` (never a crash, never silent).
 - A wedged drive's instance is killed + respawned without affecting sibling instances or the fan
   controller (isolation).

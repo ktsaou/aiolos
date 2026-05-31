@@ -10,10 +10,10 @@
 //! curve files sit next to the main curve, derived by suffix from the SDK controller's resolved
 //! path so the `$AIOLOS_ETC_DIR` override is honoured automatically:
 //!
-//! | role | file (when the main curve is `…/asrock16-2t.curve.json`) |
+//! | role | file (when the main curve is `…/rome2d-fans.curve.json`) |
 //! |------|----------------------------------------------------------|
-//! | CPU  | `…/asrock16-2t.cpu.curve.json`                           |
-//! | case | `…/asrock16-2t.case.curve.json`                          |
+//! | CPU  | `…/rome2d-fans.cpu.curve.json`                           |
+//! | case | `…/rome2d-fans.case.curve.json`                          |
 //!
 //! Zone mode activates **only when BOTH** zone files load a non-empty curve; otherwise the uniform
 //! SDK controller drives all 8 fans (fully back-compatible — the shipped single curve is unchanged).
@@ -35,7 +35,7 @@ pub struct ZoneControllers {
 }
 
 impl ZoneControllers {
-    /// Build the zone controllers from the main curve path (e.g. `…/asrock16-2t.curve.json`),
+    /// Build the zone controllers from the main curve path (e.g. `…/rome2d-fans.curve.json`),
     /// deriving the per-zone file paths by suffix so they sit next to it (and inherit the env dir).
     pub fn for_main_path(main_curve_path: &str) -> Self {
         let cpu_path = zone_path(main_curve_path, "cpu");
@@ -101,17 +101,17 @@ mod tests {
     #[test]
     fn zone_path_inserts_before_suffix() {
         assert_eq!(
-            zone_path("/opt/aiolos/etc/asrock16-2t.curve.json", "cpu"),
-            "/opt/aiolos/etc/asrock16-2t.cpu.curve.json"
+            zone_path("/opt/aiolos/etc/rome2d-fans.curve.json", "cpu"),
+            "/opt/aiolos/etc/rome2d-fans.cpu.curve.json"
         );
         assert_eq!(
-            zone_path("/opt/aiolos/etc/asrock16-2t.curve.json", "case"),
-            "/opt/aiolos/etc/asrock16-2t.case.curve.json"
+            zone_path("/opt/aiolos/etc/rome2d-fans.curve.json", "case"),
+            "/opt/aiolos/etc/rome2d-fans.case.curve.json"
         );
         // Env-dir override path is handled the same way (suffix is what matters).
         assert_eq!(
-            zone_path("/tmp/etc/asrock16-2t.curve.json", "case"),
-            "/tmp/etc/asrock16-2t.case.curve.json"
+            zone_path("/tmp/etc/rome2d-fans.curve.json", "case"),
+            "/tmp/etc/rome2d-fans.case.curve.json"
         );
     }
 

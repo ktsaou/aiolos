@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn floor_curve_never_below_35_or_above_100() {
         let c = floor_curve();
-        // SAFETY: no temperature — including absurd/wrong-low readings — ever yields < 35%.
+        // SAFETY: no temperature — including absurd/wrong-low inputs — ever yields < 35%.
         for t in -100..200 {
             let p = c.eval(t);
             assert!((35..=100).contains(&p), "eval({t}) = {p} escaped [35,100]");

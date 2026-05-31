@@ -2,7 +2,7 @@
 //!
 //! The supervisor is the SOLE writer of `state.instances` for its module's keys (insert on spawn,
 //! remove on vanish/death) — so there is no registration race with the worker threads. It prunes
-//! the blackboard whenever it removes an instance, so stale readings are never relayed as inputs.
+//! the blackboard whenever it removes an instance, so stale components are never relayed as inputs.
 
 use crate::instance::{
     set_nonblocking, write_line_deadline, Instance, InstanceCmd, LineReader, ReadOutcome,
@@ -33,7 +33,7 @@ const BACKOFF_SATURATE_SHIFT: u32 = 32;
 
 /// Why an instance worker thread exited, carried OUT of the thread via its `JoinHandle` return value
 /// so the supervisor learns the reason without racing the main loop's shared-state update. (The main
-/// loop sets `last_status` only when it reaps the worker's `TickReport`; reading that in `reap_dead`
+/// loop sets `last_status` only when it reaps the worker's `TickReport`; component that in `reap_dead`
 /// to classify the exit would race a worker that posted `fatal` and exited before the reap.)
 /// `Fatal` = the module DECLARED a fatal `apply` (jump straight to the long backoff); `Ended` = any
 /// other self-exit (crash, timeout-kill, stdin EOF, or shutdown) → normal escalating backoff.
@@ -312,7 +312,7 @@ impl Supervisor {
         let key = self.key(id);
         if let Ok(mut s) = self.state.write() {
             s.instances.remove(&key);
-            // Prune the blackboard so a dead instance's stale readings are never relayed.
+            // Prune the blackboard so a dead instance's stale components are never relayed.
             s.blackboard.remove(&key);
             // Drop the scheduler slot too, so its lifecycle matches the instance's. Otherwise a stale
             // `busy`/`last_dispatch` could survive into a respawn with the same key when the main
@@ -440,7 +440,7 @@ impl Supervisor {
                     name,
                     last_status: "starting".to_string(),
                     last_error: None,
-                    last_readings: Vec::new(),
+                    last_components: Vec::new(),
                     restart_count,
                     last_seen: Instant::now(),
                     cmd_tx: cmd_tx.clone(),

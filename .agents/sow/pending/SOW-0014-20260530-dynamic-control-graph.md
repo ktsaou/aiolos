@@ -1,4 +1,4 @@
-# SOW-0014 - aiolos v2: dynamic control-graph data model (producers/sinks, claim·set·verify·release, config correlation)
+# SOW-0014 - aiolos v2: dynamic control-graph data model (publishers/sinks, claim·set·verify·release, config correlation)
 
 ## Status
 
@@ -8,12 +8,15 @@ Sub-state: design captured 2026-05-31 from an extended user design discussion; *
 user is still deciding whether to pursue it. This SOW **replaces** the original SOW-0014 framing ("typed
 module kinds + `input=` validation") — that approach was rejected by the user in favour of a far more
 dynamic model (see *Superseded approach* below). This is a large, **protocol-breaking aiolos v2**: it
-relocates all correlation/control logic into aiolos, turns anemoi into pure producers/sinks, and makes
+relocates all correlation/control logic into aiolos, turns anemoi into pure publishers/sinks, and makes
 the whole select→reduce→curve→act pipeline **user configuration**. The current production aiolos (v1)
 keeps cooling nova and the desktop until v2 is built, tested, and explicitly cut over. **The data-model
-half is being pulled forward by SOW-0017** (the component/publisher/sink report shape, device `class`,
-icons — no engine) as an enablement; once that ships, this SOW reduces to adding the central engine +
-config correlation on top of that shape.
+half is being pulled forward by SOW-0017** (the stable `components[] → publishers[] + sinks[]`
+detect/report shape, device `class`, icons — no engine) as an enablement. User clarification
+2026-05-31: SOW-0017 should make `detect` and reports good enough for this SOW, so this SOW should not
+require major detect/report schema changes; it should change the **apply/command methodology** and add
+the central engine + config correlation on top of that shape. The optional live `info` command remains
+a SOW-0014/follow-up command surface that must reuse the same schema rather than redesign it.
 
 ## Requirements
 
@@ -59,14 +62,14 @@ Facts:
 - v1 today: `detect` returns bare IDs; aiolos spawns `run <id>` per ID; routing relays all of a source's
   readings (`input=`), and the **consuming anemos** filters by reading `type` and computes its own duty
   via the SDK `Controller` (curve+EMA+deadband, SOW-0003 D4). Combination (`max`) and zone mapping are
-  **hardcoded in module code** (asrock `regulate`, SOW-0010 zones).
+  **hardcoded in module code** (board-fan `regulate`, SOW-0010 zones).
 - The user wants the opposite split: **mechanics in the anemos, policy in config, logic in aiolos**. The
-  anemos exposes what it can measure (producers) and what it can drive (sinks); aiolos computes the
+  anemos exposes what it can measure (publishers/producers) and what it can drive (sinks); aiolos computes the
   values; the sink merely applies them.
 - "Kinds" are **open, user-meaningful tags**, not a closed enum aiolos validates. aiolos matches a tag;
   it never interprets it. (This is why the original typed-validation SOW-0014 is rejected.)
 - Verification is naturally a **correlation**: a sink's readback (the actual observed value) is itself a
-  producer signal, so aiolos can compare commanded-vs-observed with the same select machinery and apply a
+  publisher signal, so aiolos can compare commanded-vs-observed with the same select machinery and apply a
   configured divergence policy (re-assert / re-claim / warn / ignore).
 - This is now multi-host: nova (BMC/IPMI board) and a BMC-less desktop (it87, hwmon-temps) — concrete
   proof that correlation must be per-host **configuration**, with the same agnostic anemoi.
@@ -83,14 +86,17 @@ Inferences:
   no special multi-input typing.
 
 Unknowns (design forks for the user — see Pre-Implementation Gate):
-- Exact producer/sink schema fields; whether the curve runs in the engine or the sink; how expressive the
-  condition/function grammar should be at first; one-umbrella-SOW vs a sequence; migration/coexistence.
+- Exact apply/command methodology; whether the curve runs as an engine stage or a sink-adjacent stage;
+  how expressive the condition/function grammar should be at first; one-umbrella-SOW vs a sequence;
+  migration/coexistence. The major detect/report schema should be settled by SOW-0017.
 
 ### Acceptance Criteria
 - aiolos contains **zero domain knowledge**: no "temperature"/"fan"/"power" concepts in the orchestrator;
   it operates only on opaque `kind` tags + numeric `value`s + user pipelines.
-- An anemos `detect` returns a **capability map** (`units → producers[] + sinks[]` with schemas); `info`
-  returns the same **plus live values**; both pretty-print + exit on a tty, emit one-line JSON to aiolos.
+- An anemos `detect` returns the SOW-0017 **capability map**
+  (`components[] → publishers[] + sinks[]` with schemas); reports return the same shape **plus live
+  values**. A live `info` command may be added here/follow-up, but must reuse this schema rather than
+  redesign it.
 - A user can, **entirely in configuration**, select signals by kind/source/label, reduce them
   (max/min/avg/ema/weighted/…), gate with conditions, shape with a curve, and drive any sink output — for
   any domain, with no aiolos or anemos code change.
@@ -106,9 +112,9 @@ Unknowns (design forks for the user — see Pre-Implementation Gate):
 ## Analysis
 
 Sources checked / to re-check at activation:
-- `protocol/` wire types (`detect`/`run`/`Reading`), `anemos/` SDK (`run` driver, `Controller`,
+- `protocol/` wire types (`detect`/`run`/component reports), `anemos` SDK (`run` driver, `Controller`,
   `Curve`/`Damper`), `aiolos/` (`main.rs::build_inputs`, scheduler `module.rs`/`instance.rs`,
-  `status_page.rs`), the shipped anemoi (nvidia, asrock16-2t, nvme, ipmi-temps, nut, it87, hwmon-temps),
+  `status_page.rs`), the shipped anemoi (nvidia, rome2d-fans, nvme, ipmi-temps, nut, it87, hwmon-temps),
   the protocol spec + `project-anemos-protocol` / `project-create-anemos` skills.
 
 Current state:
@@ -132,35 +138,41 @@ Problem / root-cause model:
   move all correlation/control into a config-driven, domain-blind engine in aiolos.
 
 Affected contracts and surfaces (a protocol-breaking v2):
-- **Protocol**: `detect` payload (bare IDs → capability map); a new/extended `info` command; the sink
-  tick-contract (readings-in → commanded-values-in); the claim/set/verify/release lifecycle messages.
+- **Protocol**: reuse the SOW-0017 `detect`/report capability schema
+  (`components[] → publishers[] + sinks[]`). The major protocol change left for this SOW is the sink
+  tick-contract / apply methodology (inputs-in/module-decides → commanded-values-in/aiolos-decides) and
+  any claim/set/verify/release command semantics needed to drive sinks.
 - **`anemos` SDK**: `Controller` (curve/EMA/deadband) moves out to the engine; sinks gain a
-  claim/set/verify/release device surface; producers normalise to `{kind,value}`.
+  claim/set/verify/release device surface; publishers already normalise to `{id,label,kind,value?,…}` via
+  SOW-0017.
 - **`aiolos`**: a new config-driven **control-graph engine** (select→reduce→conditions→curve→command),
   per-output verification + divergence policy, fail-safe-on-no-command; config format change.
 - **Config**: a new declarative `control` block format (replaces `input=`/per-module curve files).
-- **Status page / UI**: render units/producers/sinks/control-state; the new config UI + TUI.
+- **Status page / UI**: render components/publishers/sinks/control-state; the new config UI + TUI.
 - **Specs + skills**: protocol spec, `project-anemos-protocol`, `project-create-anemos` all rewritten.
 
 The data model (proposal captured for memory — to refine at activation):
-- **Capability model** (`detect` = schema, `info` = schema + live values):
+- **Capability model** (`detect` = schema, reports = schema + live values), supplied
+  by SOW-0017 with no major redesign here:
   ```
-  units: [{
-    id: "asrock16-2t",
-    producers: [
-      { label:"CPU1",     kind:"temperature", unit:"C", value:47 },
-      { label:"FAN1.rpm", kind:"fan-rpm",               value:1500 },
-      { label:"FAN1.pwm", kind:"fan-duty",    unit:"%", value:40 }   // readback IS a producer
+  components: [{
+    id: "board",
+    label: "ROME2D16-2T",
+    class: "board",
+    publishers: [
+      { id:"cpu1.temp",  label:"CPU1",     kind:"temperature", unit:"C", value:47 },
+      { id:"fan1.rpm",  label:"FAN1.rpm", kind:"fan-rpm",               value:1500 },
+      { id:"fan1.duty", label:"FAN1.pwm", kind:"fan-duty",    unit:"%", value:40 }   // readback publisher
     ],
     sinks: [
-      { label:"FAN1", kind:"fan-duty", range:[0,100], safe:"auto",
-        needs_claim:true, readback:"FAN1.pwm", direction:"up=more-cooling" }
+      { id:"fan1", label:"FAN1", kind:"fan-duty", range:[0,100], safe:"auto",
+        needs_claim:true, readback:"fan1.duty", direction:"up=more-cooling" }
     ]
   }]
   ```
-  unit = one OS process (the anemos chooses its own grouping); producer = `{label, kind(open tag), value,
-  unit?, range?}`; sink = `{label, kind, range, safe, needs_claim, readback, direction}`.
-- **Runtime (per tick)**: producers emit `[{label,kind,value,…}]`; aiolos commands sinks
+  component = device/entity grouping chosen by the anemos; publisher = `{id,label,kind(open tag),value?,
+  unit?,range?}`; sink = `{id,label,kind,range?,unit?,value?,safe,needs_claim,readback,direction?}`.
+- **Runtime (per tick)**: publishers emit `[{id,label,kind,value,…}]`; aiolos commands sinks
   `[{output:label, value:V}]`; sinks report control-state `released|claimed|diverged`.
 - **Lifecycle (anemos mechanics, aiolos drives, config sets policy)**: `claim` (take manual control) →
   `set(v)` → `verify` (read back → emit `readback` signal) → `release` (→ `safe`). Divergence example:
@@ -169,7 +181,7 @@ The data model (proposal captured for memory — to refine at activation):
 - **Correlation model (config, one block per controlled output)**:
   ```
   control "board-case-fans":
-    target:  asrock16-2t.FAN3..FAN8
+    target:  rome2d-fans.FAN3..FAN8
     select:  kind=temperature                 # any unit, or from:[nvidia,nvme,ipmi-temps]; label glob
     when:    nvidia present                    # optional condition gate(s)
     reduce:  max                               # max|min|avg|ema|weighted|p95|…
@@ -194,11 +206,13 @@ Sensitive data handling plan:
   in committed artifacts (per AGENTS.md).
 
 Implementation plan (sketch — a sequence under this umbrella; finalise at activation):
-1. **Protocol + data model**: capability map (`detect`/`info`), producer/sink schemas, lifecycle messages.
+1. **Protocol + apply methodology**: reuse SOW-0017 detect/report schemas; define the commanded-sink
+   apply contract and any claim/set/verify/release command semantics.
 2. **Engine**: config parse → select/reduce/conditions/curve → per-sink commands (curve relocated here).
 3. **Lifecycle + fail-safe**: claim/set/verify/release; verification + divergence policy; no-command→safe.
-4. **Config format** (text first) + migrate the shipped anemoi to producer/sink mechanics.
-5. **`info` dump**, then the **web config UI** and **TUI** (both read `info`, write the text config).
+4. **Config format** (text first) + migrate the shipped anemoi from local policy to commanded sink
+   mechanics.
+5. Optional **`info` dump**, then the **web config UI** and **TUI** (if built, they reuse the same component schema and write the text config).
 6. Hardware validation on nova + desktop; staged cutover from v1.
 
 Validation plan:
@@ -215,16 +229,16 @@ Artifact impact plan:
 Open decisions (forks — recorded from the discussion with recommendations; **not yet chosen** by the user):
 1. **Lifecycle shape** — claim/set/verify/release as above, `needs_claim` per output, divergence policy
    (`reassert|reclaim|warn|ignore`) gated by `tolerance`+`settle`. *Recommend as written.*
-2. **Verification** — model a sink's readback as a normal producer signal that aiolos correlates against
-   the command (uniform, reuses `select`), vs a dedicated verify channel. *Recommend readback-as-producer.*
+2. **Verification** — model a sink's readback as a normal publisher signal that aiolos correlates against
+   the command (uniform, reuses `select`), vs a dedicated verify channel. *Recommend readback-as-publisher.*
 3. **Expressiveness now** — minimal fixed operators (reduce set + AND-ed comparison gates) vs a richer
    expression language. *Recommend minimal-first; grow on demand.*
 4. **Delivery** — one big v2 SOW vs a sequence of child SOWs under this umbrella (old aiolos in prod until
    cutover). *Recommend a sequence under this umbrella.*
 
-Plus, to settle at activation: the exact producer/sink schema fields (units, ranges, multiple kinds per
-producer, hysteresis hints) and where stateful smoothing (EMA/deadband) sits (its own pipeline stage vs
-inside the curve).
+Plus, to settle at activation: the exact apply/command fields and where stateful smoothing
+(EMA/deadband) sits (its own pipeline stage vs inside the curve). The major publisher/sink detect/report
+schema comes from SOW-0017.
 
 ## Implications And Decisions
 
@@ -241,8 +255,9 @@ expresses intent. The validation value (catching a useless wiring) is recovered 
 showing what matches, plus warn-on-unmatched-reference — never a hard contract.
 
 ## Plan
-1. User decides whether to pursue v2 and resolves forks 1–4 + schema details.
-2. Complete the activation gate; split into staged child SOWs (protocol/model → engine → lifecycle/
+1. User decides whether to pursue v2 and resolves forks 1–4 + apply/engine details. The detect/report
+   schema should be inherited from SOW-0017 without major redesign.
+2. Complete the activation gate; split into staged child SOWs (apply contract → engine → lifecycle/
    fail-safe → config → UI/TUI) under this umbrella.
 3. Build v2 alongside v1; reproduce v1 behaviour under v2 config; hardware-validate on nova + desktop.
 4. Staged cutover from v1; rewrite specs/skills/docs; fold SOW-0015 in as a config example.
@@ -254,6 +269,9 @@ showing what matches, plus warn-on-unmatched-reference — never a hard contract
   rejected the typed-contract approach) with this **dynamic control-graph data model** SOW, capturing the
   full design discussion. Renamed slug `module-kinds-input-validation` → `dynamic-control-graph`. No code.
   Status kept `open` (user still deciding whether to pursue v2).
+- User clarified that SOW-0017 should make `detect` and reports good enough for this SOW, avoiding major
+  schema changes later. This SOW should change the apply/command methodology and add the central engine on
+  top of SOW-0017's schema. No code.
 
 ## Validation
 

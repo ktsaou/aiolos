@@ -12,10 +12,11 @@
   anemoi, drives the heartbeat, routes declared data flows between them, holds all state, serves
   a read-only status web page. Lean (no GC; low-MB binary, few-MB RSS), memory-safe.
 - **anemoi** — autonomous module binaries (any language) implementing the protocol: `detect`
-  (report the IDs they manage) and `run <ID>` (act each tick, report readings).
+  (report stable IDs + component schema), read-only `info`/`collect` (live values without hardware
+  side effects), and `run <ID>` (act each tick, report components with publishers/sinks).
   - `nvidia` — per-GPU onboard fan control via NVML.
   - `nvme` — sensor-only NVMe SSD temperatures via sysfs (controls nothing; routed into fan modules).
-  - `asrock16-2t` — ASRockRack ROME2D16-2T board fans via IPMI (`/dev/ipmi0`), driven by GPU
+  - `rome2d-fans` — ASRockRack ROME2D16-2T board fans via IPMI (`/dev/ipmi0`), driven by GPU
     temps routed from `nvidia`, NVMe temps from `nvme`, plus its own CPU/board sensors.
   - `it87` — consumer-board fans via the Linux `it87` sysfs PWM (BMC-less boards, e.g. Gigabyte
     Z690 UD): CPU zone follows `coretemp`, case zone follows GPU temps routed from `nvidia`.
@@ -34,14 +35,15 @@ Three reuse levels (SOW-0003) so an anemos carries only its device logic:
 protocol/                L2 wire types (aiolos + anemos share); JSON request/response
 anemos/                  L2 SDK: the run() lifecycle driver (CLI/signals/logging/protocol loops),
                          signal-aware StdinReader, Curve/CurveCache/Damper, the Controller
-                         (temp→duty: curve+EMA+deadband, 35% floor), and the Anemos/Device traits
+                         (temp→duty: curve+EMA+deadband, 35% floor), collect/apply split,
+                         and the Anemos/Device traits
 tech/ipmi/               L1 tech: generic inband IPMI transport (/dev/ipmi0 raw netfn/cmd)
 tech/nvml/               L1 tech: NVML GPU access (enumerate, temp, per-fan set/restore)
 tech/hwmon/              L1 tech: generic hwmon (sysfs) temperature reader + PWM fan control
 tech/nvme/               L1 tech: NVMe enumeration (serial) + per-drive temps (sysfs)
 aiolos/                  the orchestrator (depends only on protocol wire types)
 anemoi/nvidia/           L3 anemos: Anemos/Device impl on anemos + nvml (~10-line main + logic)
-anemoi/asrock16-2t/      L3 anemos: anemos + ipmi + hwmon; board OEM commands in src/board.rs
+anemoi/rome2d-fans/      L3 anemos: anemos + ipmi + hwmon; board OEM commands in src/board.rs
 anemoi/it87/             L3 anemos: anemos + hwmon; consumer-board fans via sysfs PWM (CPU/case zones)
 anemoi/hwmon-temps/      L3 anemos: sensor-only sysfs temps (anemos + hwmon); no curve, no control
 anemoi/nvme/             L3 anemos: sensor-only NVMe temps (anemos + nvme); no curve, no control
@@ -153,9 +155,9 @@ generic filler skills.
 - `.agents/skills/project-anemos-protocol/` — Trigger: **mandatory** before editing the
   orchestrator's protocol handling, any anemos's stdin/stdout, or claiming protocol conformance.
   Enforces: the one-line-JSON request/response contract, stdout=protocol / stderr=logs, the
-  detect/apply/shutdown/hello messages, half-duplex + timeout, fail-safe-on-EOF.
+  detect/info/collect/apply/shutdown/hello messages, half-duplex + timeout, fail-safe-on-EOF.
 - `.agents/skills/project-create-anemos/` — Trigger: **mandatory** when creating a new anemos
-  (module) for any device/signal. Enforces: the module contract, detect/apply/shutdown, fail-safe
+  (module) for any device/signal. Enforces: the module contract, detect/collect/apply/shutdown, fail-safe
   (restore to firmware/auto on exit), registry wiring (`input=`), curve config, test checklist.
 
 ### Project-specific commands

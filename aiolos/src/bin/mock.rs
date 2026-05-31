@@ -1,5 +1,5 @@
 //! Test-only mock anemos — a helper binary used by the orchestrator integration tests. It is
-//! never installed (packaging copies only aiolos/nvidia/asrock16-2t).
+//! never installed (packaging copies only aiolos/nvidia/rome2d-fans).
 //!
 //! Behaviour is driven by env vars namespaced by the MODULE NAME (argv[0]'s file name), so one
 //! binary plays several roles via differently-named symlinks in the test bin dir:
@@ -19,7 +19,7 @@
 //!   <mod>-<id>.lastinput  overwritten each apply with the max routed input temp (or -1)
 
 use anemos::{Event, StdinReader};
-use protocol::{Applied, Detected, FoundEntry, Inputs, Reading, Request};
+use protocol::{Applied, Component, Detected, FoundEntry, Inputs, Publisher, Request};
 use serde_json::json;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,7 @@ fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "detect".into());
     match mode.as_str() {
         "detect" => detect_loop(&module),
+        "info" | "collect" => info_once(&module, std::env::args().nth(2)),
         "run" => run_loop(
             &module,
             &std::env::args().nth(2).expect("run requires <ID>"),
@@ -50,6 +51,31 @@ fn main() {
             eprintln!("mock: unknown mode {other}");
             std::process::exit(1);
         }
+    }
+}
+
+fn info_once(module: &str, wanted: Option<String>) {
+    let ids = envk(module, "IDS").unwrap_or_else(|| "thing0".into());
+    let temp: i64 = envk(module, "TEMP")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let mut found = Vec::new();
+    for id in ids.split(',').filter(|s| !s.is_empty()) {
+        if wanted.as_deref().is_some_and(|w| w != id) {
+            continue;
+        }
+        found.push(FoundEntry {
+            id: id.to_string(),
+            kind: "MOCK".into(),
+            name: format!("mock {id}"),
+            components: vec![mock_component("self", "self", Some(temp))],
+            extra: Default::default(),
+        });
+    }
+    if wanted.is_some() && found.is_empty() {
+        emit_line(Detected::fatal("mock id not found").to_line());
+    } else {
+        emit_line(Detected::ok(found).to_line());
     }
 }
 
@@ -89,6 +115,7 @@ fn detect_loop(module: &str) {
                             id: id.to_string(),
                             kind: "MOCK".into(),
                             name: format!("mock {id}"),
+                            components: vec![mock_component("self", "self", None)],
                             extra: Default::default(),
                         })
                         .collect();
@@ -148,16 +175,11 @@ fn run_loop(module: &str, id: &str) {
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(800);
                         std::thread::sleep(Duration::from_millis(slow_ms));
-                        let mut readings =
-                            vec![Reading::new("temp", "self", json!({ "temp": temp }))];
+                        let mut components = vec![mock_component("self", "self", Some(temp))];
                         if let Some(m) = in_max {
-                            readings.push(Reading::new(
-                                "temp",
-                                "from_input",
-                                json!({ "temp": m, "in_temp": m }),
-                            ));
+                            components.push(mock_component("from_input", "from_input", Some(m)));
                         }
-                        emit_line(Applied::ok(readings).to_line());
+                        emit_line(Applied::ok(components).to_line());
                     }
                     "hang" => loop {
                         std::thread::sleep(Duration::from_secs(60));
@@ -176,16 +198,11 @@ fn run_loop(module: &str, id: &str) {
                     "fatal" => emit_line(Applied::fatal("mock fatal").to_line()),
                     "exit" => std::process::exit(0),
                     _ => {
-                        let mut readings =
-                            vec![Reading::new("temp", "self", json!({ "temp": temp }))];
+                        let mut components = vec![mock_component("self", "self", Some(temp))];
                         if let Some(m) = in_max {
-                            readings.push(Reading::new(
-                                "temp",
-                                "from_input",
-                                json!({ "temp": m, "in_temp": m }),
-                            ));
+                            components.push(mock_component("from_input", "from_input", Some(m)));
                         }
-                        emit_line(Applied::ok(readings).to_line());
+                        emit_line(Applied::ok(components).to_line());
                     }
                 }
             }
@@ -204,9 +221,18 @@ fn max_input_temp(inputs: Option<&Inputs>) -> Option<i64> {
     inputs?
         .values()
         .flatten()
-        .filter(|r| r.kind == "temp")
-        .filter_map(|r| r.get_i64("temp"))
+        .flat_map(|c| &c.publishers)
+        .filter(|p| p.kind == "temperature")
+        .filter_map(Publisher::value_i64)
         .max()
+}
+
+fn mock_component(id: &str, label: &str, temp: Option<i64>) -> Component {
+    let mut publisher = Publisher::new("temp", "Temperature", "temperature").unit("C");
+    if let Some(temp) = temp {
+        publisher = publisher.value(json!(temp));
+    }
+    Component::new(id, label, "mock").with_publishers(vec![publisher])
 }
 
 fn restore(module: &str, id: &str) {

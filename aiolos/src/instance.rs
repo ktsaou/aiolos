@@ -4,7 +4,7 @@
 //! The central robustness property: NO orchestrator-side read or write on a child pipe can ever
 //! block past the caller's deadline. We set both pipe ends non-blocking and drive them with
 //! `poll(2)` against a wall-clock deadline. A module that writes a partial line, floods stdout
-//! without a newline, or stops reading its stdin is killed within ~timeout — it can never wedge
+//! without a newline, or stops component its stdin is killed within ~timeout — it can never wedge
 //! the instance thread (which would otherwise defeat the isolation guarantee).
 
 use anyhow::Result;
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 /// Max bytes we will buffer for a single response line before declaring a protocol violation.
-/// Generous for any legitimate readings list; bounds memory against a stdout flood.
+/// Generous for any legitimate components list; bounds memory against a stdout flood.
 const MAX_LINE: usize = 256 * 1024;
 
 /// How long Drop waits for a child to restore its device + exit (via stdin EOF) before SIGKILL.
@@ -80,7 +80,7 @@ impl TickStatus {
 pub struct TickResult {
     pub status: TickStatus,
     pub error: Option<String>,
-    pub readings: Vec<protocol::Reading>,
+    pub components: Vec<protocol::Component>,
 }
 
 impl TickResult {
@@ -88,7 +88,7 @@ impl TickResult {
         TickResult {
             status,
             error,
-            readings: Vec::new(),
+            components: Vec::new(),
         }
     }
 }
@@ -196,7 +196,7 @@ impl Instance {
                 ReadOutcome::Line(s) => {
                     if protocol::is_hello(&s) {
                         debug!(module=%self.module_name, id=%self.id, "hello");
-                        continue; // skip optional hello, keep reading within the deadline
+                        continue; // skip optional hello, keep component within the deadline
                     }
                     match Applied::from_line(&s) {
                         Ok(ap) => {
@@ -208,7 +208,7 @@ impl Instance {
                             return TickResult {
                                 status,
                                 error: ap.error,
-                                readings: ap.readings.unwrap_or_default(),
+                                components: ap.components.unwrap_or_default(),
                             };
                         }
                         Err(e) => {

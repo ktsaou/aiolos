@@ -19,7 +19,8 @@
 mod config;
 
 use anemos::{
-    Anemos, Applied, Controller, Detected, Device, FoundEntry, Inputs, ModuleInfo, Reading,
+    Anemos, Applied, Component, Detected, Device, FoundEntry, Inputs, ModuleInfo, OpenMode,
+    Publisher,
 };
 use serde_json::json;
 
@@ -47,13 +48,14 @@ impl Anemos for NutAnemos {
                     id: id.clone(),
                     kind: "UPS".to_string(),
                     name: id,
+                    components: vec![Component::new("ups", "UPS", "power")],
                     extra: Default::default(),
                 })
                 .collect(),
         )
     }
 
-    fn open(&mut self, id: &str) -> anyhow::Result<Box<dyn Device>> {
+    fn open(&mut self, id: &str, _mode: OpenMode) -> anyhow::Result<Box<dyn Device>> {
         // Bind by UPS id. Do NOT fail open if the UPS is momentarily unreadable: a UPS that upsd
         // cannot reach right now is a transient condition the per-tick `apply` reports as `error`
         // (the orchestrator keeps the instance and retries), not a fatal that withdraws the module.
@@ -71,10 +73,10 @@ struct UpsSensor {
 }
 
 impl Device for UpsSensor {
-    fn apply(&mut self, _inputs: Option<&Inputs>, _ctrl: &mut Controller) -> Applied {
+    fn collect(&mut self, _inputs: Option<&Inputs>) -> Applied {
         // Sensor-only: read this UPS's state and report it as a `power-state` reading.
         match nut::read(&self.id) {
-            Ok(s) => Applied::ok(vec![power_state_reading(&s)]),
+            Ok(s) => Applied::ok(vec![power_state_component(&s)]),
             Err(e) => Applied::error(e),
         }
     }
@@ -84,32 +86,52 @@ impl Device for UpsSensor {
     }
 }
 
-/// Build the `power-state` reading for one UPS. The booleans (`online`/`on_battery`/`low_battery`)
+/// Build the power-state component for one UPS. The booleans (`online`/`on_battery`/`low_battery`)
 /// are the decision-ready signals a reactor keys off; the raw `status` flags and the numeric fields
 /// are included for the status page and for richer policies. Numeric fields are omitted when the
 /// driver does not report them (never emitted as null-ish placeholders).
-fn power_state_reading(s: &nut::UpsState) -> Reading {
-    let mut f = serde_json::Map::new();
-    f.insert("status".to_string(), json!(s.status));
-    f.insert("online".to_string(), json!(s.on_line()));
-    f.insert("on_battery".to_string(), json!(s.on_battery()));
-    f.insert("low_battery".to_string(), json!(s.low_battery()));
+fn power_state_component(s: &nut::UpsState) -> Component {
+    let mut publishers = vec![
+        Publisher::new("status", "Status", "power-status").value(json!(s.status)),
+        Publisher::new("online", "Online", "power-online").value(json!(s.on_line())),
+        Publisher::new("on_battery", "On battery", "power-on-battery").value(json!(s.on_battery())),
+        Publisher::new("low_battery", "Low battery", "power-low-battery")
+            .value(json!(s.low_battery())),
+    ];
     if let Some(c) = s.charge_pct {
-        f.insert("charge".to_string(), json!(c));
+        publishers.push(
+            Publisher::new("charge", "Charge", "power-charge")
+                .value(json!(c))
+                .unit("%")
+                .range(0.0, 100.0),
+        );
     }
     if let Some(r) = s.runtime_s {
-        f.insert("runtime_s".to_string(), json!(r));
+        publishers.push(
+            Publisher::new("runtime", "Runtime", "power-runtime")
+                .value(json!(r))
+                .unit("s"),
+        );
     }
     if let Some(l) = s.load_pct {
-        f.insert("load_pct".to_string(), json!(l));
+        publishers.push(
+            Publisher::new("load", "Load", "power-load")
+                .value(json!(l))
+                .unit("%")
+                .range(0.0, 100.0),
+        );
     }
     if let Some(v) = s.input_voltage {
-        f.insert("input_voltage".to_string(), json!(v));
+        publishers.push(
+            Publisher::new("input_voltage", "Input voltage", "power-voltage")
+                .value(json!(v))
+                .unit("V"),
+        );
     }
     if let Some(m) = &s.model {
-        f.insert("model".to_string(), json!(m));
+        publishers.push(Publisher::new("model", "Model", "power-model").value(json!(m)));
     }
-    Reading::new("power-state", s.id.clone(), serde_json::Value::Object(f))
+    Component::new("ups", s.id.clone(), "power").with_publishers(publishers)
 }
 
 #[cfg(test)]
@@ -132,23 +154,23 @@ mod tests {
 
     #[test]
     fn power_state_reading_carries_decision_signals_and_metrics() {
-        let r = power_state_reading(&state("pr3000-nova", "OL"));
-        assert_eq!(r.kind, "power-state");
-        assert_eq!(r.label, "pr3000-nova");
-        assert_eq!(r.fields.get("status").unwrap(), "OL");
-        assert_eq!(r.fields.get("online").unwrap(), true);
-        assert_eq!(r.fields.get("on_battery").unwrap(), false);
-        assert_eq!(r.fields.get("low_battery").unwrap(), false);
-        assert_eq!(r.get_i64("charge"), Some(100));
-        assert_eq!(r.get_i64("runtime_s"), Some(697));
-        assert_eq!(r.get_i64("load_pct"), Some(36));
+        let c = power_state_component(&state("pr3000-nova", "OL"));
+        assert_eq!(c.class, "power");
+        assert_eq!(c.label, "pr3000-nova");
+        assert_eq!(pub_value(&c, "status"), Some(json!("OL")));
+        assert_eq!(pub_value(&c, "online"), Some(json!(true)));
+        assert_eq!(pub_value(&c, "on_battery"), Some(json!(false)));
+        assert_eq!(pub_value(&c, "low_battery"), Some(json!(false)));
+        assert_eq!(pub_i64(&c, "charge"), Some(100));
+        assert_eq!(pub_i64(&c, "runtime"), Some(697));
+        assert_eq!(pub_i64(&c, "load"), Some(36));
     }
 
     #[test]
     fn power_state_reading_reflects_on_battery() {
-        let r = power_state_reading(&state("ups0", "OB DISCHRG"));
-        assert_eq!(r.fields.get("online").unwrap(), false);
-        assert_eq!(r.fields.get("on_battery").unwrap(), true);
+        let c = power_state_component(&state("ups0", "OB DISCHRG"));
+        assert_eq!(pub_value(&c, "online"), Some(json!(false)));
+        assert_eq!(pub_value(&c, "on_battery"), Some(json!(true)));
     }
 
     #[test]
@@ -158,12 +180,26 @@ mod tests {
         s.runtime_s = None;
         s.input_voltage = None;
         s.model = None;
-        let r = power_state_reading(&s);
-        assert!(!r.fields.contains_key("charge"));
-        assert!(!r.fields.contains_key("runtime_s"));
-        assert!(!r.fields.contains_key("input_voltage"));
-        assert!(!r.fields.contains_key("model"));
+        let c = power_state_component(&s);
+        assert!(pub_value(&c, "charge").is_none());
+        assert!(pub_value(&c, "runtime").is_none());
+        assert!(pub_value(&c, "input_voltage").is_none());
+        assert!(pub_value(&c, "model").is_none());
         // The boolean signals are always present.
-        assert_eq!(r.fields.get("low_battery").unwrap(), true);
+        assert_eq!(pub_value(&c, "low_battery"), Some(json!(true)));
+    }
+
+    fn pub_value(c: &Component, id: &str) -> Option<serde_json::Value> {
+        c.publishers
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.value.clone())
+    }
+
+    fn pub_i64(c: &Component, id: &str) -> Option<i64> {
+        c.publishers
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.value_i64())
     }
 }

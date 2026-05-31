@@ -1,11 +1,11 @@
-# Spec: `asrock16-2t` anemos
+# Spec: `rome2d-fans` anemos
 
 Status: design. ASRockRack ROME2D16-2T board-fan controller via IPMI. Conforms to
 `aiolos-protocol.spec.md`. Hardware findings verified on BMC firmware 3.03 (AST2500).
 
 ## Purpose
 Drive the 8 motherboard fan headers by temperature. Registry:
-`asrock16-2t input=nvidia input=nvme` — the orchestrator routes GPU and NVMe temps in; the module
+`rome2d-fans input=nvidia input=nvme` — the orchestrator routes GPU and NVMe temps in; the module
 also reads its own CPU/board sensors. One `run` instance (the board).
 
 ## Hardware facts
@@ -15,7 +15,10 @@ also reads its own CPU/board sensors. One `run` instance (the board).
 - Inband interface: `/dev/ipmi0`.
 
 ## detect
-- Emit exactly one board ID: `{"id":"asrock16-2t","type":"board","name":"ROME2D16-2T"}`.
+- Emit exactly one board ID: `{"id":"board","type":"board","name":"ROME2D16-2T"}`.
+- The entry includes one schema component: `id="board"`, `class="board"`, CPU/driving
+  temperature publishers, driving-duty publisher, and eight `fan-duty` sinks (`fan1..fan8`) with
+  `safe:"auto"` and `needs_claim:true`.
 
 ## run <board>
 - Driving temperature = `max(` all routed `inputs` temps, own CPU temps `)`. Routed temps arrive
@@ -25,16 +28,18 @@ also reads its own CPU/board sensors. One `run` instance (the board).
   **`k10temp` sysfs** (`/sys/class/hwmon/*` where `name == k10temp`), reading every `tempN_input`
   across **both** EPYC sockets (labeled via `tempN_label` where present).
 - NVMe temps are relayed by the `nvme` sensor anemos (`input=nvme`): hot SSDs raise the board fans.
-  Routed temps are the `"type":"temp"` records relayed in `inputs`.
+  Routed temps are `temperature` publishers in the source components relayed in `inputs`.
 - *Board/DIMM IPMI SDR temps (`TEMP_MB1/2`, `TEMP_CARD_SIDE1`, `TEMP_DDR4_*`) remain a planned
   enhancement; they are not in the driving max — CPU + GPU + NVMe dominate cooling demand here.*
 - Interpolate the curve and set the 8 fans (uniform OR per-zone, see **Fan model** below); then
-  (observability only, read AFTER the control decision) report each fan's `{pwm, rpm}`: `pwm` from
-  the `0xda` duty readback (falling back to the commanded duty if unavailable), `rpm` from the fan's
-  tachometer (omitted if the sensor is unreadable). A **faulted** fan additionally carries
-  `"fault":true` (see **Fan-fault detection**). Reported alongside the temp readings and a `driving`
-  record (`{"mode":"uniform","raw","temp","pct"}` or `{"mode":"zone","cpu_raw","cpu_temp","cpu_pct",
-  "case_raw","case_temp","case_pct"}`).
+  (observability only, read AFTER the control decision) report one board component:
+  - publishers: local CPU temperatures, driving mode/raw/smoothed/duty, per-fan duty readbacks
+    (`fanN.duty`), and per-fan RPM (`fanN.rpm`) when the tachometer is readable;
+  - sinks: eight `fan-duty` sinks with current commanded value, duty readback publisher, safe state
+    `auto`, state `claimed`, and `driven_by` metadata for the local/routed inputs that drove the
+    decision.
+  Routed GPU/NVMe/IPMI temperatures are **not** re-published as board temps; they appear only in
+  sink `driven_by` metadata to avoid duplicate devices on the status page.
 - **Per-fan RPM (SOW-0005):** read via standard IPMI sensor commands on `FAN1_1..FAN8_1` (sensor
   numbers `0x60..0x67`). The linear conversion factors come from `Get Sensor Reading Factors`
   (`0x04/0x23`) — **prefetched at instance open** and cached (constant for these linear sensors;
@@ -47,14 +52,14 @@ also reads its own CPU/board sensors. One `run` instance (the board).
   sensor failure never affects fan control or fails the tick.
 - **Fan model — default uniform, optional per-zone (SOW-0010):**
   - **Uniform (default):** apply `curve(max(all routed inputs, CPU))` to all 8 fans via the single
-    `asrock16-2t.curve.json`. Back-compatible; the shipped config is unchanged.
+    `rome2d-fans.curve.json`. Back-compatible; the shipped config is unchanged.
   - **Per-zone:** when BOTH optional zone curve files load a non-empty curve, the board splits into
     two independently-curved zones, each with its own `anemos::Controller` (own EMA/deadband/
     sensitivity):
     - **CPU zone** — FAN1/FAN2 (Noctua CPU coolers) driven by `max(CPU k10temp)` via
-      `asrock16-2t.cpu.curve.json`.
+      `rome2d-fans.cpu.curve.json`.
     - **Case zone** — FAN3..FAN8 (120 mm case fans) driven by `max(all routed inputs)` (GPU + NVMe +
-      any future routed source) via `asrock16-2t.case.curve.json`. **CPU temp is deliberately
+      any future routed source) via `rome2d-fans.case.curve.json`. **CPU temp is deliberately
       excluded from the case max** so a CPU-only spike does not blast the case fans.
   - The per-fan duties go out through the same `0xd6` command (bytes 0–7 = FAN1..FAN8; see the
     critical rule below). The mode is re-decided **live every tick** from the presence of the two
@@ -76,9 +81,8 @@ commanded ≥ `FAULT_MIN_DUTY` (20 %) yet its tachometer reads a **present** RPM
 - An **unreadable** RPM (`None`) is NOT a fault (sensor read failing ≠ dead fan); it holds the
   per-fan state (neither confirms nor clears). A present RPM above the threshold clears immediately.
 - A fan commanded below the duty threshold can legitimately read ≈0 and never faults (state resets).
-- **Surfacing:** the faulted fan's `fan` reading carries `"fault":true` and a `tracing::warn!` names
-  it. Richer delivery (webhook / Netdata `aiolos_fan_rpm==0` alarm, ties to the metrics SOW) is a
-  documented **follow-on**, not implemented here.
+- **Surfacing:** the faulted fan's sink carries `"fault":true` and a `tracing::warn!` names it.
+  Richer delivery (webhook / Netdata `aiolos_fan_rpm==0` alarm) is a documented follow-on.
 - **Compensation:** on a confirmed fault, the surviving (non-faulted) fans **in the same zone** are
   commanded 100 % on subsequent ticks (more airflow is always safe); the dead fan keeps its normal
   commanded duty (never 0). This works in both uniform and per-zone mode (in uniform mode the two
@@ -101,7 +105,7 @@ partial application). Bytes 0–7 = FAN1..FAN8; bytes 8–15 are unused tach slo
 anyway). Manual mode without a valid duty drops a fan to its ~10–20% minimum.
 
 ## Modes
-`detect` · `run <board>` · `restore` (one-shot: release all fans to BMC auto and exit; idempotent;
+`detect` · `info [id]` / `collect [id]` · `run <board>` · `restore` (one-shot: release all fans to BMC auto and exit; idempotent;
 called by `aiolos restore`).
 
 ## Fail-safe (critical — whole-system cooling)
@@ -132,7 +136,7 @@ checks above:
   to auto on this alone (an in-progress edit must never blip the chassis fans). Release-to-auto is
   reserved for an indeterminable temperature or a persistent duty-set failure (above).
 
-## Config — `/opt/aiolos/etc/asrock16-2t.curve.json`
+## Config — `/opt/aiolos/etc/rome2d-fans.curve.json`
 Driving °C → fan %, linear-interpolated, clamped, hold-outside, plus a `sensitivity` key (the live
 EMA α, not a curve point):
 ```json
@@ -146,11 +150,11 @@ keep the chassis fans needlessly high. GPU heat still drives the fans up via the
 tick.
 
 ### Optional per-zone curves (SOW-0010) — back-compatible
-The single `asrock16-2t.curve.json` above is the **uniform / fallback** curve and the shipped
+The single `rome2d-fans.curve.json` above is the **uniform / fallback** curve and the shipped
 default. To split the board into the CPU-cooler and case-fan zones, drop **both** of these next to
 it (each a normal curve file with its own optional `sensitivity`):
-- `asrock16-2t.cpu.curve.json` — drives FAN1/FAN2 (Noctua CPU coolers) from CPU temp.
-- `asrock16-2t.case.curve.json` — drives FAN3..FAN8 (case fans) from `max(all routed inputs)`.
+- `rome2d-fans.cpu.curve.json` — drives FAN1/FAN2 (Noctua CPU coolers) from CPU temp.
+- `rome2d-fans.case.curve.json` — drives FAN3..FAN8 (case fans) from `max(all routed inputs)`.
 
 Zone mode activates only when BOTH load a non-empty curve; otherwise the uniform curve drives all 8
 fans. The decision is live (re-read each tick), so adding/removing the files toggles zoning without a
@@ -171,18 +175,19 @@ asserts, and the two ioctl numbers are asserted against the values above. CPU te
 ## Acceptance criteria
 - `detect` → one board ID.
 - Receives GPU + NVMe temps via `inputs` (attributed by `module:id`); computes the driving max with
-  its own CPU sensors; reports distinct `temp/GPU` and `temp/NVMe` readings.
+  its own CPU sensors; does **not** re-publish GPU/NVMe components.
 - Sets all fans via the verified all-manual + non-zero sequence; `0xda` readback matches.
-- Each fan reading carries `pwm` (from the `0xda` readback) and, when the tach is readable, `rpm`
-  (matching `ipmitool sdr type Fan`); an unreadable sensor omits `rpm` and never fails the tick.
+- The board component publishes each fan duty (from the `0xda` readback when available) and, when
+  the tach is readable, RPM (matching `ipmitool sdr type Fan`); an unreadable sensor omits RPM and
+  never fails the tick.
 - shutdown/EOF/SIGTERM each release to BMC auto; verified by `0xda` + observing fans return to auto.
 - A persistent duty-set failure releases to BMC auto (never holds manual-but-frozen).
-- `asrock16-2t restore` releases to BMC auto and is idempotent.
+- `rome2d-fans restore` releases to BMC auto and is idempotent.
 - Never leaves fans claimed-but-undutied (the ~10–20% minimum trap).
 - **Per-zone (SOW-0010):** with both zone curve files present, a CPU-only load raises FAN1/2 without
   over-driving FAN3–8, and GPU/NVMe heat raises FAN3–8 without over-driving FAN1/2; with the files
   absent, behaviour is byte-for-byte the uniform default. If either zone's temp/curve is
   indeterminable, the whole board releases to BMC auto.
 - **Fan-fault (SOW-0008):** a fan commanded ≥ 20 % reading ≈0 RPM for 3 consecutive ticks (past a
-  2-tick spin-up grace) is flagged `"fault":true` + warned, and its surviving zone siblings are
-  boosted to 100 %; an unreadable tach or a lightly-commanded fan never false-positives.
+  2-tick spin-up grace) is flagged `"fault":true` on its sink + warned, and its surviving zone
+  siblings are boosted to 100 %; an unreadable tach or a lightly-commanded fan never false-positives.

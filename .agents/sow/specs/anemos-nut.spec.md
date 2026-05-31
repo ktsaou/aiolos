@@ -1,11 +1,11 @@
 # Spec: `nut` anemos
 
 Status: design (SOW-0009). UPS / utility-power state **sensor** — read-only; controls NO device.
-Conforms to `aiolos-protocol.spec.md`. Its readings are routed (`input=nut`) into a power reactor
+Conforms to `aiolos-protocol.spec.md`. Its components are routed (`input=nut`) into a power reactor
 (e.g. `nvidia-powercap`) so a utility-power event triggers a declared action.
 
 ## Purpose
-Report each monitored UPS's utility-power state for routing, as a new reading type **`power-state`**.
+Report each monitored UPS's utility-power state for routing, as a `power` component.
 One `run` instance per UPS, bound by the NUT **id** (the upsc name, or `name@host[:port]` for a
 remote upsd). This is a **sensor-only** anemos: it has no curve, sets nothing, and its fail-safe is
 a no-op (there is nothing to hand back to firmware).
@@ -27,17 +27,21 @@ level-1 `nut` tech crate (`upsc -l` to list, `upsc <id>` to read + parse).
 ## detect
 - Determine the UPS set: the operator config `nut.conf` list if it yields any id, else auto-discover
   via `upsc -l` (the local upsd). Emit one `found` per id:
-  `{"id":"<ups-id>","type":"UPS","name":"<ups-id>"}`.
+  `{"id":"<ups-id>","type":"UPS","name":"<ups-id>","components":[...]}` with one `ups` component
+  schema containing power-state publishers.
 - Empty `found` is a real result (no UPS configured/discovered). Re-`detect` reflects the current
   set.
 
 ## run <id>
-- Each tick: `upsc <id>`, parse the variables, and report ONE `power-state` reading:
+- Each tick: `upsc <id>`, parse the variables, and report one `ups` component:
   ```json
-  {"status":"ok","readings":[
-    {"type":"power-state","label":"pr3000-nova",
-     "status":"OL","online":true,"on_battery":false,"low_battery":false,
-     "charge":100,"runtime_s":697,"load_pct":36,"input_voltage":219.0,"model":"PR3000ERT2U"}]}
+  {"status":"ok","components":[{
+    "id":"ups","label":"UPS","class":"power",
+    "publishers":[
+      {"id":"status","label":"UPS status","kind":"power-status","value":"OL"},
+      {"id":"online","label":"Online","kind":"power-online","value":true},
+      {"id":"on_battery","label":"On battery","kind":"power-on-battery","value":false},
+      {"id":"runtime","label":"Runtime","kind":"power-runtime","value":697,"unit":"s"}]}]}
   ```
   - `status` = `ups.status` verbatim (space-separated NUT flags, e.g. `OL`, `OB`, `OB LB`, `OL CHRG`).
   - `online`/`on_battery`/`low_battery` = decision-ready booleans derived from the flags. `OB` is
@@ -48,7 +52,7 @@ level-1 `nut` tech crate (`upsc -l` to list, `upsc <id>` to read + parse).
   non-zero) respond `{"status":"error","error":"…"}` (transient; reconciled on the next tick).
 
 ## Modes
-`detect` · `run <id>` · `restore` (one-shot: **no-op** — a sensor controls nothing — exits 0;
+`detect` · `info [id]` / `collect [id]` · `run <id>` · `restore` (one-shot: **no-op** — a sensor controls nothing — exits 0;
 idempotent; still implemented so `aiolos restore` can call it uniformly).
 
 ## Fail-safe
@@ -70,7 +74,7 @@ of aiolos is unaffected.
 
 ## Acceptance criteria
 - `detect` lists one entry per configured/discovered UPS; ids stable across re-detect.
-- `run <id>` reports a `power-state` reading within timeout; an `upsc`/upsd failure → `status:error`
+- `run <id>` reports a `power` component within timeout; an `upsc`/upsd failure → `status:error`
   (never a crash, never silent).
 - The booleans correctly reflect `ups.status` (incl. `OB` winning over `OL` in a transition).
 - `nut restore` exits 0 and is idempotent (no-op).

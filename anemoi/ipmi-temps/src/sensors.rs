@@ -1,6 +1,6 @@
 //! ASRockRack ROME2D16-2T BMC analog temperature sensors over inband IPMI, built on the generic
 //! `ipmi` transport: standard `Get Sensor Reading` (0x04/0x2d) + `Get Sensor Reading Factors`
-//! (0x04/0x23) — the SAME mechanism the asrock fan module uses for tach RPM, here applied to the
+//! (0x04/0x23) — the SAME mechanism the rome2d-fans module uses for tach RPM, here applied to the
 //! board/CPU/DIMM/NIC temperature sensors. This is the board-specific layer (hardcoded sensor table,
 //! like `board.rs::FAN_SENSORS`); the generic IPMI transport lives in the `ipmi` crate.
 //!
@@ -11,7 +11,7 @@ use ipmi::{Ipmi, SensorFactors, SensorReading};
 use std::time::Duration;
 
 /// Short per-call timeout for these read-only observability reads — identical rationale to the
-/// asrock fan module's `OBS_TIMEOUT`: a slow/unresponsive BMC degrades a sensor to "absent" rather
+/// rome2d-fans module's `OBS_TIMEOUT`: a slow/unresponsive BMC degrades a sensor to "absent" rather
 /// than blowing the orchestrator's apply deadline. With ≤ 1 IPMI call per sensor per tick, the
 /// worst case over the full table stays comfortably under the default apply deadline, while a
 /// healthy BMC (single-digit-ms reads) keeps wide headroom.
@@ -21,13 +21,13 @@ const OBS_TIMEOUT: Duration = Duration::from_millis(100);
 struct TempSensor {
     /// IPMI sensor number (`Get Sensor Reading` argument).
     num: u8,
-    /// Stable label reported as the reading's `label` (and consumed by routing).
+    /// Stable label reported as the component's `label` (and consumed by routing).
     label: &'static str,
 }
 
 /// This board's analog temperature sensors (verified numbers from the host inspection / activation
 /// brief). Hardcoded because the module is board-specific by name — exactly like
-/// `board.rs::FAN_SENSORS`. Each is read every tick; only those whose reading is `available` are
+/// `board.rs::FAN_SENSORS`. Each is read every tick; only those whose component is `available` are
 /// reported (unpopulated DIMM slots and absent sensors report "ns"/unavailable and are skipped —
 /// never emitted as a bogus 0). Note `0x2D` is intentionally absent (CARD_SIDE1 is 0x2C, LAN is
 /// 0x2E).
@@ -154,7 +154,7 @@ impl Sensors {
     /// readable. At most **one** IPMI call per sensor per tick: if a sensor's constant conversion
     /// factors aren't cached yet (prefetch failed), fetch them this tick and report no temperature
     /// until the next one — so even a cold cache never does factor+sensor in the same tick. A sensor
-    /// that is unavailable ("ns"), errors, or has no factors yet is skipped (never a bogus reading).
+    /// that is unavailable ("ns"), errors, or has no factors yet is skipped (never a bogus component).
     /// Short-timeout, read-only.
     pub fn read_temps(&mut self) -> Vec<(&'static str, i32)> {
         let mut out = Vec::with_capacity(TEMP_SENSORS.len());
@@ -163,7 +163,7 @@ impl Sensors {
                 Some(f) => temp_celsius(Some(f), self.ipmi.read_sensor(s.num, OBS_TIMEOUT).ok()),
                 None => {
                     // Factors unknown -> fetch them now (one call); the temperature comes next tick.
-                    // The reading byte (0) is immaterial for a linear sensor.
+                    // The component byte (0) is immaterial for a linear sensor.
                     self.factors[i] = self.ipmi.read_sensor_factors(s.num, 0, OBS_TIMEOUT).ok();
                     None
                 }
@@ -176,12 +176,12 @@ impl Sensors {
     }
 }
 
-/// Convert a temperature sensor reading to whole °C, or `None` when the factors are missing, the
+/// Convert a temperature sensor component to whole °C, or `None` when the factors are missing, the
 /// read failed, or the sensor reports its value as unavailable ("ns"). Unlike a fan tach, a
 /// temperature may legitimately be negative, so no non-negativity clamp is applied. Pure
 /// (unit-testable without hardware).
-fn temp_celsius(factors: Option<SensorFactors>, reading: Option<SensorReading>) -> Option<i32> {
-    let (f, r) = (factors?, reading?);
+fn temp_celsius(factors: Option<SensorFactors>, component: Option<SensorReading>) -> Option<i32> {
+    let (f, r) = (factors?, component?);
     if !r.available {
         return None;
     }
@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn temp_celsius_converts_only_a_valid_reading() {
+    fn temp_celsius_converts_only_a_valid_component() {
         // A linear temperature sensor with M=1, B=0, exps=0 -> °C == raw byte.
         let f = SensorFactors {
             m: 1,
@@ -230,7 +230,7 @@ mod tests {
             Some(47)
         );
 
-        // Unavailable ("ns") / missing reading / missing factors -> None (never a bogus temp).
+        // Unavailable ("ns") / missing component / missing factors -> None (never a bogus temp).
         assert_eq!(
             temp_celsius(
                 Some(f),

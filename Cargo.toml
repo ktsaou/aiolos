@@ -9,7 +9,7 @@ members = [
     "tech/nut",        # level-1 tech: NUT/upsc UPS client (read-only)
     "aiolos",          # orchestrator
     "anemoi/nvidia",   # level-3 anemos
-    "anemoi/asrock16-2t",
+    "anemoi/rome2d-fans",
     "anemoi/it87",     # level-3 anemos (consumer-board fans via it87 sysfs PWM)
     "anemoi/nvme",     # level-3 anemos (sensor-only: NVMe temps)
     "anemoi/ipmi-temps", # level-3 anemos (sensor-only: BMC board/CPU/DIMM/NIC temps)

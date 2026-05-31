@@ -8,7 +8,7 @@
 //! ISOLATION under the SOW-0013 decoupled scheduler (a hung, a partial-line-flooding, AND a SLOW
 //! sibling never stall a healthy one that keeps firing at its `every`; the hung/partial ones get
 //! killed at their `timeout` + respawned, the slow one is merely delayed — never skipped — and
-//! never killed), `input=` routing (most-recent completed readings), and detect-set hotplug.
+//! never killed), `input=` routing (most-recent completed components), and detect-set hotplug.
 
 use std::fs;
 use std::path::PathBuf;
@@ -261,7 +261,7 @@ fn slow_sibling_is_delayed_not_skipped_and_never_killed() {
 }
 
 #[test]
-fn input_routing_delivers_peer_readings() {
+fn input_routing_delivers_peer_components() {
     let mut h = Harness::start(
         &["sensor", "consumer input=sensor"],
         &[("MOCK_SENSOR_TEMP", "63")],
@@ -283,7 +283,7 @@ fn input_routing_delivers_peer_readings() {
 
 #[test]
 fn multi_input_routing_merges_sources() {
-    // A consumer wired to TWO producers (`input=a input=b`) must receive BOTH peers' readings and
+    // A consumer wired to TWO producers (`input=a input=b`) must receive BOTH peers' components and
     // see the max across them. Exercises multi-source routing + the `module:id` input keying.
     let mut h = Harness::start(
         &["a", "b", "consumer input=a input=b"],

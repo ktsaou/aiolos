@@ -1,14 +1,14 @@
-//! Reduce routed `power-state` readings (from `input=nut`) to one aggregate [`PowerSignal`].
+//! Reduce routed power-state publishers (from `input=nut`) to one aggregate [`PowerSignal`].
 //!
-//! aiolos relays each source instance's full readings array keyed by `module:id`. We scan ALL routed
-//! inputs for `type:"power-state"` records (source-agnostic — any UPS sensor, not just `nut`), and
+//! aiolos relays each source instance's full component report keyed by `module:id`. We scan ALL routed
+//! inputs for power-state publishers (source-agnostic — any UPS sensor, not just `nut`), and
 //! fold them into the worst-case signal: on battery if ANY UPS is, low-battery if ANY raised LB, and
 //! the SMALLEST runtime among the on-battery UPSes (the binding constraint for the cap trigger).
 
 use crate::policy::PowerSignal;
-use anemos::{Inputs, Reading};
+use anemos::{Component, Inputs};
 
-/// Fold all routed `power-state` readings into the aggregate signal. Absent/empty inputs -> a
+/// Fold all routed power-state publishers into the aggregate signal. Absent/empty inputs -> a
 /// default (not-on-battery) signal, which the policy reads as "AC present -> lift" (the safe
 /// direction: no power-state input must never cause a spurious cap).
 pub fn power_signal(inputs: Option<&Inputs>) -> PowerSignal {
@@ -16,29 +16,26 @@ pub fn power_signal(inputs: Option<&Inputs>) -> PowerSignal {
     let Some(inputs) = inputs else {
         return sig;
     };
-    for readings in inputs.values() {
-        fold_readings(readings, &mut sig);
+    for components in inputs.values() {
+        fold_components(components, &mut sig);
     }
     sig
 }
 
-/// Fold one peer instance's readings into `sig` (only `type:"power-state"` records are considered).
-fn fold_readings(readings: &[Reading], sig: &mut PowerSignal) {
-    for r in readings {
-        if r.kind != "power-state" {
-            continue;
-        }
-        let on_batt = bool_field(r, "on_battery");
+/// Fold one peer instance's components into `sig`.
+fn fold_components(components: &[Component], sig: &mut PowerSignal) {
+    for c in components {
+        let on_batt = bool_publisher(c, "on_battery", "power-on-battery");
         if on_batt {
             sig.on_battery = true;
         }
-        if bool_field(r, "low_battery") {
+        if bool_publisher(c, "low_battery", "power-low-battery") {
             sig.low_battery = true;
         }
         // Only on-battery UPSes constrain the runtime (a UPS on mains reports its full battery
         // runtime, which is irrelevant to the cap trigger and would mask a draining one).
         if on_batt {
-            if let Some(rt) = r.get_i64("runtime_s") {
+            if let Some(rt) = i64_publisher(c, "runtime", "power-runtime") {
                 sig.min_runtime_s = Some(match sig.min_runtime_s {
                     Some(cur) => cur.min(rt),
                     None => rt,
@@ -48,9 +45,20 @@ fn fold_readings(readings: &[Reading], sig: &mut PowerSignal) {
     }
 }
 
-/// Read a JSON boolean field, defaulting to `false` if absent or not a bool.
-fn bool_field(r: &Reading, key: &str) -> bool {
-    r.fields.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+fn bool_publisher(c: &Component, id: &str, kind: &str) -> bool {
+    c.publishers
+        .iter()
+        .find(|p| p.id == id || p.kind == kind)
+        .and_then(|p| p.value.as_ref())
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn i64_publisher(c: &Component, id: &str, kind: &str) -> Option<i64> {
+    c.publishers
+        .iter()
+        .find(|p| p.id == id || p.kind == kind)
+        .and_then(|p| p.value_i64())
 }
 
 #[cfg(test)]
@@ -59,14 +67,19 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
-    fn ps(label: &str, on_battery: bool, low_battery: bool, runtime: Option<i64>) -> Reading {
-        let mut f = serde_json::Map::new();
-        f.insert("on_battery".into(), json!(on_battery));
-        f.insert("low_battery".into(), json!(low_battery));
+    fn ps(label: &str, on_battery: bool, low_battery: bool, runtime: Option<i64>) -> Component {
+        let mut publishers = vec![
+            anemos::Publisher::new("on_battery", "On battery", "power-on-battery")
+                .value(json!(on_battery)),
+            anemos::Publisher::new("low_battery", "Low battery", "power-low-battery")
+                .value(json!(low_battery)),
+        ];
         if let Some(rt) = runtime {
-            f.insert("runtime_s".into(), json!(rt));
+            publishers.push(
+                anemos::Publisher::new("runtime", "Runtime", "power-runtime").value(json!(rt)),
+            );
         }
-        Reading::new("power-state", label, serde_json::Value::Object(f))
+        Component::new("ups", label, "power").with_publishers(publishers)
     }
 
     #[test]
@@ -108,16 +121,18 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_power_state_readings() {
+    fn ignores_non_power_state_components() {
         let mut inputs: Inputs = HashMap::new();
         inputs.insert(
             "nvidia:GPU-1".into(),
-            vec![Reading::new("temp", "GPU", json!({"temp": 63}))],
+            vec![Component::new("gpu", "GPU", "gpu").with_publishers(vec![
+                anemos::Publisher::new("temp", "Temperature", "temperature").value(json!(63)),
+            ])],
         );
         let s = power_signal(Some(&inputs));
         assert!(
             !s.on_battery,
-            "a temp reading must not look like a power event"
+            "a temp component must not look like a power event"
         );
     }
 

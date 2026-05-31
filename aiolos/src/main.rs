@@ -13,7 +13,7 @@ mod status_page;
 use anyhow::Result;
 use config::Config;
 use instance::{InstanceCmd, TickReport, TickStatus};
-use protocol::{Inputs, Reading};
+use protocol::{Component, Inputs};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -365,7 +365,7 @@ fn reap_results(
         return;
     }
 
-    // Log each result (outside the write lock) so the journal shows readings the parent received.
+    // Log each result (outside the write lock) so the journal shows components the parent received.
     for r in &reports {
         info!(
             wake = wake_count,
@@ -373,7 +373,7 @@ fn reap_results(
             status = r.result.status.as_str(),
             latency_ms = r.latency.as_millis() as u64,
             error = r.result.error.as_deref().unwrap_or(""),
-            readings = %summarize_readings(&r.result.readings),
+            components = %summarize_components(&r.result.components),
             "apply result",
         );
     }
@@ -386,10 +386,10 @@ fn reap_results(
 
 /// Fold async `apply` results into shared state. A report is applied ONLY if the instance currently
 /// holding its key exists AND is at the report's `generation` (`restart_count`). This discards both
-/// a result for an already-removed instance (re-inserting its readings would orphan a stale
+/// a result for an already-removed instance (re-inserting its components would orphan a stale
 /// blackboard entry that nothing prunes again — routed to consumers forever) AND a slow predecessor's
 /// late result after a same-key respawn (which would otherwise corrupt the new instance and wrongly
-/// clear its legitimately-busy slot). For the owning instance, this updates status/readings/latency
+/// clear its legitimately-busy slot). For the owning instance, this updates status/components/latency
 /// + blackboard and clears its `busy` flag (idle again) so the scheduler can re-dispatch when due.
 fn apply_results(s: &mut AppState, reports: Vec<TickReport>) {
     for r in reports {
@@ -419,18 +419,18 @@ fn apply_results(s: &mut AppState, reports: Vec<TickReport>) {
             e.last_error = result.error;
             e.last_seen = Instant::now();
             if is_ok {
-                e.last_readings = result.readings.clone();
+                e.last_components = result.components.clone();
             }
-            if is_ok && !result.readings.is_empty() {
-                s.blackboard.insert(key, result.readings);
+            if is_ok && !result.components.is_empty() {
+                s.blackboard.insert(key, result.components);
             }
         }
     }
 }
 
 /// For each instance, if its module has `input=<peer...>`, gather every named peer's instances'
-/// last readings from the blackboard into this module's `apply.inputs`. Keyed by the full
-/// `module:id` blackboard key (not the bare peer id) so the consumer can attribute each reading to
+/// last components from the blackboard into this module's `apply.inputs`. Keyed by the full
+/// `module:id` blackboard key (not the bare peer id) so the consumer can attribute each component to
 /// its SOURCE MODULE (e.g. tell GPU temps from NVMe temps) and so keys never collide across
 /// sources. Uninterpreted, one heartbeat stale.
 fn build_inputs(
@@ -449,12 +449,12 @@ fn build_inputs(
         let mut m: Inputs = HashMap::new();
         for src in sources {
             let prefix = format!("{src}:");
-            for (bkey, readings) in &state.blackboard {
+            for (bkey, components) in &state.blackboard {
                 // The `:` delimiter prevents typical prefix collisions (source "nv" does not match
                 // "nvme:..."); module names are constrained not to contain `:`. Insert under the
                 // full `module:id` key.
-                if bkey.starts_with(&prefix) && !readings.is_empty() {
-                    m.insert(bkey.clone(), readings.clone());
+                if bkey.starts_with(&prefix) && !components.is_empty() {
+                    m.insert(bkey.clone(), components.clone());
                 }
             }
         }
@@ -463,15 +463,16 @@ fn build_inputs(
     out
 }
 
-/// Compact one-line summary of routed inputs (peer id → its temp readings) for the journal.
+/// Compact one-line summary of routed inputs (peer id → its temp components) for the journal.
 fn summarize_inputs(inputs: &Inputs) -> String {
     inputs
         .iter()
-        .map(|(id, readings)| {
-            let temps: Vec<String> = readings
+        .map(|(id, components)| {
+            let temps: Vec<String> = components
                 .iter()
-                .filter(|r| r.kind == "temp")
-                .filter_map(|r| r.get_i64("temp"))
+                .flat_map(|c| c.publishers.iter())
+                .filter(|p| p.kind == "temperature")
+                .filter_map(|p| p.value_i64())
                 .map(|t| t.to_string())
                 .collect();
             format!("{id}:temp={}", temps.join("/"))
@@ -480,13 +481,47 @@ fn summarize_inputs(inputs: &Inputs) -> String {
         .join(" ")
 }
 
-/// Compact one-line summary of a readings list (every kind/label + its numeric fields).
-fn summarize_readings(readings: &[Reading]) -> String {
-    readings
+/// Compact one-line summary of a components list (every kind/label + its numeric fields).
+fn summarize_components(components: &[Component]) -> String {
+    components
         .iter()
-        .map(|r| {
-            let fields: Vec<String> = r.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            format!("{}/{}[{}]", r.kind, r.label, fields.join(","))
+        .map(|c| {
+            let pubs: Vec<String> = c
+                .publishers
+                .iter()
+                .map(|p| {
+                    let v = p
+                        .value
+                        .as_ref()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    format!("{}/{}={}", p.kind, p.id, v)
+                })
+                .collect();
+            let sinks: Vec<String> = c
+                .sinks
+                .iter()
+                .map(|s| {
+                    let v = s
+                        .value
+                        .as_ref()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    format!("sink:{}/{}={}", s.kind, s.id, v)
+                })
+                .collect();
+            format!(
+                "{}/{}[{}{}{}]",
+                c.class,
+                c.id,
+                pubs.join(","),
+                if pubs.is_empty() || sinks.is_empty() {
+                    ""
+                } else {
+                    ","
+                },
+                sinks.join(",")
+            )
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -530,8 +565,8 @@ fn graceful_shutdown(state: &Arc<RwLock<AppState>>, max_apply_timeout: Duration)
 pub struct AppState {
     pub tick_count: u64,
     pub instances: HashMap<String, InstanceEntry>,
-    /// Last good readings per instance key (`module:id`); pruned when an instance is removed.
-    pub blackboard: HashMap<String, Vec<Reading>>,
+    /// Last good components per instance key (`module:id`); pruned when an instance is removed.
+    pub blackboard: HashMap<String, Vec<Component>>,
     /// Per-module detect health (status + last declared error), for the status page.
     pub modules: HashMap<String, ModuleHealth>,
     /// Per-instance scheduler state (SOW-0013): busy/idle, last dispatch, last apply latency, and
@@ -567,7 +602,7 @@ pub struct InstanceEntry {
     pub name: String,
     pub last_status: String,
     pub last_error: Option<String>,
-    pub last_readings: Vec<Reading>,
+    pub last_components: Vec<Component>,
     pub restart_count: u32,
     /// Wall-clock of this instance's last reported result (initialised to spawn time). Drives the
     /// cadence-independent `seconds_since_seen` staleness metric — SOW-0013 turned the tick into a
@@ -603,12 +638,22 @@ extern "C" fn handle_signal(_sig: i32) {
 mod tests {
     use super::*;
     use instance::TickResult;
+    use protocol::Publisher;
+    use serde_json::json;
+
+    fn temp_component(label: &str, temp: i64, class: &str) -> Component {
+        Component::new(label.to_ascii_lowercase(), label, class).with_publishers(vec![
+            Publisher::new("temp", "Temperature", "temperature")
+                .value(json!(temp))
+                .unit("C"),
+        ])
+    }
 
     fn report(
         key: &str,
         generation: u32,
         status: TickStatus,
-        readings: Vec<Reading>,
+        components: Vec<Component>,
     ) -> TickReport {
         TickReport {
             key: key.to_string(),
@@ -616,7 +661,7 @@ mod tests {
             result: TickResult {
                 status,
                 error: None,
-                readings,
+                components,
             },
             latency: Duration::from_millis(7),
         }
@@ -626,9 +671,6 @@ mod tests {
     fn apply_results_does_not_resurrect_a_removed_instances_blackboard_entry() {
         // Race guard: a result arriving for an instance the supervisor already removed must NOT
         // re-create a blackboard entry (which nothing would prune again -> stale routed forever).
-        use protocol::Reading;
-        use serde_json::json;
-
         let mut s = AppState::default();
         // One live instance "mod:a"; "mod:ghost" is intentionally absent (already removed).
         let (tx, _rx) = mpsc::channel();
@@ -640,7 +682,7 @@ mod tests {
                 name: "a".into(),
                 last_status: "starting".into(),
                 last_error: None,
-                last_readings: Vec::new(),
+                last_components: Vec::new(),
                 restart_count: 0,
                 last_seen: Instant::now(),
                 cmd_tx: tx,
@@ -648,7 +690,7 @@ mod tests {
             },
         );
 
-        let mk = |t: i64| vec![Reading::new("temp", "GPU", json!({ "temp": t }))];
+        let mk = |t: i64| vec![temp_component("GPU", t, "gpu")];
         apply_results(
             &mut s,
             vec![
@@ -659,7 +701,7 @@ mod tests {
 
         assert!(
             s.blackboard.contains_key("mod:a"),
-            "a live instance's readings must be stored"
+            "a live instance's components must be stored"
         );
         assert!(
             !s.blackboard.contains_key("mod:ghost"),
@@ -681,7 +723,7 @@ mod tests {
                 name: "a".into(),
                 last_status: "starting".into(),
                 last_error: None,
-                last_readings: Vec::new(),
+                last_components: Vec::new(),
                 restart_count: 0,
                 last_seen: Instant::now(),
                 cmd_tx: tx,
@@ -706,9 +748,7 @@ mod tests {
     #[test]
     fn apply_results_discards_a_stale_generation_report() {
         // A slow predecessor's late result (generation 0) must NOT touch the respawned instance
-        // (generation 1): no readings stored, and its legitimately-busy slot stays busy.
-        use protocol::Reading;
-        use serde_json::json;
+        // (generation 1): no components stored, and its legitimately-busy slot stays busy.
         let mut s = AppState::default();
         let (tx, _rx) = mpsc::channel();
         s.instances.insert(
@@ -719,7 +759,7 @@ mod tests {
                 name: "a".into(),
                 last_status: "starting".into(),
                 last_error: None,
-                last_readings: Vec::new(),
+                last_components: Vec::new(),
                 restart_count: 1, // respawned -> generation 1
                 last_seen: Instant::now(),
                 cmd_tx: tx,
@@ -742,7 +782,7 @@ mod tests {
                 "mod:a",
                 0,
                 TickStatus::Ok,
-                vec![Reading::new("temp", "GPU", json!({"temp": 50}))],
+                vec![temp_component("GPU", 50, "gpu")],
             )],
         );
         assert!(
@@ -751,7 +791,7 @@ mod tests {
         );
         assert!(
             !s.blackboard.contains_key("mod:a"),
-            "a stale-generation report must NOT store readings for the respawned instance"
+            "a stale-generation report must NOT store components for the respawned instance"
         );
     }
 
@@ -788,22 +828,19 @@ mod tests {
     #[test]
     fn build_inputs_merges_multiple_sources_keyed_by_module_id() {
         // Multi-input routing: a consumer wired `input=nvidia input=nvme` must receive BOTH
-        // sources' readings, keyed by the full `module:id` (so it can attribute source), and must
-        // NOT receive an unrelated module's readings.
-        use protocol::Reading;
-        use serde_json::json;
-
+        // sources' components, keyed by the full `module:id` (so it can attribute source), and must
+        // NOT receive an unrelated module's components.
         let mut s = AppState::default();
         let (tx, _rx) = mpsc::channel();
         s.instances.insert(
-            "asrock16-2t:board".to_string(),
+            "rome2d-fans:board".to_string(),
             InstanceEntry {
-                module_name: "asrock16-2t".into(),
+                module_name: "rome2d-fans".into(),
                 id: "board".into(),
                 name: "board".into(),
                 last_status: "ok".into(),
                 last_error: None,
-                last_readings: Vec::new(),
+                last_components: Vec::new(),
                 restart_count: 0,
                 last_seen: Instant::now(),
                 cmd_tx: tx,
@@ -812,28 +849,26 @@ mod tests {
         );
         s.blackboard.insert(
             "nvidia:GPU-1".into(),
-            vec![Reading::new("temp", "GPU", json!({"temp": 63}))],
+            vec![temp_component("GPU", 63, "gpu")],
         );
         s.blackboard.insert(
             "nvme:SER-A".into(),
-            vec![Reading::new("temp", "Composite", json!({"temp": 40}))],
+            vec![temp_component("Composite", 40, "ssd")],
         );
         s.blackboard.insert(
             "nvme:SER-B".into(),
-            vec![Reading::new("temp", "Composite", json!({"temp": 44}))],
+            vec![temp_component("Composite", 44, "ssd")],
         );
-        // Unrelated module — must NOT be routed to asrock.
-        s.blackboard.insert(
-            "other:x".into(),
-            vec![Reading::new("temp", "x", json!({"temp": 99}))],
-        );
+        // Unrelated module — must NOT be routed to the board-fan module.
+        s.blackboard
+            .insert("other:x".into(), vec![temp_component("x", 99, "mock")]);
 
         let mut input_map: HashMap<String, Vec<String>> = HashMap::new();
-        input_map.insert("asrock16-2t".into(), vec!["nvidia".into(), "nvme".into()]);
+        input_map.insert("rome2d-fans".into(), vec!["nvidia".into(), "nvme".into()]);
 
         let out = build_inputs(&s, &input_map);
         let inputs = out
-            .get("asrock16-2t:board")
+            .get("rome2d-fans:board")
             .expect("consumer present")
             .as_ref()
             .expect("inputs routed");
@@ -848,23 +883,20 @@ mod tests {
     }
 
     #[test]
-    fn build_inputs_none_when_no_source_readings_and_skips_empty() {
-        use protocol::Reading;
-        use serde_json::json;
-
+    fn build_inputs_none_when_no_source_components_and_skips_empty() {
         // A consumer instance wired to `sources`, with an empty blackboard to start.
         fn consumer(sources: Vec<String>) -> (AppState, HashMap<String, Vec<String>>) {
             let mut s = AppState::default();
             let (tx, _rx) = mpsc::channel();
             s.instances.insert(
-                "asrock16-2t:board".to_string(),
+                "rome2d-fans:board".to_string(),
                 InstanceEntry {
-                    module_name: "asrock16-2t".into(),
+                    module_name: "rome2d-fans".into(),
                     id: "board".into(),
                     name: "board".into(),
                     last_status: "ok".into(),
                     last_error: None,
-                    last_readings: Vec::new(),
+                    last_components: Vec::new(),
                     restart_count: 0,
                     last_seen: Instant::now(),
                     cmd_tx: tx,
@@ -872,31 +904,31 @@ mod tests {
                 },
             );
             let mut map = HashMap::new();
-            map.insert("asrock16-2t".to_string(), sources);
+            map.insert("rome2d-fans".to_string(), sources);
             (s, map)
         }
 
         // (a) sources wired but blackboard empty -> None (the `inputs` key is omitted, not `{}`).
         let (s, map) = consumer(vec!["nvidia".into(), "nvme".into()]);
-        assert!(build_inputs(&s, &map)["asrock16-2t:board"].is_none());
+        assert!(build_inputs(&s, &map)["rome2d-fans:board"].is_none());
 
-        // (b) two sources, only one has readings -> only the present source is routed.
+        // (b) two sources, only one has components -> only the present source is routed.
         let (mut s, map) = consumer(vec!["nvidia".into(), "nvme".into()]);
         s.blackboard.insert(
             "nvidia:GPU-1".into(),
-            vec![Reading::new("temp", "GPU", json!({"temp": 70}))],
+            vec![temp_component("GPU", 70, "gpu")],
         );
         let got = build_inputs(&s, &map);
-        let inputs = got["asrock16-2t:board"]
+        let inputs = got["rome2d-fans:board"]
             .as_ref()
             .expect("the present source must route");
         assert_eq!(inputs.len(), 1);
         assert!(inputs.contains_key("nvidia:GPU-1"));
 
-        // (c) a source instance with an EMPTY readings list is skipped (never routed as empty).
+        // (c) a source instance with an EMPTY components list is skipped (never routed as empty).
         let (mut s, map) = consumer(vec!["nvme".into()]);
         s.blackboard.insert("nvme:SER-A".into(), Vec::new());
-        assert!(build_inputs(&s, &map)["asrock16-2t:board"].is_none());
+        assert!(build_inputs(&s, &map)["rome2d-fans:board"].is_none());
     }
 
     #[test]

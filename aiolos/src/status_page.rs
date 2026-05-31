@@ -4,7 +4,7 @@
 //!   `GET /`             -> the themed single-page dashboard shell (HTML)
 //!   `GET /aiolos.css`   -> embedded stylesheet
 //!   `GET /aiolos.js`    -> embedded vanilla-JS app (tabs, charts, animated winds)
-//!   `GET /status.json`  -> live snapshot (modules + instances + readings)
+//!   `GET /status.json`  -> live snapshot (modules + instances + components)
 //!   `GET /history.json` -> bounded in-process time-series ring buffer
 //!   `GET /curve.json?module=<m>` -> a module's temp->duty curve (read from its etc config)
 //!   `GET /metrics`      -> Prometheus text-format exposition (SOW-0007)
@@ -19,7 +19,7 @@
 
 use crate::AppState;
 use anyhow::Result;
-use protocol::Reading;
+use protocol::{Component, Publisher, Sink};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -213,7 +213,7 @@ struct InstanceJson<'a> {
     error: Option<&'a str>,
     restart_count: u32,
     seconds_since_seen: u64,
-    readings: &'a [Reading],
+    components: &'a [Component],
     stderr_tail: Vec<String>,
 }
 
@@ -246,7 +246,7 @@ fn render_json(state: &Arc<RwLock<AppState>>) -> String {
             seconds_since_seen: i.last_seen.elapsed().as_secs(),
             // Defensive ANSI strip: stale tails captured before the SDK's `.with_ansi(false)` fix
             // could still carry escape codes; never let them reach the UI.
-            readings: &i.last_readings,
+            components: &i.last_components,
             stderr_tail: tail_lines(i, 12).iter().map(|l| strip_ansi(l)).collect(),
         })
         .collect();
@@ -269,7 +269,7 @@ fn render_json(state: &Arc<RwLock<AppState>>) -> String {
 struct HistInstance {
     key: String,
     module: String,
-    /// max temp this instance reported (driving temp preferred if present, else max `temp` reading).
+    /// max temp this instance reported (driving temp preferred if present, else max `temp` component).
     #[serde(skip_serializing_if = "Option::is_none")]
     temp: Option<f64>,
     /// commanded/observed max fan duty % across this instance's fans (or the driving `pct`).
@@ -324,7 +324,7 @@ fn spawn_snapshotter(state: Arc<RwLock<AppState>>, history: Arc<Mutex<History>>)
                 .instances
                 .values()
                 .map(|i| {
-                    let agg = aggregate_readings(&i.last_readings);
+                    let agg = aggregate_components(&i.last_components);
                     HistInstance {
                         key: format!("{}:{}", i.module_name, i.id),
                         module: i.module_name.clone(),
@@ -354,36 +354,49 @@ struct Agg {
     rpm: Option<f64>,
 }
 
-/// Reduce a reading list to the headline series: representative temp (driving smoothed temp if the
-/// instance reports a `driving` reading, else the max `temp` reading), max fan duty (driving `pct`
-/// if present, else max fan `pwm`), and max fan `rpm`.
-fn aggregate_readings(readings: &[Reading]) -> Agg {
+/// Reduce a component list to the headline series: representative temp (driving smoothed temp if the
+/// instance publishes one, else the max temperature publisher), max fan duty (driving duty or sink
+/// value), and max fan RPM.
+fn aggregate_components(components: &[Component]) -> Agg {
     let mut max_temp: Option<f64> = None;
     let mut driving_temp: Option<f64> = None;
     let mut driving_pct: Option<f64> = None;
     let mut max_pwm: Option<f64> = None;
     let mut max_rpm: Option<f64> = None;
 
-    for r in readings {
-        match r.kind.as_str() {
-            "temp" => {
-                if let Some(t) = num(r, "temp") {
-                    max_temp = Some(max_temp.map_or(t, |m: f64| m.max(t)));
+    for c in components {
+        for p in &c.publishers {
+            match p.kind.as_str() {
+                "temperature" => {
+                    if let Some(t) = pnum(p) {
+                        max_temp = Some(max_temp.map_or(t, |m: f64| m.max(t)));
+                    }
+                }
+                "driving-temperature" => {
+                    driving_temp = pnum(p).or(driving_temp);
+                }
+                "driving-duty" => {
+                    driving_pct = pnum(p).or(driving_pct);
+                }
+                "fan-duty" => {
+                    if let Some(pct) = pnum(p) {
+                        max_pwm = Some(max_pwm.map_or(pct, |m: f64| m.max(pct)));
+                    }
+                }
+                "fan-rpm" => {
+                    if let Some(rp) = pnum(p) {
+                        max_rpm = Some(max_rpm.map_or(rp, |m: f64| m.max(rp)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for s in &c.sinks {
+            if s.kind == "fan-duty" {
+                if let Some(pct) = snum(s) {
+                    max_pwm = Some(max_pwm.map_or(pct, |m: f64| m.max(pct)));
                 }
             }
-            "driving" => {
-                driving_temp = num(r, "temp").or(driving_temp);
-                driving_pct = num(r, "pct").or(driving_pct);
-            }
-            "fan" => {
-                if let Some(p) = num(r, "pwm") {
-                    max_pwm = Some(max_pwm.map_or(p, |m: f64| m.max(p)));
-                }
-                if let Some(rp) = num(r, "rpm") {
-                    max_rpm = Some(max_rpm.map_or(rp, |m: f64| m.max(rp)));
-                }
-            }
-            _ => {}
         }
     }
     Agg {
@@ -484,7 +497,7 @@ fn curve_path(module: &str) -> String {
 // Prometheus exposition (/metrics) — SOW-0007
 // ---------------------------------------------------------------------------
 
-/// Render the live readings as Prometheus text-format (version 0.0.4). Hand-rolled, no deps.
+/// Render the live components as Prometheus text-format (version 0.0.4). Hand-rolled, no deps.
 fn render_metrics(state: &Arc<RwLock<AppState>>) -> String {
     let s = match state.read() {
         Ok(s) => s,
@@ -534,88 +547,114 @@ fn render_metrics(state: &Arc<RwLock<AppState>>) -> String {
             i.last_seen.elapsed().as_secs()
         ));
 
-        // Disambiguate duplicate (kind,label) within an instance (e.g. two "CPU" sockets) by
-        // suffixing _2, _3, … to the label value so each series stays unique.
-        let mut seen: std::collections::HashMap<(&str, String), u32> =
-            std::collections::HashMap::new();
-        for r in &i.last_readings {
-            let mut label = r.label.clone();
-            let count = seen.entry((r.kind.as_str(), r.label.clone())).or_insert(0);
-            *count += 1;
-            if *count > 1 {
-                label = format!("{label}_{count}");
+        for c in &i.last_components {
+            let cbase = format!(
+                "{base},component={},component_class={}",
+                json_str(&c.id),
+                json_str(&c.class)
+            );
+            for p in &c.publishers {
+                let full = format!(
+                    "{cbase},publisher={},label={}",
+                    json_str(&p.id),
+                    json_str(&p.label)
+                );
+                match p.kind.as_str() {
+                    "temperature" => {
+                        if let Some(t) = pnum(p) {
+                            m.temp
+                                .push(format!("aiolos_temp_celsius{{{full}}} {}", fmt_num(t)));
+                        }
+                    }
+                    "fan-duty" => {
+                        if let Some(v) = pnum(p) {
+                            m.duty
+                                .push(format!("aiolos_fan_duty_percent{{{full}}} {}", fmt_num(v)));
+                        }
+                    }
+                    "fan-rpm" => {
+                        if let Some(v) = pnum(p) {
+                            m.rpm
+                                .push(format!("aiolos_fan_rpm{{{full}}} {}", fmt_num(v)));
+                        }
+                    }
+                    "driving-temperature" => {
+                        if let Some(v) = pnum(p) {
+                            m.driving
+                                .push(format!("aiolos_driving_celsius{{{full}}} {}", fmt_num(v)));
+                        }
+                    }
+                    "driving-raw-temperature" => {
+                        if let Some(v) = pnum(p) {
+                            m.driving_raw.push(format!(
+                                "aiolos_driving_raw_celsius{{{full}}} {}",
+                                fmt_num(v)
+                            ));
+                        }
+                    }
+                    "driving-duty" => {
+                        if let Some(v) = pnum(p) {
+                            m.driving_duty.push(format!(
+                                "aiolos_driving_duty_percent{{{full}}} {}",
+                                fmt_num(v)
+                            ));
+                        }
+                    }
+                    "powercap-capped" => {
+                        if let Some(v) = pbool(p).or_else(|| pnum(p)) {
+                            m.pc_capped
+                                .push(format!("aiolos_powercap_capped{{{full}}} {}", fmt_num(v)));
+                        }
+                    }
+                    "power-limit" => {
+                        if let Some(v) = pnum(p) {
+                            m.pc_limit
+                                .push(format!("aiolos_powercap_limit_mw{{{full}}} {}", fmt_num(v)));
+                        }
+                    }
+                    "power-draw" => {
+                        if let Some(v) = pnum(p) {
+                            m.pc_draw
+                                .push(format!("aiolos_powercap_draw_mw{{{full}}} {}", fmt_num(v)));
+                        }
+                    }
+                    "power-on-battery" => {
+                        if let Some(v) = pbool(p).or_else(|| pnum(p)) {
+                            m.ps_on_battery
+                                .push(format!("aiolos_power_on_battery{{{full}}} {}", fmt_num(v)));
+                        }
+                    }
+                    "power-runtime" => {
+                        if let Some(v) = pnum(p) {
+                            m.ps_runtime.push(format!(
+                                "aiolos_power_runtime_seconds{{{full}}} {}",
+                                fmt_num(v)
+                            ));
+                        }
+                    }
+                    "power-charge" => {
+                        if let Some(v) = pnum(p) {
+                            m.ps_charge.push(format!(
+                                "aiolos_power_charge_percent{{{full}}} {}",
+                                fmt_num(v)
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
             }
-            let full = format!("{base},label={}", json_str(&label));
-            match r.kind.as_str() {
-                "temp" => {
-                    if let Some(t) = num(r, "temp") {
-                        m.temp
-                            .push(format!("aiolos_temp_celsius{{{full}}} {}", fmt_num(t)));
-                    }
-                }
-                "fan" => {
-                    if let Some(p) = num(r, "pwm") {
+            for s in &c.sinks {
+                if s.kind == "fan-duty" {
+                    let full = format!(
+                        "{cbase},sink={},label={}",
+                        json_str(&s.id),
+                        json_str(&s.label)
+                    );
+                    if let Some(v) = snum(s) {
                         m.duty
-                            .push(format!("aiolos_fan_duty_percent{{{full}}} {}", fmt_num(p)));
-                    }
-                    if let Some(rp) = num(r, "rpm") {
-                        m.rpm
-                            .push(format!("aiolos_fan_rpm{{{full}}} {}", fmt_num(rp)));
+                            .push(format!("aiolos_fan_duty_percent{{{full}}} {}", fmt_num(v)));
                     }
                 }
-                "driving" => {
-                    if let Some(t) = num(r, "temp") {
-                        m.driving
-                            .push(format!("aiolos_driving_celsius{{{full}}} {}", fmt_num(t)));
-                    }
-                    if let Some(t) = num(r, "raw") {
-                        m.driving_raw.push(format!(
-                            "aiolos_driving_raw_celsius{{{full}}} {}",
-                            fmt_num(t)
-                        ));
-                    }
-                    if let Some(p) = num(r, "pct") {
-                        m.driving_duty.push(format!(
-                            "aiolos_driving_duty_percent{{{full}}} {}",
-                            fmt_num(p)
-                        ));
-                    }
-                }
-                // SOW-0009 power readings: `powercap` = nvidia-powercap control state; `power-state`
-                // = nut UPS state. Booleans are exported as 0/1 gauges via `bnum`.
-                "powercap" => {
-                    if let Some(c) = bnum(r, "capped") {
-                        m.pc_capped
-                            .push(format!("aiolos_powercap_capped{{{full}}} {}", fmt_num(c)));
-                    }
-                    if let Some(v) = num(r, "limit_mw") {
-                        m.pc_limit
-                            .push(format!("aiolos_powercap_limit_mw{{{full}}} {}", fmt_num(v)));
-                    }
-                    if let Some(v) = num(r, "draw_mw") {
-                        m.pc_draw
-                            .push(format!("aiolos_powercap_draw_mw{{{full}}} {}", fmt_num(v)));
-                    }
-                }
-                "power-state" => {
-                    if let Some(b) = bnum(r, "on_battery") {
-                        m.ps_on_battery
-                            .push(format!("aiolos_power_on_battery{{{full}}} {}", fmt_num(b)));
-                    }
-                    if let Some(v) = num(r, "runtime_s") {
-                        m.ps_runtime.push(format!(
-                            "aiolos_power_runtime_seconds{{{full}}} {}",
-                            fmt_num(v)
-                        ));
-                    }
-                    if let Some(v) = num(r, "charge") {
-                        m.ps_charge.push(format!(
-                            "aiolos_power_charge_percent{{{full}}} {}",
-                            fmt_num(v)
-                        ));
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -653,7 +692,7 @@ impl MetricBuf {
             out,
             "aiolos_temp_celsius",
             "gauge",
-            "Temperature reading in Celsius.",
+            "Temperature component in Celsius.",
             &self.temp,
         );
         emit(
@@ -667,7 +706,7 @@ impl MetricBuf {
             out,
             "aiolos_fan_rpm",
             "gauge",
-            "Fan tachometer reading in RPM.",
+            "Fan tachometer component in RPM.",
             &self.rpm,
         );
         emit(
@@ -780,18 +819,26 @@ fn emit(out: &mut String, name: &str, kind: &str, help: &str, lines: &[String]) 
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Read a numeric reading field as f64 (ints or floats).
-fn num(r: &Reading, key: &str) -> Option<f64> {
-    r.fields.get(key).and_then(|v| v.as_f64())
+/// Read a publisher value as f64 (ints or floats).
+fn pnum(p: &Publisher) -> Option<f64> {
+    p.value
+        .as_ref()
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
 }
 
-/// Read a JSON boolean field as a Prometheus 0/1 gauge value (`num` only handles JSON numbers, and
-/// `as_f64()` returns `None` for a bool).
-fn bnum(r: &Reading, key: &str) -> Option<f64> {
-    r.fields
-        .get(key)
+/// Read a publisher bool value as a Prometheus 0/1 gauge.
+fn pbool(p: &Publisher) -> Option<f64> {
+    p.value
+        .as_ref()
         .and_then(|v| v.as_bool())
         .map(|b| if b { 1.0 } else { 0.0 })
+}
+
+/// Read a sink value as f64 (ints or floats).
+fn snum(s: &Sink) -> Option<f64> {
+    s.value
+        .as_ref()
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
 }
 
 /// Format an f64 for Prometheus: drop the trailing `.0` for whole numbers, else plain decimal.
@@ -904,7 +951,7 @@ mod tests {
         id: &str,
         name: &str,
         status: &str,
-        readings: Vec<Reading>,
+        components: Vec<Component>,
     ) -> InstanceEntry {
         let (tx, _rx) = mpsc::channel();
         InstanceEntry {
@@ -913,7 +960,7 @@ mod tests {
             name: name.into(),
             last_status: status.into(),
             last_error: None,
-            last_readings: readings,
+            last_components: components,
             restart_count: 0,
             last_seen: Instant::now(),
             cmd_tx: tx,
@@ -945,33 +992,62 @@ mod tests {
         Arc::new(RwLock::new(s))
     }
 
+    fn pub_i64(id: &str, label: &str, kind: &str, value: i64, unit: Option<&str>) -> Publisher {
+        let mut p = Publisher::new(id, label, kind).value(json!(value));
+        if let Some(unit) = unit {
+            p = p.unit(unit);
+        }
+        p
+    }
+
+    fn temp_component(id: &str, label: &str, class: &str, temp: i64) -> Component {
+        Component::new(id, label, class).with_publishers(vec![pub_i64(
+            "temp",
+            label,
+            "temperature",
+            temp,
+            Some("C"),
+        )])
+    }
+
     #[test]
-    fn metrics_render_all_reading_kinds() {
+    fn metrics_render_all_component_kinds() {
         let inst = mk_instance(
             "nvidia",
             "GPU-1",
             "RTX 6000",
             "ok",
-            vec![
-                Reading::new("temp", "GPU", json!({"temp": 63})),
-                Reading::new("fan", "fan0", json!({"pwm": 72, "rpm": 2200})),
-                Reading::new(
+            vec![Component::new("gpu", "GPU", "gpu").with_publishers(vec![
+                pub_i64("temp", "GPU", "temperature", 63, Some("C")),
+                pub_i64("fan0.duty", "fan0", "fan-duty", 72, Some("%")),
+                pub_i64("fan0.rpm", "fan0", "fan-rpm", 2200, Some("rpm")),
+                pub_i64(
+                    "driving.temp",
                     "driving",
-                    "driving",
-                    json!({"temp": 60, "raw": 63, "pct": 80}),
+                    "driving-temperature",
+                    60,
+                    Some("C"),
                 ),
-            ],
+                pub_i64(
+                    "driving.raw",
+                    "driving",
+                    "driving-raw-temperature",
+                    63,
+                    Some("C"),
+                ),
+                pub_i64("driving.duty", "driving", "driving-duty", 80, Some("%")),
+            ])],
         );
         let state = state_with(vec![inst], vec![("nvidia", "ok")], 42);
         let m = render_metrics(&state);
 
         assert!(m.contains("aiolos_tick 42"));
-        assert!(m.contains(r#"aiolos_temp_celsius{module="nvidia",id="GPU-1",instance_name="RTX 6000",label="GPU"} 63"#));
-        assert!(m.contains(r#"aiolos_fan_duty_percent{module="nvidia",id="GPU-1",instance_name="RTX 6000",label="fan0"} 72"#));
-        assert!(m.contains(r#"aiolos_fan_rpm{module="nvidia",id="GPU-1",instance_name="RTX 6000",label="fan0"} 2200"#));
-        assert!(m.contains(r#"aiolos_driving_celsius{module="nvidia",id="GPU-1",instance_name="RTX 6000",label="driving"} 60"#));
-        assert!(m.contains(r#"aiolos_driving_raw_celsius{module="nvidia",id="GPU-1",instance_name="RTX 6000",label="driving"} 63"#));
-        assert!(m.contains(r#"aiolos_driving_duty_percent{module="nvidia",id="GPU-1",instance_name="RTX 6000",label="driving"} 80"#));
+        assert!(m.contains(r#"aiolos_temp_celsius{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="temp",label="GPU"} 63"#));
+        assert!(m.contains(r#"aiolos_fan_duty_percent{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="fan0.duty",label="fan0"} 72"#));
+        assert!(m.contains(r#"aiolos_fan_rpm{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="fan0.rpm",label="fan0"} 2200"#));
+        assert!(m.contains(r#"aiolos_driving_celsius{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="driving.temp",label="driving"} 60"#));
+        assert!(m.contains(r#"aiolos_driving_raw_celsius{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="driving.raw",label="driving"} 63"#));
+        assert!(m.contains(r#"aiolos_driving_duty_percent{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="driving.duty",label="driving"} 80"#));
         assert!(m.contains(
             r#"aiolos_instance_up{module="nvidia",id="GPU-1",instance_name="RTX 6000"} 1"#
         ));
@@ -983,21 +1059,29 @@ mod tests {
 
     #[test]
     fn metrics_disambiguate_duplicate_labels() {
-        // Two CPU sockets both labelled "CPU" must become "CPU" and "CPU_2" (unique series).
+        // Two CPU sockets may share the display label; publisher ids keep the series distinct.
         let inst = mk_instance(
-            "asrock16-2t",
+            "rome2d-fans",
             "board",
             "board",
             "ok",
             vec![
-                Reading::new("temp", "CPU", json!({"temp": 50})),
-                Reading::new("temp", "CPU", json!({"temp": 55})),
+                Component::new("board", "Board", "board").with_publishers(vec![
+                    pub_i64("cpu0.temp", "CPU", "temperature", 50, Some("C")),
+                    pub_i64("cpu1.temp", "CPU", "temperature", 55, Some("C")),
+                ]),
             ],
         );
         let state = state_with(vec![inst], vec![], 1);
         let m = render_metrics(&state);
-        assert!(m.contains(r#"label="CPU"} 50"#), "{m}");
-        assert!(m.contains(r#"label="CPU_2"} 55"#), "{m}");
+        assert!(
+            m.contains(r#"publisher="cpu0.temp",label="CPU"} 50"#),
+            "{m}"
+        );
+        assert!(
+            m.contains(r#"publisher="cpu1.temp",label="CPU"} 55"#),
+            "{m}"
+        );
     }
 
     #[test]
@@ -1018,7 +1102,7 @@ mod tests {
             "id",
             "na\"me",
             "ok",
-            vec![Reading::new("temp", "a\\b", json!({"temp": 1}))],
+            vec![temp_component("sensor", "a\\b", "mock", 1)],
         );
         let state = state_with(vec![inst], vec![], 1);
         let m = render_metrics(&state);
@@ -1035,17 +1119,30 @@ mod tests {
 
     #[test]
     fn aggregate_prefers_driving_and_takes_maxima() {
-        let agg = aggregate_readings(&[
-            Reading::new("temp", "GPU", json!({"temp": 40})),
-            Reading::new("temp", "NVMe", json!({"temp": 55})),
-            Reading::new(
-                "driving",
-                "driving",
-                json!({"temp": 58, "raw": 60, "pct": 77}),
-            ),
-            Reading::new("fan", "fan0", json!({"pwm": 70, "rpm": 1800})),
-            Reading::new("fan", "fan1", json!({"pwm": 90, "rpm": 2400})),
-        ]);
+        let agg = aggregate_components(&[Component::new("board", "Board", "board")
+            .with_publishers(vec![
+                pub_i64("gpu.temp", "GPU", "temperature", 40, Some("C")),
+                pub_i64("nvme.temp", "NVMe", "temperature", 55, Some("C")),
+                pub_i64(
+                    "driving.temp",
+                    "driving",
+                    "driving-temperature",
+                    58,
+                    Some("C"),
+                ),
+                pub_i64(
+                    "driving.raw",
+                    "driving",
+                    "driving-raw-temperature",
+                    60,
+                    Some("C"),
+                ),
+                pub_i64("driving.duty", "driving", "driving-duty", 77, Some("%")),
+                pub_i64("fan0.duty", "fan0", "fan-duty", 70, Some("%")),
+                pub_i64("fan0.rpm", "fan0", "fan-rpm", 1800, Some("rpm")),
+                pub_i64("fan1.duty", "fan1", "fan-duty", 90, Some("%")),
+                pub_i64("fan1.rpm", "fan1", "fan-rpm", 2400, Some("rpm")),
+            ])]);
         assert_eq!(agg.temp, Some(58.0), "driving temp preferred");
         assert_eq!(agg.duty, Some(77.0), "driving pct preferred");
         assert_eq!(agg.rpm, Some(2400.0), "max rpm");
@@ -1053,11 +1150,12 @@ mod tests {
 
     #[test]
     fn aggregate_falls_back_to_max_temp_and_pwm() {
-        let agg = aggregate_readings(&[
-            Reading::new("temp", "A", json!({"temp": 30})),
-            Reading::new("temp", "B", json!({"temp": 48})),
-            Reading::new("fan", "fan0", json!({"pwm": 65})),
-        ]);
+        let agg = aggregate_components(&[Component::new("board", "Board", "board")
+            .with_publishers(vec![
+                pub_i64("a.temp", "A", "temperature", 30, Some("C")),
+                pub_i64("b.temp", "B", "temperature", 48, Some("C")),
+                pub_i64("fan0.duty", "fan0", "fan-duty", 65, Some("%")),
+            ])]);
         assert_eq!(agg.temp, Some(48.0));
         assert_eq!(agg.duty, Some(65.0));
         assert_eq!(agg.rpm, None);
@@ -1074,7 +1172,7 @@ mod tests {
 
     #[test]
     fn percent_decode_basic() {
-        assert_eq!(percent_decode("asrock16-2t"), "asrock16-2t");
+        assert_eq!(percent_decode("rome2d-fans"), "rome2d-fans");
         assert_eq!(percent_decode("a%20b"), "a b");
         assert_eq!(percent_decode("a+b"), "a b");
     }

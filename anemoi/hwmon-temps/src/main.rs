@@ -13,7 +13,8 @@
 mod config;
 
 use anemos::{
-    Anemos, Applied, Controller, Detected, Device, FoundEntry, Inputs, ModuleInfo, Reading,
+    Anemos, Applied, Component, Detected, Device, FoundEntry, Inputs, ModuleInfo, OpenMode,
+    Publisher,
 };
 use hwmon::ChipTemps;
 use serde_json::json;
@@ -39,11 +40,12 @@ impl Anemos for HwmonTempsAnemos {
             id: "hwmon".to_string(),
             kind: "board".to_string(),
             name: "hwmon sysfs temps".to_string(),
+            components: vec![Component::new("hwmon", "hwmon sysfs temps", "board")],
             extra: Default::default(),
         }])
     }
 
-    fn open(&mut self, _id: &str) -> anyhow::Result<Box<dyn Device>> {
+    fn open(&mut self, _id: &str, _mode: OpenMode) -> anyhow::Result<Box<dyn Device>> {
         Ok(Box::new(HwmonTemps))
     }
 
@@ -55,17 +57,17 @@ impl Anemos for HwmonTempsAnemos {
 struct HwmonTemps;
 
 impl Device for HwmonTemps {
-    fn apply(&mut self, _inputs: Option<&Inputs>, _ctrl: &mut Controller) -> Applied {
+    fn collect(&mut self, _inputs: Option<&Inputs>) -> Applied {
         // Sensor-only: read the configured chips' temps and report them; control nothing.
         let chips = config::chips();
-        let readings = build_readings(&hwmon::read_chip_temps(&chips));
-        if readings.is_empty() {
+        let components = build_components(&hwmon::read_chip_temps(&chips));
+        if components.is_empty() {
             return Applied::error(format!(
                 "no temperatures readable from configured chips: {}",
                 chips.join(", ")
             ));
         }
-        Applied::ok(readings)
+        Applied::ok(components)
     }
 
     fn restore(&mut self) {
@@ -73,18 +75,18 @@ impl Device for HwmonTemps {
     }
 }
 
-/// Turn per-chip temperature groups into `temp` readings with unambiguous labels:
+/// Turn per-chip temperature groups into temperature publishers with unambiguous labels:
 /// - a chip name with ONE instance → `chip` (single sensor) or `chip.<sensor>` (multiple sensors);
 /// - a chip name with MULTIPLE instances → `chip@<instance>` / `chip@<instance>.<sensor>`,
 ///   where `<instance>` is the chip's stable device discriminator (e.g. an i2c address).
-fn build_readings(groups: &[ChipTemps]) -> Vec<Reading> {
+fn build_components(groups: &[ChipTemps]) -> Vec<Component> {
     // Count instances per chip name so we only add the `@instance` discriminator where it's needed.
     let mut instances_per_chip = std::collections::HashMap::<&str, usize>::new();
     for g in groups {
         *instances_per_chip.entry(g.chip.as_str()).or_insert(0) += 1;
     }
 
-    let mut readings = Vec::new();
+    let mut publishers = Vec::new();
     for g in groups {
         let multi_instance = instances_per_chip
             .get(g.chip.as_str())
@@ -103,10 +105,33 @@ fn build_readings(groups: &[ChipTemps]) -> Vec<Reading> {
             } else {
                 base.clone()
             };
-            readings.push(Reading::new("temp", label, json!({ "temp": temp })));
+            publishers.push(
+                Publisher::new(temp_publisher_id(&label), label, "temperature")
+                    .value(json!(temp))
+                    .unit("C"),
+            );
         }
     }
-    readings
+    if publishers.is_empty() {
+        Vec::new()
+    } else {
+        vec![Component::new("hwmon", "hwmon sysfs temps", "board").with_publishers(publishers)]
+    }
+}
+
+fn temp_publisher_id(label: &str) -> String {
+    format!(
+        "temp.{}",
+        label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            })
+            .collect::<String>()
+            .trim_matches('_')
+    )
 }
 
 #[cfg(test)]
@@ -121,16 +146,20 @@ mod tests {
         }
     }
 
-    fn labels(rs: &[Reading]) -> Vec<(String, i64)> {
-        rs.iter()
-            .map(|r| (r.label.clone(), r.get_i64("temp").unwrap()))
+    fn labels(cs: &[Component]) -> Vec<(String, i64)> {
+        cs.iter()
+            .flat_map(|c| c.publishers.iter())
+            .map(|p| (p.label.clone(), p.value_i64().unwrap()))
             .collect()
     }
 
     #[test]
     fn single_instance_single_sensor_uses_bare_chip_name() {
         let g = vec![chip("nvme", "0000:02:00.0", &[("Composite", 37)])];
-        assert_eq!(labels(&build_readings(&g)), vec![("nvme".to_string(), 37)]);
+        assert_eq!(
+            labels(&build_components(&g)),
+            vec![("nvme".to_string(), 37)]
+        );
     }
 
     #[test]
@@ -141,7 +170,7 @@ mod tests {
             &[("temp1", 31), ("temp2", 40)],
         )];
         assert_eq!(
-            labels(&build_readings(&g)),
+            labels(&build_components(&g)),
             vec![
                 ("gigabyte_wmi.temp1".to_string(), 31),
                 ("gigabyte_wmi.temp2".to_string(), 40)
@@ -159,7 +188,7 @@ mod tests {
             chip("spd5118", "11-0053", &[("temp1", 36)]),
         ];
         assert_eq!(
-            labels(&build_readings(&g)),
+            labels(&build_components(&g)),
             vec![
                 ("spd5118@11-0050".to_string(), 36),
                 ("spd5118@11-0051".to_string(), 32),
@@ -178,7 +207,7 @@ mod tests {
         ];
         // gigabyte_wmi is single-instance single-sensor -> bare; r8169 has two -> @instance.
         assert_eq!(
-            labels(&build_readings(&g)),
+            labels(&build_components(&g)),
             vec![
                 ("gigabyte_wmi".to_string(), 31),
                 ("r8169@0000:06:00".to_string(), 38),

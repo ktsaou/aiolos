@@ -1,12 +1,12 @@
 [package]
-name = "anemoi-asrock16-2t"
+name = "anemoi-rome2d-fans"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "asrock16-2t"
+name = "rome2d-fans"
 path = "src/main.rs"
 
 [dependencies]

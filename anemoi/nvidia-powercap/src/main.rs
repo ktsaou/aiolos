@@ -5,7 +5,7 @@
 //!
 //! This is a **curve-less CONTROL** anemos: `ModuleInfo` curve = `None` (no temperature curve — its
 //! decision is driven by routed power state, not a curve), but it DOES control a device. It reacts
-//! to `power-state` readings routed from the `nut` sensor (`input=nut`): when the policy's trigger
+//! to `power` components routed from the `nut` sensor (`input=nut`): when the policy's trigger
 //! fires (an on-battery UPS whose runtime/charge is critically low — see `policy.rs`) it CAPS each
 //! GPU's power-management limit; on AC restore (or no trigger) it LIFTS the cap back to the firmware
 //! default. The policy is conservative by default (monitor + log; cap only on low runtime) so a
@@ -24,7 +24,8 @@ mod inputs;
 mod policy;
 
 use anemos::{
-    Anemos, Applied, Controller, Detected, Device, FoundEntry, Inputs, ModuleInfo, Reading,
+    Anemos, Applied, Component, Controller, Detected, Device, DrivenBy, FoundEntry, Inputs,
+    ModuleInfo, OpenMode, Publisher, Sink, SinkState,
 };
 use inputs::power_signal;
 use nvml::{Detector, Gpu};
@@ -61,6 +62,12 @@ impl Anemos for NvidiaPowercap {
                         id: g.uuid,
                         kind: "GPU".to_string(),
                         name: g.name,
+                        components: vec![Component::new("gpu", "GPU", "gpu").with_sinks(vec![
+                            Sink::new("power_limit", "GPU power limit", "power-limit")
+                                .unit("mW")
+                                .safe(json!("default"))
+                                .needs_claim(false),
+                        ])],
                         extra: Default::default(),
                     })
                     .collect(),
@@ -69,7 +76,7 @@ impl Anemos for NvidiaPowercap {
         }
     }
 
-    fn open(&mut self, id: &str) -> anyhow::Result<Box<dyn Device>> {
+    fn open(&mut self, id: &str, mode: OpenMode) -> anyhow::Result<Box<dyn Device>> {
         // Opt out of the Gpu's fan-restore-on-drop: this module never touches fans, and our own
         // Drop/restore handles the power limit instead.
         let mut gpu = Gpu::open(id)?.without_fan_restore_on_drop();
@@ -87,6 +94,7 @@ impl Anemos for NvidiaPowercap {
         // never undo an operator's deliberate higher-than-default limit. After a CLEAN exit the
         // predecessor already restored the default, so `current == default` and we adopt nothing.
         let already_capped = limits.current_mw < limits.default_mw;
+        let control = mode == OpenMode::Control;
         tracing::info!(
             uuid = %gpu.uuid(),
             default_mw = limits.default_mw,
@@ -94,6 +102,7 @@ impl Anemos for NvidiaPowercap {
             min_mw = limits.min_mw,
             max_mw = limits.max_mw,
             already_capped,
+            control,
             "opened GPU for power-cap; recorded firmware default limit"
         );
         Ok(Box::new(GpuCap {
@@ -104,12 +113,13 @@ impl Anemos for NvidiaPowercap {
             // Adopt the predecessor's stranded cap so the next `Lift` (or shutdown) restores it; an
             // ongoing event still dedupes to the same target in `apply_cap`. A clean open adopts none.
             capped: already_capped,
-            applied_cap_mw: already_capped.then_some(AppliedCap {
+            applied_cap_mw: (control && already_capped).then_some(AppliedCap {
                 requested_mw: limits.current_mw,
                 actual_mw: limits.current_mw,
             }),
-            // Owe a restore iff we adopted a cap; `apply_cap` re-arms when this process caps.
-            restore_armed: already_capped,
+            // Owe a restore iff a control run adopted a cap; observe/info is read-only and must not
+            // restore on drop. `apply_cap` re-arms when this process caps.
+            restore_armed: control && already_capped,
         }))
     }
 
@@ -123,12 +133,12 @@ impl Anemos for NvidiaPowercap {
 
 /// One GPU under power-cap management. Holds the recorded firmware default (the restore target) and
 /// whether a cap is currently applied. `restore_armed` stays set until a restore succeeds (so a
-/// failed restore is retried by Drop), mirroring the asrock board's release-arming.
+/// failed restore is retried by Drop), mirroring the rome2d board's release-arming.
 struct GpuCap {
     gpu: Gpu,
     /// Firmware default power limit (mW), recorded at open — the value `restore` targets.
     default_mw: u32,
-    /// Device-accepted minimum limit (mW), recorded at open (for the readings/logging only; the
+    /// Device-accepted minimum limit (mW), recorded at open (for the components/logging only; the
     /// tech crate re-clamps on every set).
     min_mw: u32,
     policy: Policy,
@@ -150,6 +160,17 @@ struct AppliedCap {
 }
 
 impl Device for GpuCap {
+    fn collect(&mut self, _inputs: Option<&Inputs>) -> Applied {
+        let limits = match self.gpu.power_limits() {
+            Ok(limits) => limits,
+            Err(e) => return Applied::error(e.to_string()),
+        };
+        self.default_mw = limits.default_mw;
+        self.min_mw = limits.min_mw;
+        self.capped = limits.current_mw < limits.default_mw;
+        Applied::ok(self.components_observed(limits.current_mw))
+    }
+
     fn apply(&mut self, inputs: Option<&Inputs>, _ctrl: &mut Controller) -> Applied {
         // Reload the policy each tick (live tuning, like the curve modules reload their curve).
         self.policy = Policy::load();
@@ -174,7 +195,7 @@ impl Device for GpuCap {
             }
         };
 
-        Applied::ok(self.readings(&sig, &decision, commanded_mw))
+        Applied::ok(self.components_control(&sig, &decision, commanded_mw))
     }
 
     fn restore(&mut self) {
@@ -250,39 +271,97 @@ impl GpuCap {
         Ok(self.default_mw)
     }
 
-    /// Build this tick's readings: one `powercap` record carrying the control state (capped?, the
-    /// effective/default/min limits, current draw, the decision reason) plus an echo of the
-    /// aggregate power signal (on_battery / runtime) for the status page.
-    fn readings(
+    /// Build this tick's components: one GPU component carrying the control state (capped?, the
+    /// effective/default/min limits, current draw, the decision reason). Routed UPS state is not
+    /// re-published as GPU data; it appears as sink `driven_by` metadata.
+    fn components_control(
         &mut self,
         sig: &policy::PowerSignal,
         decision: &Decision,
         limit_mw: u32,
-    ) -> Vec<Reading> {
-        let mut f = serde_json::Map::new();
-        f.insert("capped".to_string(), json!(self.capped));
-        f.insert("limit_mw".to_string(), json!(limit_mw));
-        f.insert("default_mw".to_string(), json!(self.default_mw));
-        f.insert("min_mw".to_string(), json!(self.min_mw));
-        if let Some(draw) = self.gpu.power_usage() {
-            f.insert("draw_mw".to_string(), json!(draw));
+    ) -> Vec<Component> {
+        let mut driven_by = vec![DrivenBy::new("nut")
+            .publisher("on_battery")
+            .value(json!(sig.on_battery))];
+        if let Some(rt) = sig.min_runtime_s {
+            driven_by.push(
+                DrivenBy::new("nut")
+                    .publisher("runtime")
+                    .value(json!(rt))
+                    .unit("s"),
+            );
         }
-        f.insert(
-            "reason".to_string(),
-            json!(match decision {
+        self.components_with(
+            limit_mw,
+            match decision {
                 Decision::Cap(r) => r.as_str(),
                 Decision::Lift => "none",
-            }),
-        );
-        f.insert("on_battery".to_string(), json!(sig.on_battery));
-        if let Some(rt) = sig.min_runtime_s {
-            f.insert("runtime_s".to_string(), json!(rt));
+            },
+            if self.capped {
+                SinkState::Claimed
+            } else {
+                SinkState::Released
+            },
+            driven_by,
+        )
+    }
+
+    fn components_observed(&mut self, limit_mw: u32) -> Vec<Component> {
+        let state = if self.restore_armed {
+            if self.capped {
+                SinkState::Claimed
+            } else {
+                SinkState::Released
+            }
+        } else if self.capped {
+            SinkState::Unknown
+        } else {
+            SinkState::Released
+        };
+        self.components_with(limit_mw, "observed", state, Vec::new())
+    }
+
+    fn components_with(
+        &mut self,
+        limit_mw: u32,
+        reason: &str,
+        state: SinkState,
+        driven_by: Vec<DrivenBy>,
+    ) -> Vec<Component> {
+        let mut publishers = vec![
+            Publisher::new("capped", "Capped", "powercap-capped").value(json!(self.capped)),
+            Publisher::new("limit", "Power limit", "power-limit")
+                .value(json!(limit_mw))
+                .unit("mW"),
+            Publisher::new(
+                "default_limit",
+                "Default power limit",
+                "power-limit-default",
+            )
+            .value(json!(self.default_mw))
+            .unit("mW"),
+            Publisher::new("min_limit", "Minimum power limit", "power-limit-min")
+                .value(json!(self.min_mw))
+                .unit("mW"),
+            Publisher::new("reason", "Reason", "powercap-reason").value(json!(reason)),
+        ];
+        if let Some(draw) = self.gpu.power_usage() {
+            publishers.push(
+                Publisher::new("draw", "Power draw", "power-draw")
+                    .value(json!(draw))
+                    .unit("mW"),
+            );
         }
-        vec![Reading::new(
-            "powercap",
-            "GPU",
-            serde_json::Value::Object(f),
-        )]
+        let sink = Sink::new("power_limit", "GPU power limit", "power-limit")
+            .unit("mW")
+            .value(json!(limit_mw))
+            .safe(json!("default"))
+            .needs_claim(false)
+            .state(state)
+            .driven_by(driven_by);
+        vec![Component::new("gpu", self.gpu.uuid().to_string(), "gpu")
+            .with_publishers(publishers)
+            .with_sinks(vec![sink])]
     }
 }
 

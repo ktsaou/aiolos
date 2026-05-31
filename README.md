@@ -36,25 +36,26 @@ to read and an output to set.
 ```
                          ┌──────────────────────────── aiolos (orchestrator) ───────────────────────────┐
                          │  • spawns one `detect` process + one `run` instance per device                │
-                         │  • ticks every instance each heartbeat, collects readings                     │
+                         │  • ticks every instance, collects components/publishers/sinks                 │
    one-line JSON         │  • routes declared data flows between modules (the "blackboard")              │
    over stdio            │  • supervises: restart, backoff, graceful shutdown, read-only status page     │
                          └───────┬───────────────────────────────────────────────────┬──────────────────┘
                                  │ stdin: {"cmd":"apply", "inputs":{…}}                │
-                                 │ stdout: {"status":"ok","readings":[…]}              │
+                                 │ stdout: {"status":"ok","components":[…]}            │
                     ┌────────────▼────────────┐                        ┌──────────────▼──────────────┐
-                    │  nvidia  (anemos)        │   GPU temps routed     │  asrock16-2t  (anemos)       │
+                    │  nvidia  (anemos)        │   GPU temps routed     │  rome2d-fans  (anemos)       │
                     │  per-GPU fans via NVML   │ ─────────────────────▶ │  8 chassis fans via IPMI,    │
                     │                          │     as `input=`        │  driven by max(GPU, CPU)     │
                     └──────────────────────────┘                        └──────────────────────────────┘
 ```
 
-Each module is launched in three modes:
+Each module is launched in these modes:
 
 | Mode | Purpose |
 |------|---------|
 | `<module> detect` | report the IDs it manages (e.g. one entry per GPU, by UUID) |
-| `<module> run <ID>` | bound to one device; on each heartbeat read sensors, apply the curve, report readings |
+| `<module> info [ID]` / `<module> collect [ID]` | one-shot read-only live component values; no claim/set/release side effects |
+| `<module> run <ID>` | bound to one device; on each tick read sensors, apply control, report components |
 | `<module> restore` | one-shot: hand every device back to firmware/auto and exit (used by `aiolos restore`) |
 
 **stdout is protocol-only; all logs go to stderr** (captured into the orchestrator's journal). Reads
@@ -72,7 +73,7 @@ within the timeout — never wedging anything else.
   drive (keyed by stable serial), it reports per-drive temps and controls nothing. Routed into the
   fan controller so hot disks raise the chassis fans; it lives in its own process because an NVMe
   temp read can block on a wedged controller.
-- **`asrock16-2t`** — ASRockRack ROME2D16-2T chassis fans via **inband IPMI** (raw `/dev/ipmi0`
+- **`rome2d-fans`** — ASRockRack ROME2D16-2T chassis fans via **inband IPMI** (raw `/dev/ipmi0`
   ioctls, zero extra deps). Driven by `max(GPU temps from nvidia, NVMe temps from nvme, its own CPU
   temps via k10temp)`. Reports each fan's real duty (`0xda` readback) and **tachometer RPM** (read
   via standard IPMI sensor commands). Releases to BMC auto control on exit, and whenever a
@@ -104,7 +105,7 @@ to fan duty, linear-interpolated and clamped, with an EMA "sensitivity" knob:
 | 65 °C | 79% |
 | ≥80 °C | 100% |
 
-> The **board** module (`asrock16-2t`) ships `{ "50": 30, "80": 100 }` instead — its driving sensors
+> The **board** module (`rome2d-fans`) ships `{ "50": 30, "80": 100 }` instead — its driving sensors
 > (DIMM/NVMe/board/LAN) idle at ~45–50 °C, so it holds the 30% floor until 50 °C; GPU heat still
 > drives it up via the routed max.
 
@@ -151,12 +152,13 @@ The systemd unit logs to a dedicated journal namespace (`journalctl --namespace=
 # modules: `<binary> [input=<peer> ...]`
 nvidia
 nvme                                  # NVMe SSD temps (sensor-only; controls nothing)
-asrock16-2t  input=nvidia input=nvme  # chassis fans follow max(GPU, NVMe, own CPU sensors)
+rome2d-fans  input=nvidia input=nvme  # chassis fans follow max(GPU, NVMe, own CPU sensors)
 ```
 
-`input=<peer>` wires one module's last readings into another's `apply` (one heartbeat stale), keyed
-by `module:id` so the consumer can tell sources apart. Repeat it (or use a comma list) for multiple
-sources. The orchestrator relays them verbatim and stays agnostic about what they mean.
+`input=<peer>` wires one module's last component list into another's `apply`, keyed by `module:id`
+so the consumer can tell sources apart. Repeat it (or use a comma list) for multiple sources. The
+orchestrator relays components verbatim and stays agnostic about what they mean; consumers use
+publisher `kind`s and sink `driven_by` metadata instead of duplicating foreign devices.
 
 **Curves** — `/opt/aiolos/etc/<module>.curve.json` (see above).
 
@@ -177,7 +179,7 @@ tech/hwmon/          generic hwmon (sysfs) temperature reader
 tech/nvme/           NVMe enumeration + per-drive temperatures (sysfs)
 aiolos/              the orchestrator (depends only on protocol wire types)
 anemoi/nvidia/       a thin anemos: Anemos/Device on anemos + nvml
-anemoi/asrock16-2t/  a thin anemos: anemos + ipmi + hwmon (board OEM commands in src/board.rs)
+anemoi/rome2d-fans/  a thin anemos: anemos + ipmi + hwmon (board OEM commands in src/board.rs)
 anemoi/nvme/         a sensor-only anemos: anemos + nvme (reports temps, controls nothing)
 ```
 
@@ -188,7 +190,7 @@ handles CLI dispatch, signals, logging, the stdio protocol, the curve/EMA, and t
 wiring — you write none of it:
 
 ```rust
-use anemos::{Anemos, Applied, Controller, Detected, Device, FoundEntry, Inputs, ModuleInfo, Reading};
+use anemos::{Anemos, Applied, Component, Controller, Detected, Device, FoundEntry, Inputs, ModuleInfo, OpenMode, Publisher};
 
 fn main() -> ! {
     anemos::run(
@@ -202,18 +204,28 @@ fn main() -> ! {
 
 struct Demo;
 impl Anemos for Demo {
-    fn detect(&mut self) -> Detected { /* report the IDs you manage */ }
-    fn open(&mut self, id: &str) -> anyhow::Result<Box<dyn Device>> { /* bind one device */ }
+    fn detect(&mut self) -> Detected { /* report stable IDs + component schema */ }
+    fn open(&mut self, id: &str, mode: OpenMode) -> anyhow::Result<Box<dyn Device>> {
+        /* bind one device; Observe mode is read-only for `info` */
+    }
     fn restore_all(&mut self) { /* hand every device back to firmware/auto */ }
 }
 impl Device for MyDevice {
+    fn collect(&mut self, _in: Option<&Inputs>) -> Applied {
+        /* read-only live values for `<module> info` */
+    }
+
     fn apply(&mut self, _in: Option<&Inputs>, ctrl: &mut Controller) -> Applied {
         let t = self.read_temp();              // your tech crate
         match ctrl.duty(t).pct {               // SDK: curve + EMA + deadband + floor
             Some(p) => self.set(p),            // command the device
             None    => self.set_default(),     // no usable curve -> firmware/auto
         }
-        Applied::ok(vec![Reading::new("temp", "demo", serde_json::json!({ "temp": t }))])
+        Applied::ok(vec![Component::new("device", "demo", "board").with_publishers(vec![
+            Publisher::new("temp", "Temperature", "temperature")
+                .value(serde_json::json!(t))
+                .unit("C"),
+        ])])
     }
     fn restore(&mut self) { /* fail-safe: back to firmware/auto */ }
 }

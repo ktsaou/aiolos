@@ -26,18 +26,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anemoi-asrock16-2t"
-version = "0.1.0"
-dependencies = [
- "anemos",
- "anyhow",
- "hwmon",
- "ipmi",
- "serde_json",
- "tracing",
-]
-
-[[package]]
 name = "anemoi-hwmon-temps"
 version = "0.1.0"
 dependencies = [
@@ -109,6 +97,18 @@ dependencies = [
  "anyhow",
  "nvme",
  "serde_json",
+]
+
+[[package]]
+name = "anemoi-rome2d-fans"
+version = "0.1.0"
+dependencies = [
+ "anemos",
+ "anyhow",
+ "hwmon",
+ "ipmi",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

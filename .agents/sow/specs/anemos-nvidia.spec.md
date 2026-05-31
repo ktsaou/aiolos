@@ -8,7 +8,9 @@ Per-GPU fan control via NVML. One `run` instance per physical GPU, bound by GPU 
 
 ## detect
 - Enumerate GPUs via NVML; emit one `found` per GPU:
-  `{"id":"<GPU-UUID>","type":"GPU","name":"<product name>"}`.
+  `{"id":"<GPU-UUID>","type":"GPU","name":"<product name>","components":[...]}` with one
+  `gpu` component schema: temperature publisher, per-fan duty/RPM publishers, and a `fans`
+  `fan-duty` sink.
 - Persistent; re-`detect` reflects current set (a GPU that fell off the bus disappears; on return
   it reappears with the same UUID).
 - **Fork-safety:** NVML is not fork-safe. The orchestrator never holds NVML; each process that
@@ -18,12 +20,17 @@ Per-GPU fan control via NVML. One `run` instance per physical GPU, bound by GPU 
 - `nvmlInit`; resolve the device by UUID.
 - On each `apply`: read this GPU's temperature; interpolate the curve from
   `/opt/aiolos/etc/nvidia.curve.json`; set the GPU's onboard fan(s) via NVML
-  (`SetFanSpeed`-equivalent); report:
+  (`SetFanSpeed`-equivalent); report one live `gpu` component:
   ```json
-  {"status":"ok","readings":[
-    {"type":"temp","label":"GPU","temp":63},
-    {"type":"fan","label":"fan0","pwm":72,"rpm":2200},
-    {"type":"fan","label":"fan1","pwm":72,"rpm":2210}]}
+  {"status":"ok","components":[{
+    "id":"gpu","label":"GPU-...","class":"gpu",
+    "publishers":[
+      {"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"},
+      {"id":"fan0.duty","label":"fan0 duty","kind":"fan-duty","value":72,"unit":"%"},
+      {"id":"fan0.rpm","label":"fan0 RPM","kind":"fan-rpm","value":2200,"unit":"rpm"}],
+    "sinks":[{"id":"fans","label":"GPU fans","kind":"fan-duty","value":72,"unit":"%",
+      "safe":"auto","needs_claim":true,"state":"claimed",
+      "driven_by":[{"from":"self","publisher":"temp","value":63,"unit":"C"}]}]}]}
   ```
 - `inputs` are ignored (nvidia uses its own GPU temperature).
 - On GPU-lost (NVML error): respond `{"status":"error","error":"gpu lost"}`; the orchestrator
@@ -36,7 +43,7 @@ dep, no raw FFI). Used: `Nvml::init`, `device_count`, `device_by_index`, `Device
 Fans are set/restored **per fan index** (`0..num_fans`), not per GPU.
 
 ## Modes
-`detect` · `run <UUID>` · `restore` (one-shot: restore EVERY GPU's fans to firmware default and
+`detect` · `info [id]` / `collect [id]` · `run <UUID>` · `restore` (one-shot: restore EVERY GPU's fans to firmware default and
 exit; idempotent; called by `aiolos restore`).
 
 ## Fail-safe
@@ -76,6 +83,6 @@ smoother/less spike-sensitive, higher = more responsive) is reloaded every tick.
 - Detects all GPUs by UUID; per-GPU `run` instances are independent processes.
 - Fan % tracks the curve for the measured temperature (±ramp lag).
 - A GPU falling off the bus does not affect the other GPU's instance.
-- shutdown/EOF/SIGTERM each restore firmware auto; verified by reading fan policy after exit.
+- shutdown/EOF/SIGTERM each restore firmware auto; verified by observing fan policy after exit.
 - A failed control tick (set-fan error or temp-read failure) reverts all fans to firmware default.
 - `nvidia restore` restores every GPU to firmware default and is idempotent.

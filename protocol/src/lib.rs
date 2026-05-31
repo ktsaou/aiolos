@@ -34,49 +34,257 @@ pub enum Request {
     Shutdown,
 }
 
-/// Readings relayed from source modules' instances, keyed by `module:id` (the source module name
-/// and the peer instance id), so a consumer wired to multiple `input=` sources can attribute each
-/// reading to its source module and keys never collide across sources.
+/// Component reports relayed from source modules' instances, keyed by `module:id` (the source module
+/// name and the peer instance id), so a consumer wired to multiple `input=` sources can attribute each
+/// publisher to its source module and keys never collide across sources.
 ///
-/// Each peer instance reports a *list* of readings (temp, fan, …); aiolos relays the whole list
-/// verbatim and uninterpreted (it never picks "the temperature" — the consumer decides, optionally
-/// filtering by the `module:` key prefix). Mirrors the protocol spec's normative text.
-pub type Inputs = HashMap<String, Vec<Reading>>;
+/// Each peer instance reports a *list* of components; aiolos relays the whole list verbatim and
+/// uninterpreted (it never picks "the temperature" — the consumer decides, optionally filtering by
+/// the `module:` key prefix and publisher `kind`). Mirrors the protocol spec's normative text.
+pub type Inputs = HashMap<String, Vec<Component>>;
 
 // ---------------------------------------------------------------------------
-// Readings
+// Component reports
 // ---------------------------------------------------------------------------
 
-/// One measurement/actuation record a module reports. `kind` (`temp`/`fan`/…) and `label` are
-/// required; all other numeric/string fields live in `fields` (flattened onto the JSON object).
+/// One device/entity reported by an anemos. This is the stable SOW-0014-ready schema:
+/// publishers are measurements/readbacks; sinks are outputs this component can drive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Reading {
-    #[serde(rename = "type")]
-    pub kind: String,
+pub struct Component {
+    pub id: String,
     pub label: String,
-    #[serde(flatten)]
-    pub fields: Map<String, Value>,
+    #[serde(rename = "class")]
+    pub class: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishers: Vec<Publisher>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sinks: Vec<Sink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Extra descriptive fields for forward compatibility. Empty by default.
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
 }
 
-impl Reading {
-    /// Build a reading. `fields` should be a JSON object (e.g. `json!({"temp":63})`); a non-object
-    /// is treated as empty.
-    pub fn new(kind: impl Into<String>, label: impl Into<String>, fields: Value) -> Self {
-        Reading {
-            kind: kind.into(),
+impl Component {
+    pub fn new(id: impl Into<String>, label: impl Into<String>, class: impl Into<String>) -> Self {
+        Component {
+            id: id.into(),
             label: label.into(),
-            fields: match fields {
-                Value::Object(m) => m,
-                _ => Map::new(),
-            },
+            class: class.into(),
+            publishers: Vec::new(),
+            sinks: Vec::new(),
+            icon: None,
+            extra: Map::new(),
         }
     }
 
-    /// Read a numeric field as i64 (handles ints and whole floats).
-    pub fn get_i64(&self, key: &str) -> Option<i64> {
-        self.fields
-            .get(key)
+    pub fn with_publishers(mut self, publishers: Vec<Publisher>) -> Self {
+        self.publishers = publishers;
+        self
+    }
+
+    pub fn with_sinks(mut self, sinks: Vec<Sink>) -> Self {
+        self.sinks = sinks;
+        self
+    }
+}
+
+/// One normalised scalar stream published by a component. `value` is omitted in schema-only detect
+/// output and present in live `apply` reports/status surfaces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Publisher {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<[f64; 2]>,
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
+}
+
+impl Publisher {
+    pub fn new(id: impl Into<String>, label: impl Into<String>, kind: impl Into<String>) -> Self {
+        Publisher {
+            id: id.into(),
+            label: label.into(),
+            kind: kind.into(),
+            value: None,
+            unit: None,
+            range: None,
+            extra: Map::new(),
+        }
+    }
+
+    pub fn value(mut self, value: impl Into<Value>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+
+    pub fn unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = Some(unit.into());
+        self
+    }
+
+    pub fn range(mut self, min: f64, max: f64) -> Self {
+        self.range = Some([min, max]);
+        self
+    }
+
+    /// Read `value` as i64 (handles ints and whole floats).
+    pub fn value_i64(&self) -> Option<i64> {
+        self.value
+            .as_ref()
             .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)))
+    }
+
+    pub fn value_f64(&self) -> Option<f64> {
+        self.value.as_ref().and_then(Value::as_f64)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SinkState {
+    #[default]
+    Released,
+    Claimed,
+    Diverged,
+    Unknown,
+}
+
+/// One output a component can drive. In SOW-0017 modules still compute/report `value` locally; SOW-0014
+/// reuses this detect/report schema and changes apply so aiolos commands sink targets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sink {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe: Option<Value>,
+    #[serde(default)]
+    pub needs_claim: bool,
+    #[serde(default)]
+    pub state: SinkState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub driven_by: Vec<DrivenBy>,
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
+}
+
+impl Sink {
+    pub fn new(id: impl Into<String>, label: impl Into<String>, kind: impl Into<String>) -> Self {
+        Sink {
+            id: id.into(),
+            label: label.into(),
+            kind: kind.into(),
+            range: None,
+            unit: None,
+            value: None,
+            readback: None,
+            safe: None,
+            needs_claim: false,
+            state: SinkState::Released,
+            direction: None,
+            driven_by: Vec::new(),
+            extra: Map::new(),
+        }
+    }
+
+    pub fn range(mut self, min: f64, max: f64) -> Self {
+        self.range = Some([min, max]);
+        self
+    }
+
+    pub fn unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = Some(unit.into());
+        self
+    }
+
+    pub fn value(mut self, value: impl Into<Value>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+
+    pub fn readback(mut self, publisher_id: impl Into<String>) -> Self {
+        self.readback = Some(publisher_id.into());
+        self
+    }
+
+    pub fn safe(mut self, safe: impl Into<Value>) -> Self {
+        self.safe = Some(safe.into());
+        self
+    }
+
+    pub fn needs_claim(mut self, needs_claim: bool) -> Self {
+        self.needs_claim = needs_claim;
+        self
+    }
+
+    pub fn state(mut self, state: SinkState) -> Self {
+        self.state = state;
+        self
+    }
+
+    pub fn direction(mut self, direction: impl Into<String>) -> Self {
+        self.direction = Some(direction.into());
+        self
+    }
+
+    pub fn driven_by(mut self, driven_by: Vec<DrivenBy>) -> Self {
+        self.driven_by = driven_by;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DrivenBy {
+    pub from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+impl DrivenBy {
+    pub fn new(from: impl Into<String>) -> Self {
+        DrivenBy {
+            from: from.into(),
+            publisher: None,
+            value: None,
+            unit: None,
+        }
+    }
+
+    pub fn publisher(mut self, publisher: impl Into<String>) -> Self {
+        self.publisher = Some(publisher.into());
+        self
+    }
+
+    pub fn value(mut self, value: impl Into<Value>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+
+    pub fn unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = Some(unit.into());
+        self
     }
 }
 
@@ -86,7 +294,7 @@ impl Reading {
 
 /// Outcome a module declares on every `detect`/`apply` (and the supervisor reacts to EXPLICITLY —
 /// it never infers faults from empty data, exits, or silence):
-/// - `ok`     — the module did its job; `found`/`readings` are authoritative (empty is real). An
+/// - `ok`     — the module did its job; `found`/`components` are authoritative (empty is real). An
 ///   accompanying `error` is a non-fatal warning ("done, with errors").
 /// - `error`  — transient: it could NOT do its job this time (NOT "no devices"). Keep going, retry.
 /// - `fatal`  — it cannot work on this host (wrong hw, missing capability). Retried only on a long
@@ -192,27 +400,29 @@ pub struct FoundEntry {
     #[serde(rename = "type")]
     pub kind: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<Component>,
     /// Extra descriptive fields (surfaced on the status page). Empty by default.
     #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Value>,
 }
 
-/// Response to `apply` (and `shutdown`). `readings` is meaningful only when `status == ok`.
+/// Response to `apply` (and `shutdown`). `components` is meaningful only when `status == ok`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Applied {
     pub status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub readings: Option<Vec<Reading>>,
+    pub components: Option<Vec<Component>>,
 }
 
 impl Applied {
-    pub fn ok(readings: Vec<Reading>) -> Self {
+    pub fn ok(components: Vec<Component>) -> Self {
         Applied {
             status: Status::Ok,
             error: None,
-            readings: Some(readings),
+            components: Some(components),
         }
     }
 
@@ -220,7 +430,7 @@ impl Applied {
         Applied {
             status: Status::Ok,
             error: None,
-            readings: None,
+            components: None,
         }
     }
 
@@ -228,7 +438,7 @@ impl Applied {
         Applied {
             status: Status::Error,
             error: Some(msg.into()),
-            readings: None,
+            components: None,
         }
     }
 
@@ -236,7 +446,7 @@ impl Applied {
         Applied {
             status: Status::Fatal,
             error: Some(msg.into()),
-            readings: None,
+            components: None,
         }
     }
 
@@ -290,7 +500,7 @@ mod tests {
 
     #[test]
     fn apply_with_inputs_round_trip() {
-        let line = r#"{"cmd":"apply","inputs":{"gpu0":[{"type":"temp","label":"GPU","temp":63}]}}"#;
+        let line = r#"{"cmd":"apply","inputs":{"gpu0":[{"id":"gpu0","label":"GPU 0","class":"gpu","publishers":[{"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"}]}]}}"#;
         let req = Request::from_line(line).unwrap();
         let Request::Apply {
             inputs: Some(inputs),
@@ -299,7 +509,7 @@ mod tests {
             panic!("expected Apply with inputs");
         };
         let gpu0 = inputs.get("gpu0").unwrap();
-        assert_eq!(gpu0[0].get_i64("temp"), Some(63));
+        assert_eq!(gpu0[0].publishers[0].value_i64(), Some(63));
         assert_eq!(req.to_line().unwrap(), line);
     }
 
@@ -336,7 +546,7 @@ mod tests {
     #[test]
     fn apply_ok_error_fatal_round_trip() {
         for line in [
-            r#"{"status":"ok","readings":[{"type":"temp","label":"GPU","temp":63}]}"#,
+            r#"{"status":"ok","components":[{"id":"gpu0","label":"GPU 0","class":"gpu","publishers":[{"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"}]}]}"#,
             r#"{"status":"error","error":"gpu lost"}"#,
             r#"{"status":"fatal","error":"device unsupported"}"#,
         ] {
@@ -364,12 +574,29 @@ mod tests {
     }
 
     #[test]
-    fn reading_helper_and_extra_fields() {
-        let r = Reading::new("fan", "fan0", json!({"pwm": 72, "rpm": 2200}));
-        assert_eq!(r.get_i64("pwm"), Some(72));
-        assert_eq!(r.get_i64("rpm"), Some(2200));
-        // Non-object fields degrade to empty rather than corrupting the stream.
-        let empty = Reading::new("temp", "x", json!(5));
-        assert!(empty.fields.is_empty());
+    fn publisher_sink_helpers_round_trip() {
+        let p = Publisher::new("fan0.rpm", "fan0", "fan-rpm")
+            .value(json!(2200))
+            .unit("rpm");
+        assert_eq!(p.value_i64(), Some(2200));
+        let s = Sink::new("fans", "fans", "fan-duty")
+            .range(0.0, 100.0)
+            .unit("%")
+            .value(json!(72))
+            .safe(json!("auto"))
+            .needs_claim(true)
+            .state(SinkState::Claimed)
+            .readback("fan0.rpm")
+            .direction("up=more-cooling")
+            .driven_by(vec![DrivenBy::new("nvidia:GPU-1")
+                .publisher("gpu.temp")
+                .value(json!(63))
+                .unit("C")]);
+        let c = Component::new("gpu0", "GPU 0", "gpu")
+            .with_publishers(vec![p])
+            .with_sinks(vec![s]);
+        let line = serde_json::to_string(&c).unwrap();
+        let back: Component = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, c);
     }
 }

@@ -20,8 +20,8 @@
 mod config;
 
 use anemos::{
-    Anemos, Applied, Controller, CurveCache, Detected, Device, FoundEntry, Inputs, ModuleInfo,
-    Reading,
+    Anemos, Applied, Component, Controller, CurveCache, Detected, Device, DrivenBy, FoundEntry,
+    Inputs, ModuleInfo, OpenMode, Publisher, Sink, SinkState,
 };
 use config::It87Config;
 use serde_json::json;
@@ -48,6 +48,7 @@ impl Anemos for It87 {
                 id: "it87".to_string(),
                 kind: "board".to_string(),
                 name: format!("{} fans", cfg.chip),
+                components: vec![it87_schema_component(&cfg)],
                 extra: Default::default(),
             }]),
             // The chip isn't present (driver not loaded / wrong name): a real "nothing to manage"
@@ -56,7 +57,7 @@ impl Anemos for It87 {
         }
     }
 
-    fn open(&mut self, _id: &str) -> anyhow::Result<Box<dyn Device>> {
+    fn open(&mut self, _id: &str, mode: OpenMode) -> anyhow::Result<Box<dyn Device>> {
         let cfg = config::load();
         let dir = hwmon::chip_path(&cfg.chip)
             .ok_or_else(|| anyhow::anyhow!("hwmon chip '{}' not present", cfg.chip))?;
@@ -64,9 +65,10 @@ impl Anemos for It87 {
             dir,
             cfg,
             zones: None,
-            // Start armed: the first apply switches channels to manual, so a restore is owed from
-            // the outset (idempotent if no apply ever ran — restoring auto channels is a no-op).
-            restore_armed: true,
+            // Control mode starts armed: the first apply switches channels to manual, so a restore is
+            // owed from the outset (idempotent if no apply ever ran). Observe/info is read-only and
+            // must not restore channels on drop, because it never claimed them.
+            restore_armed: mode == OpenMode::Control,
         }))
     }
 
@@ -91,7 +93,7 @@ impl Anemos for It87 {
 }
 
 /// Per-zone controllers built lazily from the SDK controller's resolved curve path, so the zone
-/// curve files sit next to the main one and honour `$AIOLOS_ETC_DIR` (mirrors asrock's zones).
+/// curve files sit next to the main one and honour `$AIOLOS_ETC_DIR` (mirrors rome2d-fans' zones).
 struct Zones {
     cpu: Controller,
     case: Controller,
@@ -135,13 +137,70 @@ struct It87Device {
 }
 
 impl Device for It87Device {
+    fn collect(&mut self, _inputs: Option<&Inputs>) -> Applied {
+        // Read-only snapshot for `it87 info`: report local CPU sensors plus PWM/RPM readbacks
+        // without claiming, setting, or restoring any channel.
+        let mut publishers = Vec::new();
+        for (label, t) in hwmon::read_temps("coretemp") {
+            publishers.push(
+                Publisher::new(temp_publisher_id(&label), label, "temperature")
+                    .value(json!(t))
+                    .unit("C"),
+            );
+        }
+
+        let mut sinks = Vec::new();
+        for ch in self.cfg.managed_channels() {
+            let duty_pct = hwmon::read_pwm_raw(&self.dir, ch).map(hwmon::raw_to_pct);
+            if let Some(pct) = duty_pct {
+                publishers.push(
+                    Publisher::new(format!("fan{ch}.duty"), format!("fan{ch} duty"), "fan-duty")
+                        .value(json!(pct))
+                        .unit("%")
+                        .range(0.0, 100.0),
+                );
+            }
+            if let Some(rpm) = hwmon::read_fan_rpm(&self.dir, ch) {
+                publishers.push(
+                    Publisher::new(format!("fan{ch}.rpm"), format!("fan{ch} RPM"), "fan-rpm")
+                        .value(json!(rpm))
+                        .unit("rpm"),
+                );
+            }
+
+            let state = match hwmon::read_pwm_enable(&self.dir, ch) {
+                Some(2) => SinkState::Released,
+                Some(1) if self.restore_armed => SinkState::Claimed,
+                Some(_) | None => SinkState::Unknown,
+            };
+            sinks.push(
+                Sink::new(format!("fan{ch}"), format!("fan{ch}"), "fan-duty")
+                    .range(0.0, 100.0)
+                    .unit("%")
+                    .readback(format!("fan{ch}.duty"))
+                    .safe(json!("auto"))
+                    .needs_claim(true)
+                    .state(state)
+                    .direction("up=more-cooling"),
+            );
+        }
+
+        Applied::ok(vec![Component::new(
+            "board",
+            self.cfg.chip.clone(),
+            "board",
+        )
+        .with_publishers(publishers)
+        .with_sinks(sinks)])
+    }
+
     fn apply(&mut self, inputs: Option<&Inputs>, ctrl: &mut Controller) -> Applied {
         let gpu_temps = input_temps_from(inputs, "nvidia");
         let cpu_temps = hwmon::read_temps("coretemp");
         let gpu_max = gpu_temps.iter().copied().max();
         let cpu_max = cpu_temps.iter().map(|(_, t)| *t).max();
         // Decision 2A: case fans follow max(GPU, CPU) — a desktop tower is one airflow chamber, so
-        // intake/exhaust must respond to CPU heat too (unlike asrock's directed-airflow server).
+        // intake/exhaust must respond to CPU heat too (unlike rome2d-fans' directed-airflow server).
         let case_raw_opt = [gpu_max, cpu_max].into_iter().flatten().max();
 
         let zones = self
@@ -149,8 +208,8 @@ impl Device for It87Device {
             .get_or_insert_with(|| Zones::for_main_path(ctrl.path()));
         let zone_mode = zones.both_present();
 
-        // Decide the commanded duty per managed channel + the driving record for the readings.
-        let (commanded, driving) = if zone_mode {
+        // Decide the commanded duty per managed channel + the driving publishers for the report.
+        let (commanded, driving_publishers) = if zone_mode {
             let (Some(cpu_raw), Some(case_raw)) = (cpu_max, case_raw_opt) else {
                 zones.cpu.reset();
                 zones.case.reset();
@@ -173,16 +232,49 @@ impl Device for It87Device {
                 "decision: set board fans (zone mode)"
             );
             let commanded = self.commanded_zone(cpu_pct, case_pct);
-            let driving = Reading::new(
-                "driving",
-                "driving",
-                json!({
-                    "mode": "zone",
-                    "cpu_raw": cpu_raw, "cpu_temp": cpu_duty.smoothed, "cpu_pct": cpu_pct,
-                    "case_raw": case_raw, "case_temp": case_duty.smoothed, "case_pct": case_pct,
-                }),
-            );
-            (commanded, driving)
+            (
+                commanded,
+                vec![
+                    Publisher::new("driving.mode", "Driving mode", "driving-mode")
+                        .value(json!("zone")),
+                    Publisher::new(
+                        "driving.cpu.raw",
+                        "CPU raw driving temperature",
+                        "driving-raw-temperature",
+                    )
+                    .value(json!(cpu_raw))
+                    .unit("C"),
+                    Publisher::new(
+                        "driving.cpu.temp",
+                        "CPU driving temperature",
+                        "driving-temperature",
+                    )
+                    .value(json!(cpu_duty.smoothed))
+                    .unit("C"),
+                    Publisher::new("driving.cpu.duty", "CPU driving duty", "driving-duty")
+                        .value(json!(cpu_pct))
+                        .unit("%")
+                        .range(0.0, 100.0),
+                    Publisher::new(
+                        "driving.case.raw",
+                        "Case raw driving temperature",
+                        "driving-raw-temperature",
+                    )
+                    .value(json!(case_raw))
+                    .unit("C"),
+                    Publisher::new(
+                        "driving.case.temp",
+                        "Case driving temperature",
+                        "driving-temperature",
+                    )
+                    .value(json!(case_duty.smoothed))
+                    .unit("C"),
+                    Publisher::new("driving.case.duty", "Case driving duty", "driving-duty")
+                        .value(json!(case_pct))
+                        .unit("%")
+                        .range(0.0, 100.0),
+                ],
+            )
         } else {
             let Some(raw) = case_raw_opt else {
                 return self.release_or_error("indeterminable temp");
@@ -199,12 +291,27 @@ impl Device for It87Device {
                 .into_iter()
                 .map(|ch| (ch, pct))
                 .collect();
-            let driving = Reading::new(
-                "driving",
-                "driving",
-                json!({ "mode": "uniform", "temp": duty.smoothed, "raw": raw, "pct": pct }),
-            );
-            (commanded, driving)
+            (
+                commanded,
+                vec![
+                    Publisher::new("driving.mode", "Driving mode", "driving-mode")
+                        .value(json!("uniform")),
+                    Publisher::new("driving.temp", "Driving temperature", "driving-temperature")
+                        .value(json!(duty.smoothed))
+                        .unit("C"),
+                    Publisher::new(
+                        "driving.raw",
+                        "Raw driving temperature",
+                        "driving-raw-temperature",
+                    )
+                    .value(json!(raw))
+                    .unit("C"),
+                    Publisher::new("driving.duty", "Driving duty", "driving-duty")
+                        .value(json!(pct))
+                        .unit("%")
+                        .range(0.0, 100.0),
+                ],
+            )
         };
 
         // Command the duties. A channel is put under manual control and set in one call; on the first
@@ -216,24 +323,54 @@ impl Device for It87Device {
             }
         }
 
-        // Build readings: GPU temp (routed), CPU temps, the driving record, and per-channel pwm+rpm.
-        let mut readings = Vec::new();
-        if let Some(g) = gpu_max {
-            readings.push(Reading::new("temp", "GPU", json!({ "temp": g })));
-        }
+        // Build the component report. Routed GPU temps are not re-published; they appear as
+        // sink `driven_by` metadata so the UI can show provenance without duplicate devices.
+        let mut publishers = Vec::new();
         for (label, t) in &cpu_temps {
-            readings.push(Reading::new("temp", label.clone(), json!({ "temp": t })));
+            publishers.push(
+                Publisher::new(temp_publisher_id(label), label.clone(), "temperature")
+                    .value(json!(t))
+                    .unit("C"),
+            );
         }
-        readings.push(driving);
+        publishers.extend(driving_publishers);
+        let mut sinks = Vec::new();
         for &(ch, pct) in &commanded {
-            let mut f = serde_json::Map::new();
-            f.insert("pwm".to_string(), json!(pct));
+            publishers.push(
+                Publisher::new(format!("fan{ch}.duty"), format!("fan{ch} duty"), "fan-duty")
+                    .value(json!(pct))
+                    .unit("%")
+                    .range(0.0, 100.0),
+            );
             if let Some(rpm) = hwmon::read_fan_rpm(&self.dir, ch) {
-                f.insert("rpm".to_string(), json!(rpm));
+                publishers.push(
+                    Publisher::new(format!("fan{ch}.rpm"), format!("fan{ch} RPM"), "fan-rpm")
+                        .value(json!(rpm))
+                        .unit("rpm"),
+                );
             }
-            readings.push(Reading::new("fan", format!("fan{ch}"), json!(f)));
+            sinks.push(
+                Sink::new(format!("fan{ch}"), format!("fan{ch}"), "fan-duty")
+                    .range(0.0, 100.0)
+                    .unit("%")
+                    .value(json!(pct))
+                    .readback(format!("fan{ch}.duty"))
+                    .safe(json!("auto"))
+                    .needs_claim(true)
+                    .state(SinkState::Claimed)
+                    .direction("up=more-cooling")
+                    .driven_by(driven_by_for_channel(
+                        ch, &self.cfg, gpu_max, cpu_max, zone_mode,
+                    )),
+            );
         }
-        Applied::ok(readings)
+        Applied::ok(vec![Component::new(
+            "board",
+            self.cfg.chip.clone(),
+            "board",
+        )
+        .with_publishers(publishers)
+        .with_sinks(sinks)])
     }
 
     fn restore(&mut self) {
@@ -284,7 +421,7 @@ impl It87Device {
     }
 
     /// Release all channels to firmware/automatic and report the tick as an `error` — the safe
-    /// fallback when no duty can be determined (no temp / no usable curve). Mirrors asrock.
+    /// fallback when no duty can be determined (no temp / no usable curve). Mirrors rome2d-fans.
     fn release_or_error(&self, why: &str) -> Applied {
         match self.restore_to_auto() {
             Ok(()) => Applied::error(format!("{why} — released to firmware/automatic")),
@@ -303,19 +440,93 @@ impl Drop for It87Device {
     }
 }
 
-/// Extract temperature readings only from inputs whose SOURCE MODULE is `src` (keys are `module:id`;
+fn it87_schema_component(cfg: &It87Config) -> Component {
+    let publishers = vec![
+        Publisher::new("cpu.temp", "CPU temperature", "temperature").unit("C"),
+        Publisher::new("driving.temp", "Driving temperature", "driving-temperature").unit("C"),
+        Publisher::new("driving.duty", "Driving duty", "driving-duty")
+            .unit("%")
+            .range(0.0, 100.0),
+    ];
+    let sinks = cfg
+        .managed_channels()
+        .into_iter()
+        .map(|ch| {
+            Sink::new(format!("fan{ch}"), format!("fan{ch}"), "fan-duty")
+                .range(0.0, 100.0)
+                .unit("%")
+                .safe(json!("auto"))
+                .needs_claim(true)
+                .direction("up=more-cooling")
+        })
+        .collect();
+    Component::new("board", format!("{} fans", cfg.chip), "board")
+        .with_publishers(publishers)
+        .with_sinks(sinks)
+}
+
+fn temp_publisher_id(label: &str) -> String {
+    format!(
+        "temp.{}",
+        label
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('_')
+    )
+}
+
+fn driven_by_for_channel(
+    ch: u8,
+    cfg: &It87Config,
+    gpu_max: Option<i32>,
+    cpu_max: Option<i32>,
+    zone_mode: bool,
+) -> Vec<DrivenBy> {
+    let mut out = Vec::new();
+    let cpu_zone = cfg.cpu_channels.contains(&ch);
+    if let Some(v) = cpu_max {
+        out.push(
+            DrivenBy::new("self")
+                .publisher("board/cpu.temp")
+                .value(json!(v))
+                .unit("C"),
+        );
+    }
+    if !zone_mode || !cpu_zone {
+        if let Some(v) = gpu_max {
+            out.push(
+                DrivenBy::new("nvidia")
+                    .publisher("gpu/temp")
+                    .value(json!(v))
+                    .unit("C"),
+            );
+        }
+    }
+    out
+}
+
+/// Extract temperature publishers only from inputs whose SOURCE MODULE is `src` (keys are `module:id`;
 /// module names cannot contain `:` — enforced by the registry — so the `module:` prefix is
-/// unambiguous). Mirrors asrock's helper.
+/// unambiguous). Mirrors rome2d-fans' helper.
 fn input_temps_from(inputs: Option<&Inputs>, src: &str) -> Vec<i32> {
     let mut v = Vec::new();
     if let Some(inputs) = inputs {
         let prefix = format!("{src}:");
-        for (key, readings) in inputs {
+        for (key, components) in inputs {
             if key.starts_with(&prefix) {
-                for r in readings {
-                    if r.kind == "temp" {
-                        if let Some(t) = r.get_i64("temp") {
-                            v.push(t as i32);
+                for c in components {
+                    for p in &c.publishers {
+                        if p.kind == "temperature" {
+                            if let Some(t) = p.value_i64() {
+                                v.push(t as i32);
+                            }
                         }
                     }
                 }
@@ -323,6 +534,17 @@ fn input_temps_from(inputs: Option<&Inputs>, src: &str) -> Vec<i32> {
         }
     }
     v
+}
+
+#[cfg(test)]
+fn temp_component(label: &str, temp: i64, class: &str) -> Component {
+    Component::new(label.to_ascii_lowercase(), label, class).with_publishers(vec![Publisher::new(
+        "temp",
+        "Temperature",
+        "temperature",
+    )
+    .value(json!(temp))
+    .unit("C")])
 }
 
 #[cfg(test)]
@@ -364,11 +586,11 @@ mod tests {
         let mut inputs: Inputs = HashMap::new();
         inputs.insert(
             "nvidia:GPU-1".into(),
-            vec![Reading::new("temp", "GPU", json!({"temp": 63}))],
+            vec![temp_component("GPU", 63, "gpu")],
         );
         inputs.insert(
             "nvme:SER-A".into(),
-            vec![Reading::new("temp", "Composite", json!({"temp": 44}))],
+            vec![temp_component("Composite", 44, "ssd")],
         );
         assert_eq!(input_temps_from(Some(&inputs), "nvidia"), vec![63]);
         // A short source name must not match a longer module (the `:` guards it).

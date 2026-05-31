@@ -15,10 +15,10 @@ directives. Global lines: a bare `key=value` whose first token contains `=`.
 # globals (defaults): base_tick=100 (ms), detect_every=10, max_backoff=300, status_bind=0.0.0.0:9876
 nvidia                       every=500ms timeout=3
 nvme
-asrock16-2t  input=nvidia input=nvme
+rome2d-fans  input=nvidia input=nvme
 ```
-- `input=<module>`: relay that module's instances' last `readings` arrays into this module's
-  `apply.inputs` (keyed by `module:id`). **Multiple sources** are allowed — repeat `input=` and/or
+- `input=<module>`: relay that module's instances' last `components` arrays into this module's
+  `apply.inputs` (component lists keyed by `module:id`). **Multiple sources** are allowed — repeat `input=` and/or
   use a comma list (`input=nvidia input=nvme` ≡ `input=nvidia,nvme`); order preserved, duplicates
   dropped. Unknown module directives are preserved but ignored (forward-compat). Unknown globals are
   warned + ignored.
@@ -62,7 +62,7 @@ asrock16-2t  input=nvidia input=nvme
      ≈ `max(every, apply_duration)` quantised to `base_tick`. A due-but-busy instance bumps a
      per-instance `skipped_busy` counter.
    - **Reap:** drain every result a worker posted asynchronously since the last wake and fold it into
-     state (status/readings/blackboard + per-instance latency); a posting worker is idle again.
+     state (status/components/blackboard + per-instance latency); a posting worker is idle again.
    Each instance worker runs its `apply` on **its own thread/process under its own `timeout`** — not
    gated by the base tick. Both the stdin write and stdout read are **non-blocking and
    deadline-bounded**: a module that stops reading its stdin, writes a partial line, or floods stdout
@@ -70,14 +70,14 @@ asrock16-2t  input=nvidia input=nvme
    sibling (the isolation guarantee). A response line larger than 256 KiB is a protocol violation and
    killed. A leading optional `hello` line is consumed/skipped. No instance ever blocks the scheduler
    or another instance: the loop never waits on a reply.
-4. **apply result handling:** `ok` → store readings (+ blackboard), record latency, mark idle.
+4. **apply result handling:** `ok` → store components (+ blackboard), record latency, mark idle.
    `error` → keep the instance, surface the reason, retry next time it is due. `fatal`
    (module-declared) → respawn on a **long backoff** (jumps straight to the `max_backoff` cap).
    Missed `timeout` / process exit / protocol violation → `SIGKILL` if needed and respawn with per-id
    **exponential** crash-loop backoff (2,4,8,… seconds, capped at `max_backoff`; backstop). aiolos
    **never gives up** — it retries forever, only ever slowing to the cap. The module's own
    shutdown/EOF path performs the device-safe restore. When an instance is removed (vanished or dead)
-   its blackboard entry **and its scheduler slot** are pruned, so stale readings are never relayed as
+   its blackboard entry **and its scheduler slot** are pruned, so stale components are never relayed as
    `inputs`.
    - A **control module that cannot load a usable curve at startup** declares this `fatal` on its
      first `apply` (so the reason reaches the status page) and exits non-zero, leaving its device
@@ -105,17 +105,17 @@ asrock16-2t  input=nvidia input=nvme
   Keeps the unit config-agnostic (no module names in the unit file).
 
 ## Data routing (blackboard)
-The orchestrator keeps each instance's last `readings`. For a module configured `input=X [Y …]`, it
-includes every named source's instances' readings (keyed by `module:id`, so the consumer can
-attribute each reading to its source module and keys never collide across sources) as `inputs` in
+The orchestrator keeps each instance's last `components`. For a module configured `input=X [Y …]`, it
+includes every named source's instances' components (keyed by `module:id`, so the consumer can
+attribute each component/publisher to its source module and keys never collide across sources) as `inputs` in
 this module's next `apply`. Values are relayed verbatim and uninterpreted (orchestrator stays
 agnostic). Under the SOW-0013 scheduler each consumer receives the producer's **most recent
-completed** readings as of the consumer's own dispatch (built from the live blackboard at dispatch
+completed** components as of the consumer's own dispatch (built from the live blackboard at dispatch
 time) — producers and consumers run on independent cadences, so there is no within-tick ordering
 dependency.
 
 ## State & status web page
-Holds: registry, per-module detect results, per-instance last readings + status + last error +
+Holds: registry, per-module detect results, per-instance last components + status + last error +
 restart count + last-seen, captured stderr tail, and per-instance **scheduler state** (SOW-0013:
 busy/idle, last dispatch, last `apply` latency, and the delay-not-skip `skipped_busy` counter, kept
 in `AppState.sched` for the status page / metrics to surface). Serves a **read-only** HTTP status
@@ -144,7 +144,7 @@ unkillable by anyone but stays harmless to others — orphaned, siblings keep ti
 
 ## Acceptance criteria
 - Spawns/reconciles modules from the registry; routes `input=` data correctly (most-recent completed
-  readings at the consumer's dispatch).
+  components at the consumer's dispatch).
 - Each anemos runs on its own cadence; a slow anemos runs at ≈ `max(every, apply_duration)` and is
   **never killed** for being slow (only a `timeout` breach kills+restores). A hung/partial anemos is
   killed at *its* `timeout` and respawned; siblings keep firing at their `every` throughout.
@@ -154,5 +154,5 @@ unkillable by anyone but stays harmless to others — orphaned, siblings keep ti
 - A supervisor thread that panics is respawned (backoff-bounded) with no orphaned/duplicate
   instances; the device keeps being regulated or falls back to firmware in the interim.
 - `aiolos restore` returns every configured module's device to firmware/BMC auto (ExecStopPost net).
-- Status page reflects live readings, per-instance health, and recent errors.
+- Status page reflects live components, per-instance health, and recent errors.
 - Idle RSS is single-digit MB; binary is low-MB.

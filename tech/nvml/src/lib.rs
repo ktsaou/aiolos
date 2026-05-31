@@ -1,7 +1,7 @@
 //! Level-1 tech: NVML GPU access via the `nvml-wrapper` crate.
 //!
 //! Pure device technology — enumerate GPUs, read temperature, set/restore per-fan duty. No curve,
-//! EMA, protocol, or readings concepts (those belong to the SDK + the anemos). Manual fan control
+//! EMA, protocol, or report concepts (those belong to the SDK + the anemos). Manual fan control
 //! PERSISTS after a process exits (the driver does NOT auto-revert), so a `Gpu` restores firmware
 //! fan control in its `Drop`.
 
@@ -350,21 +350,21 @@ impl Gpu {
         Ok(())
     }
 
-    /// Current power draw (mW), if readable (for readings).
+    /// Current power draw (mW), if readable (for reports).
     pub fn power_usage(&mut self) -> Option<u32> {
         let idx = self.resolve_index().ok()?;
         let dev = self.nvml.device_by_index(idx).ok()?;
         dev.power_usage().ok()
     }
 
-    /// Current fan duty % for `fan`, if readable (for readings).
+    /// Current fan duty % for `fan`, if readable (for reports).
     pub fn fan_speed(&mut self, fan: u32) -> Option<u32> {
         let idx = self.resolve_index().ok()?;
         let dev = self.nvml.device_by_index(idx).ok()?;
         dev.fan_speed(fan).ok()
     }
 
-    /// Current fan RPM for `fan`, if readable (for readings).
+    /// Current fan RPM for `fan`, if readable (for reports).
     pub fn fan_rpm(&mut self, fan: u32) -> Option<u32> {
         let idx = self.resolve_index().ok()?;
         let dev = self.nvml.device_by_index(idx).ok()?;

@@ -118,7 +118,7 @@ pub struct PowerSignal {
 pub enum Decision {
     /// Hold the firmware default (AC present, or no trigger met) — lift any prior cap.
     Lift,
-    /// Cap the limit (a trigger fired). The reason is carried for logging/readings.
+    /// Cap the limit (a trigger fired). The reason is carried for logging/components.
     Cap(CapReason),
 }
 

@@ -1,7 +1,7 @@
 /* Aiolos dashboard — vanilla JS, no frameworks, no external network.
    Polls /status.json + /history.json; builds tabs dynamically from the live module/instance set;
-   renders home/overview, per-module, curve, time-series and health views; drives an animated wind
-   backdrop whose intensity reflects live "system pressure" (max normalised temp/duty). */
+   renders device-centric home, per-module, curve, time-series and health views; drives an animated
+   wind backdrop whose speed reflects live "system pressure" (max normalised temp/duty). */
 'use strict';
 
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -14,6 +14,7 @@ const state = {
   tab: 'home',       // active tab id
   pressure: 0,       // 0..1 fleet pressure
   curveCache: {},    // module -> curve json
+  series: { rangeMs: 15 * 60 * 1000, endT: null, hidden: {} },
   failures: 0,
 };
 
@@ -38,18 +39,91 @@ const $ = (id) => document.getElementById(id);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const fmt = (v, d = 0) => (v == null || isNaN(v)) ? '–' : Number(v).toFixed(d);
 
-/* ---------- reading aggregation (mirrors the server's headline series) ---------- */
-function aggregate(readings) {
+/* ---------- component aggregation (mirrors the server's headline series) ---------- */
+function pnum(p) {
+  if (!p || p.value == null) return null;
+  const n = Number(p.value);
+  return Number.isFinite(n) ? n : null;
+}
+function snum(s) {
+  if (!s || s.value == null) return null;
+  const n = Number(s.value);
+  return Number.isFinite(n) ? n : null;
+}
+function aggregate(components) {
   let maxTemp = null, drivingTemp = null, drivingPct = null, maxPwm = null, maxRpm = null;
-  for (const r of readings || []) {
-    if (r.type === 'temp' && r.temp != null) maxTemp = maxTemp == null ? r.temp : Math.max(maxTemp, r.temp);
-    else if (r.type === 'driving') { if (r.temp != null) drivingTemp = r.temp; if (r.pct != null) drivingPct = r.pct; }
-    else if (r.type === 'fan') {
-      if (r.pwm != null) maxPwm = maxPwm == null ? r.pwm : Math.max(maxPwm, r.pwm);
-      if (r.rpm != null) maxRpm = maxRpm == null ? r.rpm : Math.max(maxRpm, r.rpm);
+  for (const c of components || []) {
+    for (const p of (c.publishers || [])) {
+      const v = pnum(p);
+      if (v == null) continue;
+      if (p.kind === 'temperature') maxTemp = maxTemp == null ? v : Math.max(maxTemp, v);
+      else if (p.kind === 'driving-temperature') drivingTemp = v;
+      else if (p.kind === 'driving-duty') drivingPct = v;
+      else if (p.kind === 'fan-duty') maxPwm = maxPwm == null ? v : Math.max(maxPwm, v);
+      else if (p.kind === 'fan-rpm') maxRpm = maxRpm == null ? v : Math.max(maxRpm, v);
+    }
+    for (const k of (c.sinks || [])) {
+      const v = snum(k);
+      if (v != null && k.kind === 'fan-duty') maxPwm = maxPwm == null ? v : Math.max(maxPwm, v);
     }
   }
   return { temp: drivingTemp != null ? drivingTemp : maxTemp, duty: drivingPct != null ? drivingPct : maxPwm, rpm: maxRpm };
+}
+
+function primaryValue(c) {
+  const agg = aggregate([c]);
+  if (agg.temp != null) return { value: fmt(agg.temp), unit: '°C', cls: tempClass(agg.temp), label: 'temp' };
+  if (agg.duty != null) return { value: fmt(agg.duty), unit: '%', cls: '', label: 'duty' };
+  if (agg.rpm != null) return { value: fmt(agg.rpm), unit: 'rpm', cls: '', label: 'fan' };
+  const p = (c.publishers || []).find(x => x.value != null);
+  return p ? { value: String(p.value), unit: p.unit || '', cls: '', label: p.label || p.kind } : { value: '–', unit: '', cls: '', label: 'idle' };
+}
+
+function classTitle(cls) {
+  const names = { gpu: 'GPUs', cpu: 'CPUs', ssd: 'SSDs', board: 'Boards', power: 'Power', nic: 'NICs', fan: 'Fans', mock: 'Mock' };
+  return names[cls] || (cls ? cls[0].toUpperCase() + cls.slice(1) : 'Devices');
+}
+
+function classGlyph(cls) {
+  const icons = { gpu: '▣', cpu: '◈', ssd: '▭', board: '✣', power: '⚡', nic: '⇄', fan: '✺', mock: '◇' };
+  return icons[cls] || '◌';
+}
+
+function classIcon(cls, component) {
+  const s = svg('svg', { class: 'class-icon-svg ' + (cls || 'device'), viewBox: '0 0 24 24', 'aria-hidden': 'true' });
+  const add = (tag, attrs) => s.append(svg(tag, attrs));
+  if (cls === 'power') {
+    add('rect', { x: 4, y: 7, width: 14, height: 10, rx: 2 });
+    add('path', { d: 'M18 10h2v4h-2M8 12h6' });
+  } else if (cls === 'ssd') {
+    add('rect', { x: 4, y: 5, width: 16, height: 14, rx: 2 });
+    add('path', { d: 'M8 9h8M8 13h5M7 17h1M11 17h1M15 17h1' });
+  } else if (cls === 'nic') {
+    add('path', { d: 'M4 8h16v8H4zM8 8V5h8v3M8 16v3M16 16v3M9 12h6' });
+  } else if (cls === 'gpu') {
+    add('rect', { x: 3, y: 7, width: 16, height: 10, rx: 2 });
+    add('path', { d: 'M19 10h2v4h-2M7 10h5v4H7zM8 4v3M14 4v3' });
+  } else if (cls === 'cpu') {
+    add('rect', { x: 7, y: 7, width: 10, height: 10, rx: 1.5 });
+    add('path', { d: 'M4 8h3M4 12h3M4 16h3M17 8h3M17 12h3M17 16h3M8 4v3M12 4v3M16 4v3M8 17v3M12 17v3M16 17v3' });
+  } else {
+    add('circle', { cx: 12, cy: 12, r: 8 });
+    add('path', { d: 'M12 6v12M6 12h12M8.5 8.5l7 7M15.5 8.5l-7 7' });
+  }
+  const rpm = aggregate(component ? [component] : []).rpm;
+  if (rpm != null && rpm > 0) {
+    s.classList.add('spinning');
+    s.style.animationDuration = clamp(120 / rpm, 0.08, 1.2).toFixed(2) + 's';
+  }
+  return s;
+}
+
+function flattenDevices(status) {
+  const out = [];
+  for (const i of (status.instances || [])) {
+    for (const c of (i.components || [])) out.push({ inst: i, component: c, key: i.module + ':' + i.id + '/' + c.id });
+  }
+  return out;
 }
 
 // Normalised "pressure" of one instance: blend of temp (30..90C) and duty (0..100%).
@@ -93,7 +167,7 @@ function onData() {
   const s = state.status;
   // fleet pressure = max instance pressure
   let p = 0, count = 0;
-  for (const i of (s.instances || [])) { p = Math.max(p, instPressure(aggregate(i.readings))); count++; }
+  for (const i of (s.instances || [])) { p = Math.max(p, instPressure(aggregate(i.components))); count++; }
   state.pressure = p;
   updateHeader(count);
   buildTabs();
@@ -180,7 +254,7 @@ function viewHome() {
   // KPI strip
   let maxTemp = null, maxDuty = null, up = 0;
   for (const i of instances) {
-    const a = aggregate(i.readings);
+    const a = aggregate(i.components);
     if (a.temp != null) maxTemp = maxTemp == null ? a.temp : Math.max(maxTemp, a.temp);
     if (a.duty != null) maxDuty = maxDuty == null ? a.duty : Math.max(maxDuty, a.duty);
     if (i.status === 'ok') up++;
@@ -195,15 +269,60 @@ function viewHome() {
   ]));
   frag.append(el('h2', { class: 'section-title', text: 'The Fleet' }), kpiPanel);
 
-  // per-module summary cards
+  // device-centric home: group by component class, not by anemos name.
+  const devices = flattenDevices(s);
+  frag.append(el('h2', { class: 'section-title', text: 'Devices' }), deviceGroups(devices));
+
+  // Keep module health visible below the device view.
   const mm = modulesMap(s);
   const cards = el('div', { class: 'grid cards' });
-  for (const name of Object.keys(mm).sort()) {
-    cards.append(moduleSummaryCard(name, mm[name]));
-  }
+  for (const name of Object.keys(mm).sort()) cards.append(moduleSummaryCard(name, mm[name]));
   if (!Object.keys(mm).length) cards.append(el('div', { class: 'empty', text: 'No modules detected yet — the winds are still gathering.' }));
   frag.append(el('h2', { class: 'section-title', text: 'The Anemoi' }), cards);
   return frag;
+}
+
+function deviceGroups(devices) {
+  if (!devices.length) return el('div', { class: 'empty', text: 'No components reported yet — waiting for the first tick.' });
+  const by = {};
+  for (const d of devices) (by[d.component.class || 'device'] ||= []).push(d);
+  const wrap = el('div', { class: 'device-groups' });
+  for (const cls of Object.keys(by).sort()) {
+    const group = el('section', { class: 'device-group' });
+    group.append(el('h3', { class: 'device-group-title' }, [
+      classIcon(cls),
+      classTitle(cls),
+    ]));
+    const grid = el('div', { class: 'grid cards' });
+    for (const d of by[cls].sort((a, b) => a.component.label.localeCompare(b.component.label))) grid.append(deviceCard(d));
+    group.append(grid);
+    wrap.append(group);
+  }
+  return wrap;
+}
+
+function deviceCard(d) {
+  const { inst: i, component: c } = d;
+  const p = primaryValue(c);
+  const a = aggregate([c]);
+  const ok = i.status === 'ok';
+  const card = el('div', { class: 'panel device-card' });
+  card.append(el('div', { class: 'card-head' }, [
+    el('div', {}, [
+      el('span', { class: 'name device-name' }, [classIcon(c.class, c), el('span', { text: c.label || c.id })]),
+      el('div', { class: 'id', text: `${i.module}:${i.id} · ${c.id}` }),
+    ]),
+    el('span', { class: 'badge ' + (ok ? 'ok' : 'bad'), text: i.status }),
+  ]));
+  card.append(el('div', { class: 'stats' }, [
+    stat(p.value, p.unit, p.label, p.cls),
+    a.duty != null ? stat(fmt(a.duty), '%', 'duty') : null,
+    a.rpm != null ? stat(fmt(a.rpm), 'rpm', 'fan') : null,
+    stat(String((c.publishers || []).length), '', 'signals'),
+  ]));
+  if (a.duty != null) { const bar = el('div', { class: 'bar' }); const f = el('span'); f.style.width = clamp(a.duty, 0, 100) + '%'; bar.append(f); card.append(bar); }
+  card.append(componentDetail(c));
+  return card;
 }
 
 function kpi(v, unit, k, color) {
@@ -224,7 +343,7 @@ function moduleSummaryCard(name, mod) {
   ]));
   // aggregate across instances
   let mt = null, md = null, mr = null;
-  for (const i of insts) { const a = aggregate(i.readings); if (a.temp != null) mt = Math.max(mt ?? -1e9, a.temp); if (a.duty != null) md = Math.max(md ?? -1e9, a.duty); if (a.rpm != null) mr = Math.max(mr ?? -1e9, a.rpm); }
+  for (const i of insts) { const a = aggregate(i.components); if (a.temp != null) mt = Math.max(mt ?? -1e9, a.temp); if (a.duty != null) md = Math.max(md ?? -1e9, a.duty); if (a.rpm != null) mr = Math.max(mr ?? -1e9, a.rpm); }
   card.append(el('div', { class: 'stats' }, [
     stat(fmt(mt), '°C', 'temp', tempClass(mt)),
     stat(fmt(md), '%', 'duty'),
@@ -262,7 +381,7 @@ function viewModule(name) {
 
 function instanceCard(i) {
   const card = el('div', { class: 'panel' });
-  const a = aggregate(i.readings);
+  const a = aggregate(i.components);
   const ok = i.status === 'ok';
   card.append(el('div', { class: 'card-head' }, [
     el('div', {}, [el('span', { class: 'name', text: i.name || i.id }), el('div', { class: 'id', text: i.id })]),
@@ -277,17 +396,32 @@ function instanceCard(i) {
   if (a.duty != null) { const bar = el('div', { class: 'bar' }); const f = el('span'); f.style.width = clamp(a.duty, 0, 100) + '%'; bar.append(f); card.append(bar); }
   // sparkline of this instance's temp from history
   card.append(sparkline(i.module + ':' + i.id));
-  // readings detail
-  card.append(readingsList(i.readings));
+  // component detail
+  card.append(componentsList(i.components));
   return card;
 }
 
-function readingsList(readings) {
-  const box = el('div', { class: 'readings' });
-  for (const r of readings || []) {
-    const fields = Object.keys(r).filter(k => k !== 'type' && k !== 'label')
-      .map(k => `<span class="k">${escapeHtml(k)}</span>=${escapeHtml(String(r[k]))}`).join('  ');
-    box.append(el('div', { html: `<span class="lbl">${escapeHtml(r.type)}·${escapeHtml(r.label)}</span> ${fields}` }));
+function componentsList(components) {
+  const box = el('div', { class: 'components-report' });
+  for (const c of components || []) box.append(componentDetail(c));
+  return box;
+}
+
+function componentDetail(c) {
+  const box = el('div', { class: 'component-detail' });
+  box.append(el('div', { class: 'component-title', text: `${classGlyph(c.class)} ${c.label || c.id} · ${c.class || 'device'}` }));
+  for (const p of (c.publishers || [])) {
+    if (p.value == null) continue;
+    const unit = p.unit ? ` ${escapeHtml(p.unit)}` : '';
+    box.append(el('div', { html: `<span class="lbl">${escapeHtml(p.label || p.id)}</span> <span class="k">${escapeHtml(p.kind)}</span>=${escapeHtml(String(p.value))}${unit}` }));
+  }
+  for (const k of (c.sinks || [])) {
+    const val = k.value != null ? `${escapeHtml(String(k.value))}${k.unit ? ' ' + escapeHtml(k.unit) : ''}` : '–';
+    const by = (k.driven_by || []).map(d => {
+      const v = d.value != null ? ` ${escapeHtml(String(d.value))}${d.unit ? escapeHtml(d.unit) : ''}` : '';
+      return `${escapeHtml(d.from)}${d.publisher ? '/' + escapeHtml(d.publisher) : ''}${v}`;
+    }).join(', ');
+    box.append(el('div', { html: `<span class="lbl">sink ${escapeHtml(k.label || k.id)}</span> <span class="k">${escapeHtml(k.state || 'unknown')}</span>→${val}${by ? ` · driven by ${by}` : ''}` }));
   }
   return box;
 }
@@ -337,12 +471,24 @@ function viewCurves() {
 }
 
 function moduleOperatingPoint(insts) {
-  // returns {temp, pct} from a driving reading, else from aggregate temp + duty
+  // returns {temp, pct} from driving publishers, else from aggregate temp + duty
   for (const i of insts) {
-    for (const r of (i.readings || [])) if (r.type === 'driving' && r.temp != null) return { temp: r.raw != null ? r.raw : r.temp, pct: r.pct };
+    for (const c of (i.components || [])) {
+      let raw = null, temp = null, pct = null;
+      for (const p of (c.publishers || [])) {
+        if (p.kind === 'driving-raw-temperature') raw = pnum(p);
+        else if (p.kind === 'driving-temperature') temp = pnum(p);
+        else if (p.kind === 'driving-duty') pct = pnum(p);
+      }
+      if (temp != null || raw != null) return { temp: raw != null ? raw : temp, pct };
+    }
   }
   let temp = null, pct = null;
-  for (const i of insts) { const a = aggregate(i.readings); if (a.temp != null) temp = Math.max(temp ?? -1e9, a.temp); if (a.duty != null) pct = Math.max(pct ?? -1e9, a.duty); }
+  for (const i of insts) {
+    const a = aggregate(i.components);
+    if (a.temp != null) temp = Math.max(temp ?? -1e9, a.temp);
+    if (a.duty != null) pct = Math.max(pct ?? -1e9, a.duty);
+  }
   return { temp, pct };
 }
 
@@ -423,6 +569,12 @@ function renderCurve(holder, name, c, op) {
 }
 
 /* ---------- TIME-SERIES view ---------- */
+const SERIES_FIELDS = [
+  { field: 'temp', label: 'Temperature', unit: '°C', axis: 'left', fixed: [20, 100], dash: '' },
+  { field: 'duty', label: 'Fan duty', unit: '%', axis: 'right', fixed: [0, 100], dash: '4 3' },
+  { field: 'rpm', label: 'Fan RPM', unit: 'rpm', axis: 'far', fixed: null, dash: '1 3' },
+];
+
 function viewSeries() {
   const frag = document.createDocumentFragment();
   frag.append(el('h2', { class: 'section-title', text: 'Time-series' }));
@@ -431,73 +583,266 @@ function viewSeries() {
     frag.append(el('div', { class: 'panel empty', text: 'Gathering history… time-series appear after a few snapshots (every 5s).' }));
     return frag;
   }
-  // keys present in the latest snapshot
-  const last = snaps[snaps.length - 1];
-  const keys = (last.instances || []).map(x => x.key);
-  const grid = el('div', { class: 'grid cols-2' });
-  grid.append(seriesPanel('Temperatures', snaps, keys, 'temp', '°C', [20, 100]));
-  grid.append(seriesPanel('Fan duty', snaps, keys, 'duty', '%', [0, 100]));
-  grid.append(seriesPanel('Fan RPM', snaps, keys, 'rpm', 'rpm', null));
-  frag.append(grid);
+  frag.append(multiAxisSeriesPanel(snaps));
   return frag;
 }
 
 const PALETTE = ['#e8c466', '#5fd3e0', '#62d6a0', '#f06a6a', '#b98e2e', '#3a93c9', '#c98ad6', '#f0b341', '#7fd1a4', '#7aa5e0'];
+const FIELD_COLOR = { temp: 'var(--aether)', duty: 'var(--accent)', rpm: 'var(--good)' };
 
-function seriesPanel(title, snaps, keys, field, unit, fixedRange) {
-  const panel = el('div', { class: 'panel' });
-  panel.append(el('h3', { text: title }));
-  const W = 520, H = 220, padL = 36, padR = 10, padT = 10, padB = 20;
-  const s = svg('svg', { class: 'chart', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none' });
+function multiAxisSeriesPanel(snaps) {
+  const panel = el('div', { class: 'panel series-panel' });
+  panel.append(el('div', { class: 'chart-head' }, [
+    el('div', {}, [
+      el('h3', { text: 'Combined fleet telemetry' }),
+      el('div', { class: 'chart-sub', text: 'One chart, three y-axes: °C (left), % (right), RPM (far right). Hover for values; wheel to zoom.' }),
+    ]),
+    seriesControls(snaps),
+  ]));
 
-  // collect series
-  const series = [];
-  keys.forEach((key, idx) => {
-    const ys = [];
-    for (const sn of snaps) { const hi = (sn.instances || []).find(x => x.key === key); ys.push(hi ? (hi[field] ?? null) : null); }
-    if (ys.some(v => v != null)) series.push({ key, ys, color: PALETTE[idx % PALETTE.length] });
-  });
-  if (!series.length) { panel.append(el('div', { class: 'empty', text: 'No data for this metric.' })); return panel; }
-
-  // y-range
-  let lo = Infinity, hi = -Infinity;
-  for (const se of series) for (const v of se.ys) if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
-  if (fixedRange) { lo = Math.min(lo, fixedRange[0]); hi = Math.max(hi, fixedRange[1]); }
-  if (!isFinite(lo)) { lo = 0; hi = 1; }
-  if (hi - lo < 1) { hi += 1; lo -= 1; }
-  const t0 = snaps[0].t, t1 = snaps[snaps.length - 1].t, tspan = (t1 - t0) || 1;
-  const X = (t) => padL + (t - t0) / tspan * (W - padL - padR);
-  const Y = (v) => (H - padB) - (v - lo) / (hi - lo) * (H - padT - padB);
-
-  // gridlines + y labels
-  for (let g = 0; g <= 4; g++) {
-    const v = lo + (hi - lo) * g / 4, y = Y(v);
-    s.append(svg('line', { x1: padL, y1: y, x2: W - padR, y2: y, class: 'axis' }));
-    const tx = svg('text', { x: padL - 5, y: y + 3, class: 'axis-txt', 'text-anchor': 'end' }); tx.textContent = Math.round(v);
-    s.append(tx);
+  const visible = windowedSnaps(snaps);
+  const series = collectSeries(visible);
+  if (!series.length) {
+    panel.append(el('div', { class: 'empty', text: 'No numeric telemetry in the selected range.' }));
+    return panel;
   }
-  // x labels (start / end relative seconds)
-  const ageS = Math.round((t1 - t0) / 1000);
-  const txl = svg('text', { x: padL, y: H - 5, class: 'axis-txt', 'text-anchor': 'start' }); txl.textContent = '-' + ageS + 's';
-  const txr = svg('text', { x: W - padR, y: H - 5, class: 'axis-txt', 'text-anchor': 'end' }); txr.textContent = 'now';
-  s.append(txl, txr);
 
-  // lines (gaps where null)
-  for (const se of series) {
+  const active = series.filter(se => !state.series.hidden[se.id]);
+  const W = 900, H = 360, padL = 58, padR = 112, padT = 20, padB = 36;
+  const plotL = padL, plotR = W - padR, plotT = padT, plotB = H - padB;
+  const plotW = plotR - plotL, plotH = plotB - plotT;
+  const chart = el('div', { class: 'chart-wrap' });
+  const tip = el('div', { class: 'chart-tip hidden' });
+  const s = svg('svg', { class: 'chart multi-axis-chart', viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none' });
+  const t0 = visible[0].t, t1 = visible[visible.length - 1].t, tspan = (t1 - t0) || 1;
+  const X = (t) => plotL + (t - t0) / tspan * plotW;
+  const domain = axisDomains(active);
+  const Y = (field, v) => {
+    const d = domain[field] || [0, 1];
+    return plotB - (v - d[0]) / (d[1] - d[0]) * plotH;
+  };
+
+  s.append(svg('rect', { x: plotL, y: plotT, width: plotW, height: plotH, class: 'plot-bg' }));
+  drawGridAndAxes(s, domain, {
+    W, H, plotL, plotR, plotT, plotB, plotW, plotH,
+    rangeMs: t1 - t0,
+    liveEdge: state.series.endT == null || t1 >= snaps[snaps.length - 1].t,
+  });
+
+  for (const se of active) {
     let d = '', pen = false;
     se.ys.forEach((v, k) => {
       if (v == null) { pen = false; return; }
-      const x = X(snaps[k].t), y = Y(v);
-      d += (pen ? 'L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1) + ' '; pen = true;
+      const x = X(visible[k].t), y = Y(se.field, v);
+      d += (pen ? 'L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
+      pen = true;
     });
-    s.append(svg('path', { d, fill: 'none', stroke: se.color, 'stroke-width': '1.8', 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+    if (d) s.append(svg('path', {
+      d, class: 'series-line', fill: 'none', stroke: se.color, 'stroke-width': '1.8',
+      'stroke-linejoin': 'round', 'stroke-linecap': 'round', 'stroke-dasharray': se.dash,
+    }));
   }
-  panel.append(s);
-  // legend
-  const legend = el('div', { class: 'legend' });
-  for (const se of series) legend.append(el('span', { html: `<i style="background:${se.color}"></i>${escapeHtml(se.key)}${unit && unit !== 'rpm' ? '' : ''}` }));
-  panel.append(legend);
+
+  const hover = svg('g', { class: 'chart-hover', visibility: 'hidden' });
+  const hoverLine = svg('line', { x1: plotL, y1: plotT, x2: plotL, y2: plotB, class: 'hover-line' });
+  const hoverDots = svg('g', {});
+  hover.append(hoverLine, hoverDots);
+  s.append(hover);
+
+  const overlay = svg('rect', { x: plotL, y: plotT, width: plotW, height: plotH, fill: 'transparent', 'pointer-events': 'all' });
+  overlay.addEventListener('mousemove', ev => {
+    const rect = s.getBoundingClientRect();
+    const vx = (ev.clientX - rect.left) * W / rect.width;
+    const idx = clamp(Math.round((vx - plotL) / plotW * (visible.length - 1)), 0, visible.length - 1);
+    const snap = visible[idx];
+    const x = X(snap.t);
+    hover.setAttribute('visibility', 'visible');
+    hoverLine.setAttribute('x1', x); hoverLine.setAttribute('x2', x);
+    hoverDots.textContent = '';
+    const rows = [];
+    for (const se of active) {
+      const v = se.ys[idx];
+      if (v == null) continue;
+      hoverDots.append(svg('circle', { cx: x, cy: Y(se.field, v), r: 3.5, fill: se.color, stroke: 'var(--panel-solid)', 'stroke-width': 1.5 }));
+      rows.push(`<div><i style="background:${se.color}"></i>${escapeHtml(se.label)} <b>${fmt(v, se.field === 'rpm' ? 0 : 1)}${escapeHtml(se.unit)}</b></div>`);
+    }
+    const age = Math.round((visible[visible.length - 1].t - snap.t) / 1000);
+    tip.innerHTML = `<strong>${age ? '-' + age + 's' : 'now'}</strong>${rows.join('') || '<div>No values</div>'}`;
+    const prect = panel.getBoundingClientRect();
+    tip.style.left = Math.min(Math.max(ev.clientX - prect.left + 14, 8), Math.max(8, prect.width - 280)) + 'px';
+    tip.style.top = Math.max(ev.clientY - prect.top - 18, 8) + 'px';
+    tip.classList.remove('hidden');
+  });
+  overlay.addEventListener('mouseleave', () => { hover.setAttribute('visibility', 'hidden'); tip.classList.add('hidden'); });
+  overlay.addEventListener('wheel', ev => {
+    ev.preventDefault();
+    zoomSeries(snaps, ev.deltaY < 0 ? 0.8 : 1.25);
+  }, { passive: false });
+  s.append(overlay);
+
+  chart.append(s, tip);
+  panel.append(chart);
+  panel.append(seriesLegend(series));
   return panel;
+}
+
+function seriesControls(snaps) {
+  const wrap = el('div', { class: 'series-controls' });
+  const ranges = [
+    ['1m', 60 * 1000], ['5m', 5 * 60 * 1000], ['15m', 15 * 60 * 1000], ['all', null],
+  ];
+  for (const [label, ms] of ranges) {
+    const active = (state.series.rangeMs == null && ms == null) || state.series.rangeMs === ms;
+    const b = el('button', { class: 'mini-btn' + (active ? ' active' : ''), text: label });
+    b.onclick = () => { state.series.rangeMs = ms; state.series.endT = null; render(); };
+    wrap.append(b);
+  }
+  const left = el('button', { class: 'mini-btn', text: '←' });
+  left.title = 'Pan earlier'; left.onclick = () => { panSeries(snaps, -1); };
+  const right = el('button', { class: 'mini-btn', text: '→' });
+  right.title = 'Pan later'; right.onclick = () => { panSeries(snaps, 1); };
+  const reset = el('button', { class: 'mini-btn', text: 'reset' });
+  reset.onclick = () => { state.series.endT = null; render(); };
+  wrap.append(left, right, reset);
+  return wrap;
+}
+
+function windowedSnaps(snaps) {
+  if (!snaps.length) return [];
+  const first = snaps[0].t, latest = snaps[snaps.length - 1].t;
+  const total = Math.max(latest - first, 1);
+  let range = state.series.rangeMs == null ? total : Math.min(state.series.rangeMs, total);
+  let end = state.series.endT == null ? latest : clamp(state.series.endT, first + range, latest);
+  if (state.series.rangeMs == null) { end = latest; range = total; }
+  const start = end - range;
+  const out = snaps.filter(sn => sn.t >= start && sn.t <= end);
+  return out.length >= 2 ? out : snaps.slice(-2);
+}
+
+function collectSeries(snaps) {
+  const keys = Array.from(new Set(snaps.flatMap(sn => (sn.instances || []).map(i => i.key)))).sort();
+  const bySnap = snaps.map(sn => {
+    const m = new Map();
+    for (const i of (sn.instances || [])) m.set(i.key, i);
+    return m;
+  });
+  const out = [];
+  keys.forEach((key, keyIdx) => {
+    SERIES_FIELDS.forEach((meta, fieldIdx) => {
+      const ys = bySnap.map(m => {
+        const v = m.get(key)?.[meta.field];
+        return v == null || !Number.isFinite(Number(v)) ? null : Number(v);
+      });
+      if (!ys.some(v => v != null)) return;
+      out.push({
+        id: key + '|' + meta.field,
+        key,
+        field: meta.field,
+        label: `${key} · ${meta.label}`,
+        unit: meta.unit,
+        color: PALETTE[(keyIdx * SERIES_FIELDS.length + fieldIdx) % PALETTE.length],
+        dash: meta.dash,
+        ys,
+      });
+    });
+  });
+  return out;
+}
+
+function axisDomains(series) {
+  const domains = {};
+  for (const meta of SERIES_FIELDS) {
+    let lo = Infinity, hi = -Infinity;
+    if (meta.fixed) { lo = meta.fixed[0]; hi = meta.fixed[1]; }
+    if (meta.field === 'rpm') lo = 0;
+    for (const se of series) if (se.field === meta.field) {
+      for (const v of se.ys) if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    }
+    if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+    if (hi - lo < 1) hi = lo + 1;
+    if (!meta.fixed) {
+      const pad = (hi - lo) * 0.08;
+      lo = Math.max(meta.field === 'rpm' ? 0 : -Infinity, lo - pad);
+      hi += pad;
+    }
+    domains[meta.field] = [lo, hi];
+  }
+  return domains;
+}
+
+function drawGridAndAxes(s, domain, box) {
+  const { W, H, plotL, plotR, plotT, plotB, plotW, plotH, rangeMs, liveEdge } = box;
+  const yFor = (field, v) => plotB - (v - domain[field][0]) / (domain[field][1] - domain[field][0]) * plotH;
+  const tickVals = (field) => Array.from({ length: 5 }, (_, g) => domain[field][0] + (domain[field][1] - domain[field][0]) * g / 4);
+  // Temperature grid owns the horizontal grid; the other axes share the same plot.
+  for (const v of tickVals('temp')) {
+    const y = yFor('temp', v);
+    s.append(svg('line', { x1: plotL, y1: y, x2: plotR, y2: y, class: 'axis' }));
+    const tx = svg('text', { x: plotL - 7, y: y + 3, class: 'axis-txt axis-temp', 'text-anchor': 'end' });
+    tx.textContent = fmt(v, 0);
+    s.append(tx);
+  }
+  const axes = [
+    ['duty', plotR + 7, 'start', 'axis-duty', '%'],
+    ['rpm', plotR + 58, 'start', 'axis-rpm', 'rpm'],
+  ];
+  for (const [field, x, anchor, cls, unit] of axes) {
+    s.append(svg('line', { x1: x - 5, y1: plotT, x2: x - 5, y2: plotB, class: 'axis ' + cls }));
+    for (const v of tickVals(field)) {
+      const y = yFor(field, v);
+      const tx = svg('text', { x, y: y + 3, class: 'axis-txt ' + cls, 'text-anchor': anchor });
+      tx.textContent = fmt(v, field === 'rpm' ? 0 : 0);
+      s.append(tx);
+    }
+    const lab = svg('text', { x, y: plotT - 7, class: 'axis-txt ' + cls, 'text-anchor': anchor });
+    lab.textContent = unit;
+    s.append(lab);
+  }
+  s.append(svg('line', { x1: plotL, y1: plotB, x2: plotR, y2: plotB, class: 'axis' }));
+  const xl = svg('text', { x: plotL, y: H - 8, class: 'axis-txt', 'text-anchor': 'start' });
+  xl.textContent = '-' + Math.round((rangeMs || 0) / 1000) + 's';
+  const xr = svg('text', { x: plotR, y: H - 8, class: 'axis-txt', 'text-anchor': 'end' });
+  xr.textContent = liveEdge ? 'now' : 'window';
+  s.append(xl, xr);
+  const legend = svg('text', { x: plotL, y: plotT - 7, class: 'axis-txt axis-temp', 'text-anchor': 'start' });
+  legend.textContent = '°C';
+  s.append(legend);
+}
+
+function seriesLegend(series) {
+  const legend = el('div', { class: 'legend series-legend' });
+  for (const se of series) {
+    const hidden = !!state.series.hidden[se.id];
+    const b = el('button', { class: 'series-toggle' + (hidden ? ' muted' : '') });
+    b.innerHTML = `<i style="background:${se.color}"></i><span>${escapeHtml(se.label)}</span>`;
+    b.onclick = () => {
+      if (hidden) delete state.series.hidden[se.id];
+      else state.series.hidden[se.id] = true;
+      render();
+    };
+    legend.append(b);
+  }
+  return legend;
+}
+
+function zoomSeries(snaps, factor) {
+  const first = snaps[0].t, latest = snaps[snaps.length - 1].t;
+  const total = Math.max(latest - first, 30 * 1000);
+  const current = state.series.rangeMs == null ? total : state.series.rangeMs;
+  const next = clamp(current * factor, 30 * 1000, total);
+  state.series.rangeMs = next >= total * 0.98 ? null : Math.round(next);
+  state.series.endT = state.series.endT == null ? latest : clamp(state.series.endT, first + next, latest);
+  render();
+}
+
+function panSeries(snaps, dir) {
+  const first = snaps[0].t, latest = snaps[snaps.length - 1].t;
+  const total = Math.max(latest - first, 1);
+  if (state.series.rangeMs == null || state.series.rangeMs >= total) return;
+  const range = state.series.rangeMs;
+  const current = state.series.endT == null ? latest : state.series.endT;
+  state.series.endT = clamp(current + dir * range * 0.5, first + range, latest);
+  render();
 }
 
 /* ---------- HEALTH view ---------- */
@@ -561,11 +906,11 @@ const Wind = (() => {
   function resize() { w = window.innerWidth; h = window.innerHeight; svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`); }
   function loop() {
     const p = state.pressure || 0;
-    // pressure raises flow speed, stroke weight, amplitude and opacity
-    t += 0.006 + p * 0.03;
-    const baseW = 0.8 + p * 2.2;
-    const op = 0.18 + p * 0.5;
-    svgEl.style.opacity = (0.5 + p * 0.5).toFixed(2);
+    // pressure raises flow speed; color stays steady so motion, not intensity, carries load.
+    t += 0.006 + p * 0.04;
+    const baseW = 1.2;
+    const op = 0.28;
+    svgEl.style.opacity = 0.72;
     lines.forEach((ln, k) => {
       const yy = ln.y * h;
       const amp = (10 + p * 60) * ln.amp;
@@ -579,8 +924,7 @@ const Wind = (() => {
       ln.el.setAttribute('d', d);
       ln.el.setAttribute('stroke-width', (baseW * (0.5 + ln.amp)).toFixed(2));
       ln.el.setAttribute('stroke-opacity', (op * (0.4 + ln.amp * 0.6)).toFixed(2));
-      // tint hotter flows toward the accent/danger color
-      ln.el.style.stroke = p > 0.6 ? 'var(--accent)' : 'var(--wind-stroke)';
+      ln.el.style.stroke = 'var(--wind-stroke)';
     });
     raf = requestAnimationFrame(loop);
   }

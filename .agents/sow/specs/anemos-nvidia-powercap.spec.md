@@ -7,7 +7,7 @@ and the worked example of a module driven by **routed signal** (not a temperatur
 ## Purpose
 React to a utility-power event by capping each GPU's NVML power-management limit to extend UPS
 runtime, then lift the cap when AC returns. One `run` instance per physical GPU, bound by GPU
-**UUID** (stable across NVML index renumbering). It consumes `power-state` readings routed from the
+**UUID** (stable across NVML index renumbering). It consumes `power` components routed from the
 `nut` sensor (`input=nut`).
 
 ## Curve-less control (why `curve = None`)
@@ -19,7 +19,8 @@ restore.
 
 ## detect
 - Enumerate GPUs via NVML; emit one `found` per GPU:
-  `{"id":"<GPU-UUID>","type":"GPU","name":"<product name>"}` (same ids as `nvidia`).
+  `{"id":"<GPU-UUID>","type":"GPU","name":"<product name>","components":[...]}` (same ids as
+  `nvidia`) with one GPU component exposing a `power-limit` sink.
 - **Fork-safety:** NVML is not fork-safe; each process calls `nvmlInit` itself after being spawned.
 
 ## open <UUID>
@@ -30,7 +31,7 @@ restore.
 - The GPU handle opts out of the tech crate's fan-restore-on-drop (this module never touches fans).
 
 ## run <UUID>
-- Each `apply`: reduce the routed `power-state` readings to one aggregate signal (on-battery if ANY
+- Each `apply`: reduce the routed `power` component publishers to one aggregate signal (on-battery if ANY
   UPS is; low-battery if ANY raised `LB`; the SMALLEST runtime among **on-battery** UPSes — a mains
   UPS's runtime is ignored so it can't mask a draining one), then decide and act:
   - **Cap** when on-battery AND a trigger fires (see policy); set the limit to `cap_pct`% of the
@@ -38,11 +39,17 @@ restore.
   - **Lift** otherwise (AC present, or on-battery but healthy) → restore the firmware default.
   - NVML is issued only when the effective limit CHANGES (transition, or a live `cap_pct` edit), not
     every tick.
-- Report:
+- Report one GPU component; routed UPS state is sink `driven_by` metadata, not re-published:
   ```json
-  {"status":"ok","readings":[
-    {"type":"powercap","label":"GPU","capped":true,"limit_mw":420000,"default_mw":600000,
-     "min_mw":100000,"draw_mw":410000,"reason":"low-runtime","on_battery":true,"runtime_s":250}]}
+  {"status":"ok","components":[{
+    "id":"gpu","label":"GPU-...","class":"gpu",
+    "publishers":[
+      {"id":"capped","label":"Capped","kind":"powercap-capped","value":true},
+      {"id":"limit","label":"Power limit","kind":"power-limit","value":420000,"unit":"mW"},
+      {"id":"reason","label":"Reason","kind":"powercap-reason","value":"low-runtime"}],
+    "sinks":[{"id":"power_limit","label":"GPU power limit","kind":"power-limit","value":420000,
+      "unit":"mW","safe":"default","state":"claimed",
+      "driven_by":[{"from":"nut","publisher":"runtime","value":250,"unit":"s"}]}]}]}
   ```
 - `reason` ∈ {`none`,`on-battery`,`low-runtime`,`low-battery-flag`}. A failed control tick restores
   the firmware default and responds `{"status":"error","error":"…"}`.
@@ -61,7 +68,7 @@ a healthy battery, capping only once the battery is genuinely draining — exten
 matters without disrupting a running job on a brief outage. No secrets in this file (thresholds only).
 
 ## Modes
-`detect` · `run <UUID>` · `restore` (one-shot: restore EVERY GPU's power limit to firmware default
+`detect` · `info [id]` / `collect [id]` · `run <UUID>` · `restore` (one-shot: restore EVERY GPU's power limit to firmware default
 and exit; idempotent; called by `aiolos restore`).
 
 ## Fail-safe
