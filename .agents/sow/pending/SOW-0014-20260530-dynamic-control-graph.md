@@ -10,7 +10,10 @@ module kinds + `input=` validation") — that approach was rejected by the user 
 dynamic model (see *Superseded approach* below). This is a large, **protocol-breaking aiolos v2**: it
 relocates all correlation/control logic into aiolos, turns anemoi into pure producers/sinks, and makes
 the whole select→reduce→curve→act pipeline **user configuration**. The current production aiolos (v1)
-keeps cooling nova and the desktop until v2 is built, tested, and explicitly cut over.
+keeps cooling nova and the desktop until v2 is built, tested, and explicitly cut over. **The data-model
+half is being pulled forward by SOW-0017** (the component/publisher/sink report shape, device `class`,
+icons — no engine) as an enablement; once that ships, this SOW reduces to adding the central engine +
+config correlation on top of that shape.
 
 ## Requirements
 
@@ -276,6 +279,9 @@ Pending.
 - SOW-0009 (completed): its future powercap policy — re-enabling the cap with a **configurable baseline**
   (cap below 400 W without restoring the 600 W default) and the thermal trigger — also lands under this
   SOW. Its stale `SOW-0014`/`SOW-0015` references were repointed here (2026-05-31).
+- SOW-0017 (created 2026-05-31): carries this SOW's **data model** forward — the component/publisher/sink
+  report shape, device `class`, and icons — **without** the engine. When it ships, this SOW becomes just
+  the central engine + config correlation on top of that shape.
 
 ## Regression Log
 
