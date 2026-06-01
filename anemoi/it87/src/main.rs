@@ -499,25 +499,37 @@ fn unmanaged_spinning(all: &[(u8, Option<i32>)], managed: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Build `fanN.rpm` publishers for the chip's unmanaged-but-spinning headers (e.g. a BIOS-driven CPU
-/// fan): reported as read-only sensors — RPM only, no duty and no sink, so the UI shows them without
-/// implying aiolos controls them. Reads sysfs once per header via the `hwmon` tech crate.
+/// Build read-only publishers for the chip's unmanaged-but-spinning headers (e.g. a BIOS-driven CPU
+/// fan): both `fanN.duty` and `fanN.rpm`, but NO sink — so the UI shows duty and RPM side by side
+/// (answering "does this fan still have headroom?") without implying aiolos controls the header.
+/// The duty is the firmware-reported `pwmN` value, not an aiolos command; a board running the header
+/// in automatic mode may report a static placeholder (e.g. `255`) that does not track the live duty,
+/// so it is informational only. Reads sysfs via the `hwmon` tech crate.
 fn unmanaged_fan_publishers(dir: &std::path::Path, cfg: &It87Config) -> Vec<Publisher> {
     let managed = cfg.managed_channels();
     let all: Vec<(u8, Option<i32>)> = hwmon::fan_channels(dir)
         .into_iter()
         .map(|ch| (ch, hwmon::read_fan_rpm(dir, ch)))
         .collect();
-    unmanaged_spinning(&all, &managed)
-        .into_iter()
-        .filter_map(|ch| {
-            hwmon::read_fan_rpm(dir, ch).map(|rpm| {
+    let mut out = Vec::new();
+    for ch in unmanaged_spinning(&all, &managed) {
+        if let Some(pct) = hwmon::read_pwm_raw(dir, ch).map(hwmon::raw_to_pct) {
+            out.push(
+                Publisher::new(format!("fan{ch}.duty"), format!("fan{ch} duty"), "fan-duty")
+                    .value(json!(pct))
+                    .unit("%")
+                    .range(0.0, 100.0),
+            );
+        }
+        if let Some(rpm) = hwmon::read_fan_rpm(dir, ch) {
+            out.push(
                 Publisher::new(format!("fan{ch}.rpm"), format!("fan{ch} RPM"), "fan-rpm")
                     .value(json!(rpm))
-                    .unit("rpm")
-            })
-        })
-        .collect()
+                    .unit("rpm"),
+            );
+        }
+    }
+    out
 }
 
 fn driven_by_for_channel(

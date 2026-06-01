@@ -500,7 +500,18 @@ deliverable) found this is not a phantom/missing-device bug but a **reporting-sc
 **Decision (approved 2026-06-01):** "report all readable channels, control the configured subset",
 scoped to `it87` (not yet a project-wide convention). A header is reported when it is **managed**
 (always) **or currently spinning** (`rpm > 0`, unmanaged); empty/unreadable headers stay hidden so the
-report lists real fans only. Unmanaged headers get an RPM publisher only — no duty, no sink.
+report lists real fans only.
+
+**Refinement (approved 2026-06-01, same day):** unmanaged headers report **both `fanN.duty` and
+`fanN.rpm`** (still no sink) — user's rationale: duty + RPM together answer "does this fan still have
+headroom?", independent of whether aiolos controls it. Caveat flagged and accepted: the duty is the
+firmware-reported `pwmN` register, and on this host the BIOS-auto CPU header (`pwm1`) reads a **static
+`255` (100%)** while its RPM varies (1238–1318 across reads), so for *that* header the duty is a
+placeholder, not a live signal — the headroom inference holds only where firmware exposes a real auto
+duty. No `pwmN_mode` files exist on this chip. UI impact checked: the board card's headline duty uses
+`driving-duty` (not `max(fan-duty)`), so the placeholder does not corrupt the summary; it shows only
+in the per-fan rows and time-series. Evidence: `aiolos/src/assets/aiolos.js:73` (maxDuty is fallback
+only) and `:80` (`duty = drivingPct ?? maxDuty`).
 
 **Implementation:**
 - `tech/hwmon`: new `fan_channels(dir)` enumerates present `fanN_input` tachs (sorted; ignores
