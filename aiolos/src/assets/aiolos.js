@@ -141,13 +141,19 @@ function unitView(u) {
     for (const p of (c.publishers || [])) if (p.kind === 'temperature') { const v = pnum(p); if (v != null) cmax = Math.max(cmax ?? -1e9, v); }
     if (cmax != null && cmax !== -1e9) temps.push({ label: c.label || c.id, value: cmax });
     const rpms = (c.publishers || []).filter(p => p.kind === 'fan-rpm');
-    const duties = (c.sinks || []).filter(s => s.kind === 'fan-duty');
-    if ((rpms.length + duties.length) && rpms.length <= 1 && duties.length <= 1) {
-      fans.push({ label: c.label || c.id, rpm: rpms[0] ? pnum(rpms[0]) : null, duty: duties[0] ? pnum(duties[0]) : null, state: duties[0] ? duties[0].state : null });
+    // Fan duty arrives as a controllable SINK (fans we drive) OR a read-only PUBLISHER (fans we only
+    // report, e.g. a BIOS-driven CPU fan). Take both, so every fan shows its duty — not just the
+    // ones with a sink. Sinks win on overlap (they also carry the claim state).
+    const dutyPubs = (c.publishers || []).filter(p => p.kind === 'fan-duty');
+    const dutySinks = (c.sinks || []).filter(s => s.kind === 'fan-duty');
+    if ((rpms.length + dutyPubs.length + dutySinks.length) && rpms.length <= 1 && dutyPubs.length <= 1 && dutySinks.length <= 1) {
+      const ds = dutySinks[0], dp = dutyPubs[0];
+      fans.push({ label: c.label || c.id, rpm: rpms[0] ? pnum(rpms[0]) : null, duty: ds ? pnum(ds) : (dp ? pnum(dp) : null), state: ds ? ds.state : null });
     } else {
       const m = {};
       for (const p of rpms) { const n = (p.id || '').split('.')[0]; (m[n] ??= { label: p.label || n }).rpm = pnum(p); }
-      for (const s of duties) { const n = (s.id || '').split('.')[0]; (m[n] ??= { label: s.label || n }).duty = pnum(s); m[n].state = s.state; if (s.label) m[n].label = s.label; }
+      for (const p of dutyPubs) { const n = (p.id || '').split('.')[0]; (m[n] ??= { label: p.label || n }).duty = pnum(p); }
+      for (const s of dutySinks) { const n = (s.id || '').split('.')[0]; (m[n] ??= { label: s.label || n }).duty = pnum(s); m[n].state = s.state; if (s.label) m[n].label = s.label; }
       for (const n of Object.keys(m)) fans.push({ label: m[n].label || n, rpm: m[n].rpm ?? null, duty: m[n].duty ?? null, state: m[n].state });
     }
   }

@@ -525,6 +525,13 @@ only) and `:80` (`duty = drivingPct ?? maxDuty`).
 - Live read-only `it87 info`: fan-rpm publishers `fan3, fan4, fan1(=1318)`; sinks `fan3, fan4` only —
   3 real fans, CPU fan surfaced, empty headers hidden. Confirmed on the running service after install.
 
+**Dashboard fix (2026-06-01):** the overview fan pip showed the new read-only fan (RPM) but no duty,
+because `unitView` (`aiolos/src/assets/aiolos.js`) sourced fan duty **only from sinks**. Read-only
+fans report duty as a **publisher** (no sink), so it was dropped. Fixed: `unitView` now folds fan-duty
+from **both publishers and sinks** (sinks win on overlap, as they carry the claim state). The focus
+view already rendered all publishers, so it was unaffected. Rebuilt/reinstalled `aiolos` (JS is
+`include_str!`-embedded); requires a browser hard-refresh to drop the cached script.
+
 **Follow-ups (not done here):**
 - Optional: make "report all readable channels" a project-wide convention (`project-create-anemos`
   skill + an enumerate helper per tech crate) so future anemoi inherit it.
