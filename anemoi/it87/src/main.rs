@@ -185,6 +185,9 @@ impl Device for It87Device {
             );
         }
 
+        // Report unmanaged-but-spinning headers (e.g. the BIOS-driven CPU fan) as read-only sensors.
+        publishers.extend(unmanaged_fan_publishers(&self.dir, &self.cfg));
+
         Applied::ok(vec![Component::new(
             "board",
             self.cfg.chip.clone(),
@@ -364,6 +367,8 @@ impl Device for It87Device {
                     )),
             );
         }
+        // Report unmanaged-but-spinning headers (e.g. the BIOS-driven CPU fan) as read-only sensors.
+        publishers.extend(unmanaged_fan_publishers(&self.dir, &self.cfg));
         Applied::ok(vec![Component::new(
             "board",
             self.cfg.chip.clone(),
@@ -482,6 +487,39 @@ fn temp_publisher_id(label: &str) -> String {
     )
 }
 
+/// Unmanaged fan headers worth REPORTING: those currently spinning (`rpm > 0`). Channels this module
+/// manages are reported elsewhere (with a duty publisher + a controllable sink), so they are excluded
+/// here; empty/unwired headers (rpm `0`/absent) are hidden to keep the report to real fans. Pure, so
+/// the policy is unit-tested without sysfs. `all` is `(channel, rpm)` for every header on the chip.
+fn unmanaged_spinning(all: &[(u8, Option<i32>)], managed: &[u8]) -> Vec<u8> {
+    all.iter()
+        .filter(|(ch, _)| !managed.contains(ch))
+        .filter(|(_, rpm)| rpm.is_some_and(|r| r > 0))
+        .map(|(ch, _)| *ch)
+        .collect()
+}
+
+/// Build `fanN.rpm` publishers for the chip's unmanaged-but-spinning headers (e.g. a BIOS-driven CPU
+/// fan): reported as read-only sensors — RPM only, no duty and no sink, so the UI shows them without
+/// implying aiolos controls them. Reads sysfs once per header via the `hwmon` tech crate.
+fn unmanaged_fan_publishers(dir: &std::path::Path, cfg: &It87Config) -> Vec<Publisher> {
+    let managed = cfg.managed_channels();
+    let all: Vec<(u8, Option<i32>)> = hwmon::fan_channels(dir)
+        .into_iter()
+        .map(|ch| (ch, hwmon::read_fan_rpm(dir, ch)))
+        .collect();
+    unmanaged_spinning(&all, &managed)
+        .into_iter()
+        .filter_map(|ch| {
+            hwmon::read_fan_rpm(dir, ch).map(|rpm| {
+                Publisher::new(format!("fan{ch}.rpm"), format!("fan{ch} RPM"), "fan-rpm")
+                    .value(json!(rpm))
+                    .unit("rpm")
+            })
+        })
+        .collect()
+}
+
 fn driven_by_for_channel(
     ch: u8,
     cfg: &It87Config,
@@ -578,6 +616,30 @@ mod tests {
         };
         // FAN1 = cpu duty (30); FAN3/FAN4 = case duty (75); sorted by channel.
         assert_eq!(dev.commanded_zone(30, 75), vec![(1, 30), (3, 75), (4, 75)]);
+    }
+
+    #[test]
+    fn unmanaged_spinning_reports_only_spinning_unmanaged_headers() {
+        // This host: fan1 = BIOS CPU fan (spinning), fan2/fan5 = empty headers, fan3/fan4 = managed.
+        let all = vec![
+            (1u8, Some(1293)),
+            (2, Some(0)),
+            (3, Some(1254)),
+            (4, Some(1259)),
+            (5, Some(0)),
+        ];
+        let managed = vec![3u8, 4];
+        // Only the spinning, unmanaged header (the CPU fan) is surfaced.
+        assert_eq!(unmanaged_spinning(&all, &managed), vec![1]);
+    }
+
+    #[test]
+    fn unmanaged_spinning_excludes_managed_even_when_spinning_and_hides_dead_headers() {
+        let all = vec![(1u8, Some(0)), (2, None), (3, Some(900)), (4, Some(800))];
+        // ch1 dead, ch2 unreadable -> hidden; ch3 managed -> excluded; ch4 unmanaged+spinning -> kept.
+        assert_eq!(unmanaged_spinning(&all, &[3]), vec![4]);
+        // With nothing managed, every spinning header is reported (here ch3 and ch4).
+        assert_eq!(unmanaged_spinning(&all, &[]), vec![3, 4]);
     }
 
     #[test]

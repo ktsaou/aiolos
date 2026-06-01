@@ -481,6 +481,46 @@ Still open before this SOW can complete:
   ROME2D16-2T units (provenance via labels).
 - External reviewer pass and on-screen visual acceptance (the project review gate) remain pending.
 
+## Addendum - 2026-06-01 - it87 reports unmanaged (BIOS-driven) fans
+
+**Trigger:** On the dashboard the board showed **2** fans while the host has **3** (CPU + intake +
+exhaust). Investigation (in scope of this SOW's "report model / reading-duplication confusion"
+deliverable) found this is not a phantom/missing-device bug but a **reporting-scope** choice in the
+`it87` module: it published `fanN` data only for channels it *manages*.
+
+**Evidence (file:line):**
+- `anemoi/it87/src/main.rs:153` (`collect`) and the `apply` report loop iterated **only**
+  `cfg.managed_channels()` — so reported == managed. No code enumerated the chip's other headers.
+- Live config `/opt/aiolos/etc/it87.conf`: `cpu=` empty, `case=3,4` → managed = {3,4}. The CPU fan is
+  on `pwm1` (EC-locked, BIOS Smart Fan), so it was never reported.
+- Chip `it8689` exposes 5 fan headers; `fan1=1318rpm` (BIOS CPU fan), `fan3`/`fan4` (managed case
+  fans), `fan2`/`fan5`=0 (empty). The SDK already separates **Publisher** (report) from **Sink**
+  (control) — reporting an uncontrolled fan needs only a publisher with no sink, no SDK change.
+
+**Decision (approved 2026-06-01):** "report all readable channels, control the configured subset",
+scoped to `it87` (not yet a project-wide convention). A header is reported when it is **managed**
+(always) **or currently spinning** (`rpm > 0`, unmanaged); empty/unreadable headers stay hidden so the
+report lists real fans only. Unmanaged headers get an RPM publisher only — no duty, no sink.
+
+**Implementation:**
+- `tech/hwmon`: new `fan_channels(dir)` enumerates present `fanN_input` tachs (sorted; ignores
+  pwm/temp/malformed). Tests: numeric (not lexical) sort, absent-dir empty.
+- `anemoi/it87`: pure `unmanaged_spinning(all, managed)` policy + `unmanaged_fan_publishers(dir,cfg)`;
+  appended to both `collect` and `apply` reports. Tests cover spinning/dead/managed/empty-managed
+  cases. Detect schema left coarse (consistent: per-channel fan publishers only appear in live reports).
+
+**Validation:**
+- `cargo test -p hwmon -p anemoi-it87` → 14 pass; `cargo clippy` clean; `cargo fmt` applied.
+- Live read-only `it87 info`: fan-rpm publishers `fan3, fan4, fan1(=1318)`; sinks `fan3, fan4` only —
+  3 real fans, CPU fan surfaced, empty headers hidden. Confirmed on the running service after install.
+
+**Follow-ups (not done here):**
+- Optional: make "report all readable channels" a project-wide convention (`project-create-anemos`
+  skill + an enumerate helper per tech crate) so future anemoi inherit it.
+- Optional: operator-assigned fan labels (e.g. "CPU", "Intake", "Exhaust") instead of `fanN`.
+- Pre-existing: the live registry comment `it87 ... CPU zone (ch1) follows coretemp` is stale (the
+  deployed `it87.conf` has `cpu=` empty); cosmetic, untouched here.
+
 ## Regression Log
 
 None yet.

@@ -39,6 +39,13 @@ reclaims SmartFan. Report one `board` component:
   "sinks":[{"id":"fan1","label":"fan1","kind":"fan-duty","value":45,"unit":"%",
     "safe":"auto","state":"claimed","driven_by":[{"from":"self","publisher":"board/cpu.temp","value":55,"unit":"C"}]}]}]}
 ```
+In addition to the managed channels (each reported with a `fanN.duty` publisher and a controllable
+`fanN` sink), the report includes a **read-only `fanN.rpm` publisher for every unmanaged header that
+is currently spinning** (`fanN_input > 0`) — e.g. a BIOS-driven CPU fan on an EC-locked header. These
+carry RPM only (no duty, no sink), so the UI shows the fan without implying aiolos controls it. Empty
+/unwired headers (RPM `0` or unreadable) are omitted, so the report lists real fans only. The same
+unmanaged-fan publishers appear in the read-only `info`/`collect` report. (SOW-0017 addendum.)
+
 If the driving temperature is indeterminable, or the active curve is empty, the module **releases
 every managed channel to firmware/automatic** (`pwmN_enable=2`) and replies `status:error` — it
 never holds manual-but-blind. The case zone follows `max(GPU, CPU)` (NOT GPU-only): a desktop tower
@@ -74,6 +81,9 @@ value ≥ floor; systemd `ExecStopPost: aiolos restore` (which calls `it87 resto
 - `detect` emits the board when the chip is present; empty `found` when absent (never an error).
 - `run` drives CPU-zone channels from CPU temp and case-zone channels from `max(GPU,CPU)` per their
   curves; verified by reading `pwmN`/`fanN_input` under CPU and GPU load.
+- `run`/`info`/`collect` also report a read-only `fanN.rpm` publisher for every unmanaged header that
+  is spinning (RPM > 0), with no duty and no sink; empty/unreadable headers are omitted. Verified on
+  the reference host: the BIOS-driven CPU fan (`fan1`) appears alongside the managed case fans.
 - `shutdown`, stdin-EOF, and SIGTERM each restore every managed channel to `pwmN_enable=2`
   (verified by reading sysfs after exit); `it87 restore` is idempotent.
 - Indeterminable temp or empty curve → release to firmware/automatic + `status:error` (never holds

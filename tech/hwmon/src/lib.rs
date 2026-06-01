@@ -95,6 +95,30 @@ pub fn read_fan_rpm(dir: &Path, channel: u8) -> Option<i32> {
     read_sysfs_i64(&dir.join(format!("fan{channel}_input"))).map(|v| v as i32)
 }
 
+/// Every 1-based fan channel that exposes a `fanN_input` tachometer under `dir`, sorted ascending.
+/// Used to enumerate ALL of a chip's fan headers (so a module can *report* headers it does not
+/// *control* — e.g. a BIOS-driven CPU fan). The presence of `fanN_input` says the header exists;
+/// whether a fan is actually wired is a separate question (a bare header reads `0` RPM).
+pub fn fan_channels(dir: &Path) -> Vec<u8> {
+    let mut chans: Vec<u8> = Vec::new();
+    let Ok(files) = fs::read_dir(dir) else {
+        return chans;
+    };
+    for f in files.flatten() {
+        let fname = f.file_name().to_string_lossy().into_owned();
+        if let Some(n) = fname
+            .strip_prefix("fan")
+            .and_then(|s| s.strip_suffix("_input"))
+            .and_then(|s| s.parse::<u8>().ok())
+        {
+            chans.push(n);
+        }
+    }
+    chans.sort_unstable();
+    chans.dedup();
+    chans
+}
+
 /// Read a channel's current `pwmN_enable` mode under `dir`; `channel` is 1-based.
 pub fn read_pwm_enable(dir: &Path, channel: u8) -> Option<u8> {
     read_sysfs_i64(&dir.join(format!("pwm{channel}_enable"))).map(|v| v as u8)
@@ -239,5 +263,31 @@ mod tests {
         for pct in [0, 35, 50, 75, 100] {
             assert_eq!(raw_to_pct(pct_to_raw(pct)), pct, "round-trip {pct}%");
         }
+    }
+
+    #[test]
+    fn fan_channels_lists_present_tachs_numerically_sorted() {
+        let dir = std::env::temp_dir().join(format!("hwmon-fanchan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // A mix of fan tachs (out of order, incl. a 2-digit channel to catch lexical sorting),
+        // plus decoys that must be ignored: a pwm, a temp, and a malformed `fanN_input`.
+        for f in [
+            "fan3_input",
+            "fan1_input",
+            "fan10_input",
+            "pwm1",
+            "temp1_input",
+            "fanX_input",
+        ] {
+            fs::write(dir.join(f), "0").unwrap();
+        }
+        assert_eq!(fan_channels(&dir), vec![1, 3, 10]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fan_channels_empty_when_dir_absent() {
+        assert!(fan_channels(Path::new("/nonexistent-hwmon-dir-xyz")).is_empty());
     }
 }
