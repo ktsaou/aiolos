@@ -24,11 +24,15 @@ pub struct PowerLimits {
     pub max_mw: u32,
 }
 
-/// A discovered GPU (raw info; the anemos maps this into the protocol's `FoundEntry`).
+/// A discovered GPU (raw info; the anemos maps this into the protocol unit/component/signal model).
 pub struct GpuInfo {
     pub uuid: String,
     pub name: String,
     pub num_fans: u32,
+    /// NVML enumeration index — the canonical system name other tools use (`nvidia-smi` "GPU N");
+    /// the anemos derives the short user name `gpuN` from it. Not stable across renumbering, which is
+    /// fine for a display handle (the stable identity is the UUID).
+    pub index: u32,
 }
 
 /// Detect-process enumerator: holds ONE NVML handle for the process lifetime and reuses it.
@@ -84,6 +88,7 @@ fn list(nvml: &Nvml) -> Result<Vec<GpuInfo>> {
             uuid,
             name,
             num_fans,
+            index: i,
         });
     }
     Ok(out)
@@ -191,6 +196,7 @@ pub struct Gpu {
     nvml: Nvml,
     uuid: String,
     index: u32,
+    name: String,
     num_fans: u32,
     /// Whether `Drop` restores firmware fan control. A fan module leaves this `true` (NVML manual
     /// fan control persists after exit, so the Drop is the panic backstop); a non-fan module (e.g.
@@ -209,10 +215,12 @@ impl Gpu {
             if let Ok(dev) = nvml.device_by_index(i) {
                 if dev.uuid().map(|u| u == uuid).unwrap_or(false) {
                     let num_fans = dev.num_fans().unwrap_or(0);
+                    let name = dev.name().unwrap_or_else(|_| "NVIDIA GPU".to_string());
                     return Ok(Gpu {
                         nvml,
                         uuid: uuid.to_string(),
                         index: i,
+                        name,
                         num_fans,
                         restore_fans_on_drop: true,
                     });
@@ -230,8 +238,18 @@ impl Gpu {
         self
     }
 
+    /// Current NVML enumeration index (for the `gpuN` display name; updated by `resolve_index`).
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
     pub fn uuid(&self) -> &str {
         &self.uuid
+    }
+
+    /// The GPU product name (e.g. "NVIDIA RTX PRO 6000 …"), read once at open — the unit description.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn num_fans(&self) -> u32 {

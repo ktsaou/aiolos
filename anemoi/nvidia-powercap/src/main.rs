@@ -1,31 +1,18 @@
-//! nvidia-powercap anemos — react to utility-power loss by capping GPU power via NVML.
+//! nvidia-powercap anemos — react to utility-power loss by capping GPU power via NVML (label-driven
+//! signal model, SOW-0018).
 //!
-//! Level-3: device logic ONLY. The `anemos` SDK owns the lifecycle (CLI/signals/logging/protocol/
-//! restore wiring); the `nvml` tech crate owns NVML access (incl. power-limit get/set/restore).
+//! A **curve-less CONTROL** anemos: it reacts to `power` signals routed from `nut` (`input=nut`) and
+//! caps/lifts each GPU's power-management limit. Reports each GPU as a unit (`id` = UUID, same as
+//! `nvidia`, so they merge) with a `power` component carrying the cap state + a `power-limit` sink.
 //!
-//! This is a **curve-less CONTROL** anemos: `ModuleInfo` curve = `None` (no temperature curve — its
-//! decision is driven by routed power state, not a curve), but it DOES control a device. It reacts
-//! to `power` components routed from the `nut` sensor (`input=nut`): when the policy's trigger
-//! fires (an on-battery UPS whose runtime/charge is critically low — see `policy.rs`) it CAPS each
-//! GPU's power-management limit; on AC restore (or no trigger) it LIFTS the cap back to the firmware
-//! default. The policy is conservative by default (monitor + log; cap only on low runtime) so a
-//! brief blip never throttles a running job.
-//!
-//! Fail-safe (exactly like `nvidia` restores fans): the ORIGINAL/default power limit recorded at
-//! `open` is restored on `shutdown`, stdin EOF, SIGTERM/SIGINT, the `restore` one-shot, AND on Drop
-//! (panic backstop). A failed control tick also restores the limit. NVML power limits PERSIST after
-//! the process exits, so restore is mandatory; `aiolos restore` (systemd ExecStopPost) is the net
-//! after a SIGKILL.
-//!
-//! detect → one entry per GPU (id = UUID, like `nvidia`).
-//! run <UUID> → each tick, decide cap/lift from routed power-state and apply it.
+//! The cap/lift/restore control path is UNCHANGED from v1 — this is a reporting refactor.
 
 mod inputs;
 mod policy;
 
 use anemos::{
-    Anemos, Applied, Component, Controller, Detected, Device, DrivenBy, FoundEntry, Inputs,
-    ModuleInfo, OpenMode, Publisher, Sink, SinkState,
+    Anemos, Component, Control, Controller, Device, Inputs, ModuleInfo, OpenMode, Provenance,
+    Report, Signal, SinkState, Unit,
 };
 use inputs::power_signal;
 use nvml::{Detector, Gpu};
@@ -37,9 +24,6 @@ fn main() -> ! {
     anemos::run(
         ModuleInfo {
             name: "nvidia-powercap",
-            // Curve-less control: no temperature curve. The reaction is driven by routed power
-            // state, so `apply` ignores the SDK controller (None means the SDK skips the curve
-            // checks; this module still controls the device).
             curve_default_path: None,
             curve_env_filename: None,
         },
@@ -54,55 +38,41 @@ struct NvidiaPowercap {
 }
 
 impl Anemos for NvidiaPowercap {
-    fn detect(&mut self) -> Detected {
+    fn detect(&mut self) -> Report {
         match self.detector.enumerate() {
-            Ok(gpus) => Detected::ok(
-                gpus.into_iter()
-                    .map(|g| FoundEntry {
-                        id: g.uuid,
-                        kind: "GPU".to_string(),
-                        name: g.name,
-                        components: vec![Component::new("gpu", "GPU", "gpu").with_sinks(vec![
-                            Sink::new("power_limit", "GPU power limit", "power-limit")
-                                .unit("mW")
-                                .safe(json!("default"))
-                                .needs_claim(false),
-                        ])],
-                        extra: Default::default(),
-                    })
-                    .collect(),
-            ),
-            Err(e) => Detected::error(format!("NVML enumeration failed: {e}")),
+            Ok(gpus) => {
+                let (mut units, mut components, mut signals) = (Vec::new(), Vec::new(), Vec::new());
+                for g in gpus {
+                    let comp = format!("{}:power", g.uuid);
+                    units.push(gpu_unit(&g.uuid, g.index, &g.name));
+                    components.push(Component::new(&comp, &g.uuid).name("power").typed("power"));
+                    signals.push(
+                        Signal::sink(format!("{comp}:power_limit"), &comp, "power-limit")
+                            .uom("mW")
+                            .name("power limit")
+                            .control(Control {
+                                needs_claim: false,
+                                safe: Some(json!("default")),
+                                ..Default::default()
+                            }),
+                    );
+                }
+                Report::ok(units, components, signals)
+            }
+            Err(e) => Report::error(format!("NVML enumeration failed: {e}")),
         }
     }
 
     fn open(&mut self, id: &str, mode: OpenMode) -> anyhow::Result<Box<dyn Device>> {
-        // Opt out of the Gpu's fan-restore-on-drop: this module never touches fans, and our own
-        // Drop/restore handles the power limit instead.
         let mut gpu = Gpu::open(id)?.without_fan_restore_on_drop();
-        // Record the ORIGINAL power envelope NOW (at open) so restore always targets the true
-        // firmware default even if a later read fails. A GPU that cannot report a power limit is
-        // not power-cappable -> fatal (the SDK retries open on a long backoff); we never half-manage.
         let limits = gpu
             .power_limits()
             .map_err(|e| anyhow::anyhow!("GPU power limits unreadable (cannot power-cap): {e}"))?;
-        // Adopt a pre-existing cap. NVML power limits PERSIST across process death, so if a SIGKILLed
-        // predecessor (e.g. the orchestrator's timeout-kill) left this GPU BELOW its firmware default,
-        // a fresh process must OWN that and restore it — otherwise `apply_lift`'s `!capped` early
-        // return would strand the GPU capped during normal operation (only `aiolos restore` on systemd
-        // stop would ever fix it). We adopt only a reduction (`current < default`, an actual cap) so we
-        // never undo an operator's deliberate higher-than-default limit. After a CLEAN exit the
-        // predecessor already restored the default, so `current == default` and we adopt nothing.
         let already_capped = limits.current_mw < limits.default_mw;
         let control = mode == OpenMode::Control;
         tracing::info!(
-            uuid = %gpu.uuid(),
-            default_mw = limits.default_mw,
-            current_mw = limits.current_mw,
-            min_mw = limits.min_mw,
-            max_mw = limits.max_mw,
-            already_capped,
-            control,
+            uuid = %gpu.uuid(), default_mw = limits.default_mw, current_mw = limits.current_mw,
+            min_mw = limits.min_mw, max_mw = limits.max_mw, already_capped, control,
             "opened GPU for power-cap; recorded firmware default limit"
         );
         Ok(Box::new(GpuCap {
@@ -110,15 +80,11 @@ impl Anemos for NvidiaPowercap {
             default_mw: limits.default_mw,
             min_mw: limits.min_mw,
             policy: Policy::load(),
-            // Adopt the predecessor's stranded cap so the next `Lift` (or shutdown) restores it; an
-            // ongoing event still dedupes to the same target in `apply_cap`. A clean open adopts none.
             capped: already_capped,
             applied_cap_mw: (control && already_capped).then_some(AppliedCap {
                 requested_mw: limits.current_mw,
                 actual_mw: limits.current_mw,
             }),
-            // Owe a restore iff a control run adopted a cap; observe/info is read-only and must not
-            // restore on drop. `apply_cap` re-arms when this process caps.
             restore_armed: control && already_capped,
         }))
     }
@@ -131,28 +97,16 @@ impl Anemos for NvidiaPowercap {
     }
 }
 
-/// One GPU under power-cap management. Holds the recorded firmware default (the restore target) and
-/// whether a cap is currently applied. `restore_armed` stays set until a restore succeeds (so a
-/// failed restore is retried by Drop), mirroring the rome2d board's release-arming.
 struct GpuCap {
     gpu: Gpu,
-    /// Firmware default power limit (mW), recorded at open — the value `restore` targets.
     default_mw: u32,
-    /// Device-accepted minimum limit (mW), recorded at open (for the components/logging only; the
-    /// tech crate re-clamps on every set).
     min_mw: u32,
     policy: Policy,
-    /// Whether a cap is currently applied (so a tick only issues NVML when the state changes).
     capped: bool,
-    /// The cap currently applied, if any — so a tick re-issues NVML only when the requested target
-    /// changes (a live `cap_pct` edit), not every tick.
     applied_cap_mw: Option<AppliedCap>,
-    /// Whether the power limit still needs restoring (set when we cap, cleared once restored).
     restore_armed: bool,
 }
 
-/// A cap currently in effect: the value we requested (the dedupe key) and the value the device
-/// actually applied after its `[min,max]` clamp (what we report).
 #[derive(Debug, Clone, Copy)]
 struct AppliedCap {
     requested_mw: u32,
@@ -160,21 +114,19 @@ struct AppliedCap {
 }
 
 impl Device for GpuCap {
-    fn collect(&mut self, _inputs: Option<&Inputs>) -> Applied {
+    fn collect(&mut self, _inputs: Option<&Inputs>) -> Report {
         let limits = match self.gpu.power_limits() {
             Ok(limits) => limits,
-            Err(e) => return Applied::error(e.to_string()),
+            Err(e) => return Report::error(e.to_string()),
         };
         self.default_mw = limits.default_mw;
         self.min_mw = limits.min_mw;
         self.capped = limits.current_mw < limits.default_mw;
-        Applied::ok(self.components_observed(limits.current_mw))
+        self.report_observed(limits.current_mw)
     }
 
-    fn apply(&mut self, inputs: Option<&Inputs>, _ctrl: &mut Controller) -> Applied {
-        // Reload the policy each tick (live tuning, like the curve modules reload their curve).
+    fn apply(&mut self, inputs: Option<&Inputs>, _ctrl: &mut Controller) -> Report {
         self.policy = Policy::load();
-
         let sig = power_signal(inputs);
         let decision = decide(&self.policy, &sig);
 
@@ -188,14 +140,11 @@ impl Device for GpuCap {
         let commanded_mw = match result {
             Ok(mw) => mw,
             Err(e) => {
-                // A control failure must not leave the GPU stuck capped: restore to firmware default
-                // and report the fault (the SDK also resets after a non-Ok tick).
                 self.restore();
-                return Applied::error(e.to_string());
+                return Report::error(e.to_string());
             }
         };
-
-        Applied::ok(self.components_control(&sig, &decision, commanded_mw))
+        self.report_control(&sig, &decision, commanded_mw)
     }
 
     fn restore(&mut self) {
@@ -216,25 +165,12 @@ impl Device for GpuCap {
 }
 
 impl GpuCap {
-    /// Apply (or maintain) the cap. Issues NVML only when the effective cap CHANGES — on the
-    /// transition into the capped state, or when a live `cap_pct` edit moves the target — so an
-    /// unchanged limit is never re-commanded every tick. Returns the limit in effect (mW).
     fn apply_cap(&mut self, target_mw: u32, reason: CapReason) -> anyhow::Result<u32> {
-        // Dedupe on the REQUESTED target so an unchanged request is never re-issued. Report the
-        // previously-applied (clamped) limit without another NVML write. Trade-off: if a GPU's
-        // accepted [min,max] window shifted at runtime (some expose thermal-dependent limits), an
-        // unchanged request would not be re-clamped — acceptable, as the cap is coarse battery
-        // protection, not a precise setpoint.
         if let Some(applied) = self.applied_cap_mw {
             if applied.requested_mw == target_mw {
                 return Ok(applied.actual_mw);
             }
         }
-        // Arm the restore BEFORE touching the device. If `set_power_limit` changes the hardware limit
-        // and then errors (or any step before the bookkeeping below fails), the fail-safe must still
-        // fire — a GPU must never be left capped-but-unowned (NVML limits persist after exit).
-        // Over-arming is harmless: restoring an uncapped GPU to its firmware default is an idempotent
-        // no-op. `restore_armed` is cleared only after a restore actually succeeds.
         self.restore_armed = true;
         let actual = self.gpu.set_power_limit(target_mw)?;
         let transition = !self.capped;
@@ -244,11 +180,9 @@ impl GpuCap {
             actual_mw: actual,
         });
         if transition {
-            tracing::warn!(
-                uuid = %self.gpu.uuid(), reason = reason.as_str(), target_mw,
+            tracing::warn!(uuid = %self.gpu.uuid(), reason = reason.as_str(), target_mw,
                 actual_mw = actual, default_mw = self.default_mw,
-                "CAPPING GPU power (utility power event)"
-            );
+                "CAPPING GPU power (utility power event)");
         } else {
             tracing::info!(uuid = %self.gpu.uuid(), reason = reason.as_str(),
                 actual_mw = actual, "adjusted GPU power cap (policy change)");
@@ -256,42 +190,32 @@ impl GpuCap {
         Ok(actual)
     }
 
-    /// Lift any cap, restoring the firmware default. Issues NVML only on the transition out of the
-    /// capped state. Returns the limit in effect (mW).
     fn apply_lift(&mut self) -> anyhow::Result<u32> {
         if !self.capped {
-            return Ok(self.default_mw); // never capped (or already lifted) -> nothing to do
+            return Ok(self.default_mw);
         }
         self.gpu.restore_power()?;
         self.capped = false;
         self.applied_cap_mw = None;
-        self.restore_armed = false; // back at firmware default -> nothing owed
+        self.restore_armed = false;
         tracing::info!(uuid = %self.gpu.uuid(), default_mw = self.default_mw,
             "lifted GPU power cap (utility power restored / trigger cleared)");
         Ok(self.default_mw)
     }
 
-    /// Build this tick's components: one GPU component carrying the control state (capped?, the
-    /// effective/default/min limits, current draw, the decision reason). Routed UPS state is not
-    /// re-published as GPU data; it appears as sink `driven_by` metadata.
-    fn components_control(
+    /// This tick's report: the GPU unit, a `power` component carrying the cap state, and the
+    /// `power-limit` sink. Routed UPS state is not re-published; it appears as sink `driven_by`.
+    fn report_control(
         &mut self,
         sig: &policy::PowerSignal,
         decision: &Decision,
         limit_mw: u32,
-    ) -> Vec<Component> {
-        let mut driven_by = vec![DrivenBy::new("nut")
-            .publisher("on_battery")
-            .value(json!(sig.on_battery))];
+    ) -> Report {
+        let mut driven_by = vec![Provenance::new("nut:on_battery").value(json!(sig.on_battery))];
         if let Some(rt) = sig.min_runtime_s {
-            driven_by.push(
-                DrivenBy::new("nut")
-                    .publisher("runtime")
-                    .value(json!(rt))
-                    .unit("s"),
-            );
+            driven_by.push(Provenance::new("nut:runtime").value(json!(rt)).uom("s"));
         }
-        self.components_with(
+        self.report_with(
             limit_mw,
             match decision {
                 Decision::Cap(r) => r.as_str(),
@@ -306,7 +230,7 @@ impl GpuCap {
         )
     }
 
-    fn components_observed(&mut self, limit_mw: u32) -> Vec<Component> {
+    fn report_observed(&mut self, limit_mw: u32) -> Report {
         let state = if self.restore_armed {
             if self.capped {
                 SinkState::Claimed
@@ -318,63 +242,80 @@ impl GpuCap {
         } else {
             SinkState::Released
         };
-        self.components_with(limit_mw, "observed", state, Vec::new())
+        self.report_with(limit_mw, "observed", state, Vec::new())
     }
 
-    fn components_with(
+    fn report_with(
         &mut self,
         limit_mw: u32,
         reason: &str,
         state: SinkState,
-        driven_by: Vec<DrivenBy>,
-    ) -> Vec<Component> {
-        let mut publishers = vec![
-            Publisher::new("capped", "Capped", "powercap-capped").value(json!(self.capped)),
-            Publisher::new("limit", "Power limit", "power-limit")
+        driven_by: Vec<Provenance>,
+    ) -> Report {
+        let uid = self.gpu.uuid().to_string();
+        let comp = format!("{uid}:power");
+        let units = vec![gpu_unit(&uid, self.gpu.index(), self.gpu.name())];
+        let components = vec![Component::new(&comp, &uid).name("power").typed("power")];
+        let mut signals = vec![
+            Signal::producer(format!("{comp}:capped"), &comp, "powercap-capped")
+                .value(json!(self.capped))
+                .name("capped"),
+            Signal::producer(format!("{comp}:limit"), &comp, "power-limit")
                 .value(json!(limit_mw))
-                .unit("mW"),
-            Publisher::new(
-                "default_limit",
-                "Default power limit",
+                .uom("mW")
+                .name("power limit"),
+            Signal::producer(
+                format!("{comp}:default_limit"),
+                &comp,
                 "power-limit-default",
             )
             .value(json!(self.default_mw))
-            .unit("mW"),
-            Publisher::new("min_limit", "Minimum power limit", "power-limit-min")
+            .uom("mW")
+            .name("default limit"),
+            Signal::producer(format!("{comp}:min_limit"), &comp, "power-limit-min")
                 .value(json!(self.min_mw))
-                .unit("mW"),
-            Publisher::new("reason", "Reason", "powercap-reason").value(json!(reason)),
+                .uom("mW")
+                .name("min limit"),
+            Signal::producer(format!("{comp}:reason"), &comp, "powercap-reason")
+                .value(json!(reason))
+                .name("reason"),
         ];
         if let Some(draw) = self.gpu.power_usage() {
-            publishers.push(
-                Publisher::new("draw", "Power draw", "power-draw")
+            signals.push(
+                Signal::producer(format!("{comp}:draw"), &comp, "power-draw")
                     .value(json!(draw))
-                    .unit("mW"),
+                    .uom("mW")
+                    .name("draw"),
             );
         }
-        let sink = Sink::new("power_limit", "GPU power limit", "power-limit")
-            .unit("mW")
-            .value(json!(limit_mw))
-            .safe(json!("default"))
-            .needs_claim(false)
-            .state(state)
-            .driven_by(driven_by);
-        vec![Component::new("gpu", self.gpu.uuid().to_string(), "gpu")
-            .with_publishers(publishers)
-            .with_sinks(vec![sink])]
+        signals.push(
+            Signal::sink(format!("{comp}:power_limit"), &comp, "power-limit")
+                .value(json!(limit_mw))
+                .uom("mW")
+                .name("power limit")
+                .control(Control {
+                    needs_claim: false,
+                    state,
+                    safe: Some(json!("default")),
+                    driven_by,
+                    ..Default::default()
+                }),
+        );
+        Report::ok(units, components, signals)
     }
+}
+
+fn gpu_unit(uuid: &str, index: u32, product: &str) -> Unit {
+    Unit::new(uuid)
+        .name(format!("gpu{index}"))
+        .description(product)
+        .typed("gpu")
+        .label("vendor", "NVIDIA")
 }
 
 impl Drop for GpuCap {
     fn drop(&mut self) {
-        // Final fail-safe: if a cap is still owed (a restore never succeeded), restore on drop — the
-        // backstop for panic unwinding or any path that skipped `restore`. NVML power limits persist
-        // after exit, so this matters.
         if self.restore_armed && self.gpu.restore_power().is_err() {
-            // Panic-safe logging: `eprintln!` PANICS on a stderr write error. In a Drop running during
-            // a panic unwind that would double-panic -> process abort, defeating this very backstop.
-            // Use a raw, infallible write of a static message instead (no formatting -> no allocation).
-            // (`aiolos restore` via systemd ExecStopPost remains the net if the limit stays capped.)
             let _ = std::io::stderr().write_all(
                 b"WARNING: nvidia-powercap restore-on-drop FAILED - GPU may stay capped; `aiolos restore` is the net\n",
             );

@@ -96,9 +96,9 @@ function primaryValue(c) {
   const p = (c.publishers || []).find(x => x.value != null);
   return p ? { v: String(p.value), u: p.unit || '', k: p.label || p.kind, col: 'var(--ink)' } : { v: '–', u: '', k: 'idle', col: 'var(--ink-faint)' };
 }
-const CLASS_NAMES = { gpu: 'Graphics', cpu: 'Processors', ssd: 'Storage', board: 'Mainboard', power: 'Power', nic: 'Network', fan: 'Fans', mock: 'Mock' };
+const CLASS_NAMES = { gpu: 'Graphics', cpu: 'Processors', ssd: 'Storage', board: 'Mainboard', power: 'Power', ups: 'Power', nic: 'Network', fan: 'Fans', mock: 'Mock' };
 const className = (c) => CLASS_NAMES[c] || (c ? c[0].toUpperCase() + c.slice(1) : 'Devices');
-const CLUSTER_ORDER = ['gpu', 'cpu', 'board', 'ssd', 'nic', 'power', 'fan', 'mock'];
+const CLUSTER_ORDER = ['gpu', 'cpu', 'board', 'ssd', 'nic', 'power', 'ups', 'fan', 'mock'];
 function clusterOrder(a, b) { const ia = CLUSTER_ORDER.indexOf(a), ib = CLUSTER_ORDER.indexOf(b); return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib); }
 function flattenDevices(status) {
   const out = [];
@@ -107,18 +107,35 @@ function flattenDevices(status) {
   return out;
 }
 function findDevice(key) { return flattenDevices(state.status || {}).find(d => d.key === key); }
-/* ---- unit model: a unit = an instance; its components group its measurements ---- */
-function unitType(u) {
-  const t = (u.inst.type || '').toLowerCase();
-  if (t && CLASS_NAMES[t]) return t;
-  const c0 = u.components[0];
-  if (c0 && CLASS_NAMES[c0.class]) return c0.class;
-  return t || (c0 ? c0.class : 'device');
+/* ---- unit model (SOW-0018): a unit = hardware assembled from the wire's flat units/components/
+   signals. We reconstruct each component's publishers (producers) + sinks so the rest of the UI
+   consumes one stable shape. A unit reported by several anemoi (the motherboard) is already merged
+   server-side into one `units[]` entry. ---- */
+const L = (o, k, d = '') => (o && o.labels && o.labels[k] != null) ? o.labels[k] : d;
+function buildUnits(status) {
+  const comps = {};
+  for (const c of (status.components || [])) comps[c.id] = { id: c.id, label: L(c, 'name', c.id), class: L(c, 'type', 'device'), unit: c.unit, publishers: [], sinks: [] };
+  for (const s of (status.signals || [])) {
+    const c = comps[s.component]; if (!c) continue;
+    const base = { id: s.id, label: L(s, 'name', s.id), kind: L(s, 'type', ''), value: s.value, unit: s.uom };
+    if (s.role === 'sink') {
+      const sk = { ...base, state: s.control ? s.control.state : null, driven_by: s.control ? (s.control.driven_by || []) : [], safe: s.control ? s.control.safe : null };
+      if (s.labels && s.labels.fault) sk.fault = true;
+      c.sinks.push(sk);
+    } else c.publishers.push(base);
+  }
+  const units = {};
+  for (const u of (status.units || [])) units[u.id] = {
+    key: u.id, type: L(u, 'type', 'device'), sources: u.sources || [], components: [],
+    inst: { id: u.id, name: L(u, 'name', u.id), description: L(u, 'description', ''), type: L(u, 'type', 'device'), status: u.status || 'ok' },
+  };
+  for (const c of Object.values(comps)) { const u = units[c.unit]; if (u) u.components.push(c); }
+  for (const u of Object.values(units)) u.components.sort((a, b) => a.id < b.id ? -1 : 1);
+  return Object.values(units);
 }
-function flattenUnits(status) {
-  return (status.instances || []).map(i => { const u = { inst: i, components: i.components || [], key: i.module + ':' + i.id }; u.type = unitType(u); return u; });
-}
-function findUnit(key) { return flattenUnits(state.status || {}).find(u => u.key === key); }
+function unitType(u) { return (u.type && CLASS_NAMES[u.type]) ? u.type : (u.type || 'device'); }
+function flattenUnits(status) { return buildUnits(status); }
+function findUnit(key) { return buildUnits(state.status || {}).find(u => u.key === key); }
 function unitCtx(u) {
   const a = aggregate(u.components);
   const pc = u.components.find(c => (c.publishers || []).some(p => /^power-/.test(p.kind)));
@@ -332,7 +349,7 @@ async function poll() {
 }
 function setConn(cls, txt) { const c = $('conn'); if (c) { c.className = 'conn ' + cls; c.textContent = txt; } }
 function onData() {
-  let p = 0; for (const i of (state.status.instances || [])) p = Math.max(p, instPressure(aggregate(i.components)));
+  let p = 0; for (const u of buildUnits(state.status || {})) p = Math.max(p, instPressure(unitCtx(u)));
   state.pressure = p; render();
 }
 function pressureColor(p) { return p >= 0.8 ? 'var(--bad)' : p >= 0.55 ? 'var(--warn)' : p >= 0.3 ? 'var(--accent)' : 'var(--aether)'; }
@@ -351,7 +368,7 @@ function syncChrome() {
   document.body.classList.toggle('under-pressure', p >= 0.7);
   document.body.classList.toggle('alarm', p >= 0.85);
   for (const b of document.querySelectorAll('.lens')) b.classList.toggle('active', b.dataset.view === state.view.name);
-  let hot = null; for (const i of (state.status.instances || [])) { const a = aggregate(i.components); if (a.maxTemp != null) hot = Math.max(hot ?? -1e9, a.maxTemp); }
+  let hot = null; for (const u of buildUnits(state.status || {})) { const a = unitCtx(u); if (a.maxTemp != null) hot = Math.max(hot ?? -1e9, a.maxTemp); }
   const aur = $('aurora'); if (aur) { aur.style.setProperty('--aura', p >= 0.5 ? col : (hot != null ? tempColor(hot) : 'transparent')); aur.style.setProperty('--aura-op', (0.16 + p * 0.62).toFixed(2)); }
 }
 function unitsSig() { return flattenUnits(state.status).map(u => u.key + ':' + u.components.length).join(','); }
@@ -599,8 +616,9 @@ function windowedSnaps(snaps) {
 function collectSeries(snaps) {
   const keys = Array.from(new Set(snaps.flatMap(sn => (sn.instances || []).map(i => i.key)))).sort();
   const bySnap = snaps.map(sn => { const m = new Map(); for (const i of (sn.instances || [])) m.set(i.key, i); return m; });
+  const nameByKey = {}; for (const sn of snaps) for (const i of (sn.instances || [])) if (i.name) nameByKey[i.key] = i.name;
   const out = [];
-  keys.forEach((key, keyIdx) => SERIES_FIELDS.forEach((meta, fieldIdx) => { const ys = bySnap.map(m => { const v = m.get(key)?.[meta.field]; return v == null || !Number.isFinite(Number(v)) ? null : Number(v); }); if (!ys.some(v => v != null)) return; out.push({ id: key + '|' + meta.field, key, field: meta.field, label: `${key} · ${meta.label}`, unit: meta.unit, color: PALETTE[(keyIdx * SERIES_FIELDS.length + fieldIdx) % PALETTE.length], dash: meta.dash, ys }); }));
+  keys.forEach((key, keyIdx) => SERIES_FIELDS.forEach((meta, fieldIdx) => { const ys = bySnap.map(m => { const v = m.get(key)?.[meta.field]; return v == null || !Number.isFinite(Number(v)) ? null : Number(v); }); if (!ys.some(v => v != null)) return; out.push({ id: key + '|' + meta.field, key, field: meta.field, label: `${nameByKey[key] || key} · ${meta.label}`, unit: meta.unit, color: PALETTE[(keyIdx * SERIES_FIELDS.length + fieldIdx) % PALETTE.length], dash: meta.dash, ys }); }));
   return out;
 }
 function axisDomains(series) {
@@ -628,24 +646,27 @@ function zoomSeries(snaps, factor) { const first = snaps[0].t, latest = snaps[sn
 function panSeries(snaps, dir) { const first = snaps[0].t, latest = snaps[snaps.length - 1].t, total = Math.max(latest - first, 1); if (state.series.rangeMs == null || state.series.rangeMs >= total) return; const range = state.series.rangeMs, current = state.series.endT == null ? latest : state.series.endT; state.series.endT = clamp(current + dir * range * 0.5, first + range, latest); render(); }
 
 /* ===================== LAW (curves — only where one exists) ===================== */
-function moduleControls(insts) { return insts.some(i => (i.components || []).some(c => (c.sinks || []).length || (c.publishers || []).some(p => /^driving/.test(p.kind)))); }
+// Units this module contributes to (by the assembled `sources` list).
+function moduleUnits(module) { return buildUnits(state.status || {}).filter(u => (u.sources || []).includes(module)); }
+function moduleControls(module) { return moduleUnits(module).some(u => u.components.some(c => c.sinks.length || c.publishers.some(p => /^driving/.test(p.kind)))); }
 function viewLaw() {
   const frag = document.createDocumentFragment();
   frag.append(lensHead('Nomos · the law that binds heat to wind', 'Law'));
   const bodyEl = el('div', { class: 'lens-body' });
   const mm = modulesMap(state.status); const grid = el('div', { class: 'law-grid' }); let any = false;
   for (const name of Object.keys(mm).sort()) {
-    if (!moduleControls(mm[name].instances)) continue;  // skip sensor-only modules (no curve)
-    const op = moduleOperatingPoint(mm[name].instances); const card = el('div', { class: 'law-card' }); card.append(el('h3', { text: name }));
+    if (!moduleControls(name)) continue;  // skip sensor-only modules (no curve)
+    const op = moduleOperatingPoint(name); const card = el('div', { class: 'law-card' }); card.append(el('h3', { text: name }));
     const holder = el('div'); card.append(holder); grid.append(card); any = true;
     fetchCurve(name).then(c => renderCurve(holder, name, c, op));
   }
   bodyEl.append(any ? grid : el('div', { class: 'empty', text: 'No controlling modules — nothing has a curve.' }));
   frag.append(bodyEl); return frag;
 }
-function moduleOperatingPoint(insts) {
-  for (const i of insts) for (const c of (i.components || [])) { let raw = null, temp = null, pct = null; for (const p of (c.publishers || [])) { if (p.kind === 'driving-raw-temperature') raw = pnum(p); else if (p.kind === 'driving-temperature') temp = pnum(p); else if (p.kind === 'driving-duty') pct = pnum(p); } if (temp != null || raw != null) return { temp: raw != null ? raw : temp, pct }; }
-  let temp = null, pct = null; for (const i of insts) { const a = aggregate(i.components); if (a.temp != null) temp = Math.max(temp ?? -1e9, a.temp); if (a.duty != null) pct = Math.max(pct ?? -1e9, a.duty); } return { temp: temp === -1e9 ? null : temp, pct: pct === -1e9 ? null : pct };
+function moduleOperatingPoint(module) {
+  const us = moduleUnits(module);
+  for (const u of us) for (const c of u.components) { let raw = null, temp = null, pct = null; for (const p of c.publishers) { if (p.kind === 'driving-raw-temperature') raw = pnum(p); else if (p.kind === 'driving-temperature') temp = pnum(p); else if (p.kind === 'driving-duty') pct = pnum(p); } if (temp != null || raw != null) return { temp: raw != null ? raw : temp, pct }; }
+  let temp = null, pct = null; for (const u of us) { const a = unitCtx(u); if (a.temp != null) temp = Math.max(temp ?? -1e9, a.temp); if (a.duty != null) pct = Math.max(pct ?? -1e9, a.duty); } return { temp: temp === -1e9 ? null : temp, pct: pct === -1e9 ? null : pct };
 }
 async function fetchCurve(name) { if (state.curveCache[name] && Date.now() - state.curveCache[name]._t < 15000) return state.curveCache[name]; try { const c = await fetch('/curve.json?module=' + encodeURIComponent(name), { cache: 'no-store' }).then(r => r.json()); c._t = Date.now(); state.curveCache[name] = c; return c; } catch (e) { return { available: false, points: [] }; } }
 let CURVE_SEQ = 0;

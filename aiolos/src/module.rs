@@ -10,7 +10,7 @@ use crate::instance::{
 };
 use crate::registry::RegistryEntry;
 use crate::{AppState, InstanceEntry, ModuleHealth, StderrTail, ACTIVE_INSTANCES, SHUTDOWN_FLAG};
-use protocol::{Detected, FoundEntry, Request, Status};
+use protocol::{Report, Request, Status};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -91,7 +91,7 @@ struct DetectProc {
 /// Result of one detect round-trip (computed while the detect proc is borrowed, then acted on).
 enum DetectOutcome {
     /// A parsed (or parse-failed) module reply.
-    Reply(serde_json::Result<Detected>),
+    Reply(serde_json::Result<Report>),
     /// The module didn't answer (timeout/EOF/IO) — backstop path.
     ReadFail,
 }
@@ -107,7 +107,7 @@ struct Supervisor {
     results: mpsc::Sender<TickReport>,
     running: HashMap<String, (mpsc::Sender<InstanceCmd>, thread::JoinHandle<WorkerExit>)>,
     detect_proc: Option<DetectProc>,
-    last_found: Vec<FoundEntry>,
+    last_found: Vec<protocol::Unit>,
     /// Per-id crash-loop backoff: (consecutive failures, last failure time).
     backoff: HashMap<String, (u32, Instant)>,
     /// Per-id lifetime spawn count (restart_count = spawn_count - 1).
@@ -197,7 +197,7 @@ impl Supervisor {
                         if protocol::is_hello(&s) {
                             continue; // skip optional hello
                         }
-                        break DetectOutcome::Reply(Detected::from_line(&s));
+                        break DetectOutcome::Reply(Report::from_line(&s));
                     }
                     ReadOutcome::Eof | ReadOutcome::Timeout | ReadOutcome::TooLong => {
                         break DetectOutcome::ReadFail
@@ -232,7 +232,7 @@ impl Supervisor {
                         warn!(module=%self.module_name, warning=%w, "detect ok with warnings");
                     }
                     self.set_health("ok", d.error.clone());
-                    self.last_found = d.found; // authoritative — empty legitimately means none
+                    self.last_found = d.units; // authoritative — empty legitimately means none
                     self.detect_every
                 }
                 // Declared transient failure: keep instances, surface the reason, recycle the proc.
@@ -300,8 +300,17 @@ impl Supervisor {
         let to_spawn: Vec<(String, String, String)> = self
             .last_found
             .iter()
-            .filter(|e| !self.running.contains_key(&e.id) && self.backoff_expired(&e.id))
-            .map(|e| (e.id.clone(), e.name.clone(), e.kind.clone()))
+            .filter(|u| !self.running.contains_key(&u.id) && self.backoff_expired(&u.id))
+            .map(|u| {
+                // Short user name + type come from the unit's well-known labels.
+                let name = u
+                    .labels
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| u.id.clone());
+                let unit_type = u.labels.get("type").cloned().unwrap_or_default();
+                (u.id.clone(), name, unit_type)
+            })
             .collect();
         for (id, name, unit_type) in to_spawn {
             self.spawn_instance(id, name, unit_type);
@@ -441,7 +450,9 @@ impl Supervisor {
                     unit_type,
                     last_status: "starting".to_string(),
                     last_error: None,
+                    last_units: Vec::new(),
                     last_components: Vec::new(),
+                    last_signals: Vec::new(),
                     restart_count,
                     last_seen: Instant::now(),
                     cmd_tx: cmd_tx.clone(),

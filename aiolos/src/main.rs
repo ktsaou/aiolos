@@ -13,7 +13,7 @@ mod status_page;
 use anyhow::Result;
 use config::Config;
 use instance::{InstanceCmd, TickReport, TickStatus};
-use protocol::{Component, Inputs};
+use protocol::{Component, Inputs, Role, Signal, Unit};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -373,7 +373,7 @@ fn reap_results(
             status = r.result.status.as_str(),
             latency_ms = r.latency.as_millis() as u64,
             error = r.result.error.as_deref().unwrap_or(""),
-            components = %summarize_components(&r.result.components),
+            signals = %summarize_signals(&r.result.signals),
             "apply result",
         );
     }
@@ -419,10 +419,12 @@ fn apply_results(s: &mut AppState, reports: Vec<TickReport>) {
             e.last_error = result.error;
             e.last_seen = Instant::now();
             if is_ok {
+                e.last_units = result.units.clone();
                 e.last_components = result.components.clone();
+                e.last_signals = result.signals.clone();
             }
-            if is_ok && !result.components.is_empty() {
-                s.blackboard.insert(key, result.components);
+            if is_ok && !result.signals.is_empty() {
+                s.blackboard.insert(key, result.signals);
             }
         }
     }
@@ -449,12 +451,12 @@ fn build_inputs(
         let mut m: Inputs = HashMap::new();
         for src in sources {
             let prefix = format!("{src}:");
-            for (bkey, components) in &state.blackboard {
+            for (bkey, signals) in &state.blackboard {
                 // The `:` delimiter prevents typical prefix collisions (source "nv" does not match
                 // "nvme:..."); module names are constrained not to contain `:`. Insert under the
                 // full `module:id` key.
-                if bkey.starts_with(&prefix) && !components.is_empty() {
-                    m.insert(bkey.clone(), components.clone());
+                if bkey.starts_with(&prefix) && !signals.is_empty() {
+                    m.insert(bkey.clone(), signals.clone());
                 }
             }
         }
@@ -467,12 +469,11 @@ fn build_inputs(
 fn summarize_inputs(inputs: &Inputs) -> String {
     inputs
         .iter()
-        .map(|(id, components)| {
-            let temps: Vec<String> = components
+        .map(|(id, signals)| {
+            let temps: Vec<String> = signals
                 .iter()
-                .flat_map(|c| c.publishers.iter())
-                .filter(|p| p.kind == "temperature")
-                .filter_map(|p| p.value_i64())
+                .filter(|s| s.kind() == Some("temperature"))
+                .filter_map(|s| s.value_i64())
                 .map(|t| t.to_string())
                 .collect();
             format!("{id}:temp={}", temps.join("/"))
@@ -481,47 +482,18 @@ fn summarize_inputs(inputs: &Inputs) -> String {
         .join(" ")
 }
 
-/// Compact one-line summary of a components list (every kind/label + its numeric fields).
-fn summarize_components(components: &[Component]) -> String {
-    components
+/// Compact one-line summary of a signal list (each signal's id + value; sinks marked) for the journal.
+fn summarize_signals(signals: &[Signal]) -> String {
+    signals
         .iter()
-        .map(|c| {
-            let pubs: Vec<String> = c
-                .publishers
-                .iter()
-                .map(|p| {
-                    let v = p
-                        .value
-                        .as_ref()
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    format!("{}/{}={}", p.kind, p.id, v)
-                })
-                .collect();
-            let sinks: Vec<String> = c
-                .sinks
-                .iter()
-                .map(|s| {
-                    let v = s
-                        .value
-                        .as_ref()
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    format!("sink:{}/{}={}", s.kind, s.id, v)
-                })
-                .collect();
-            format!(
-                "{}/{}[{}{}{}]",
-                c.class,
-                c.id,
-                pubs.join(","),
-                if pubs.is_empty() || sinks.is_empty() {
-                    ""
-                } else {
-                    ","
-                },
-                sinks.join(",")
-            )
+        .map(|s| {
+            let v = s
+                .value
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let role = if s.role == Role::Sink { "sink:" } else { "" };
+            format!("{role}{}={v}", s.id)
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -565,8 +537,9 @@ fn graceful_shutdown(state: &Arc<RwLock<AppState>>, max_apply_timeout: Duration)
 pub struct AppState {
     pub tick_count: u64,
     pub instances: HashMap<String, InstanceEntry>,
-    /// Last good components per instance key (`module:id`); pruned when an instance is removed.
-    pub blackboard: HashMap<String, Vec<Component>>,
+    /// Last good signals per instance key (`module:id`); pruned when an instance is removed. The
+    /// routing relay + the status-page assembly read these.
+    pub blackboard: HashMap<String, Vec<Signal>>,
     /// Per-module detect health (status + last declared error), for the status page.
     pub modules: HashMap<String, ModuleHealth>,
     /// Per-instance scheduler state (SOW-0013): busy/idle, last dispatch, last apply latency, and
@@ -605,7 +578,11 @@ pub struct InstanceEntry {
     pub unit_type: String,
     pub last_status: String,
     pub last_error: Option<String>,
+    /// The unit/component/signal entities from this instance's last good report (assembled into the
+    /// status page across all instances; `last_signals` also feeds the routing relay).
+    pub last_units: Vec<Unit>,
     pub last_components: Vec<Component>,
+    pub last_signals: Vec<Signal>,
     pub restart_count: u32,
     /// Wall-clock of this instance's last reported result (initialised to spawn time). Drives the
     /// cadence-independent `seconds_since_seen` staleness metric — SOW-0013 turned the tick into a
@@ -641,30 +618,25 @@ extern "C" fn handle_signal(_sig: i32) {
 mod tests {
     use super::*;
     use instance::TickResult;
-    use protocol::Publisher;
+    use protocol::Signal;
     use serde_json::json;
 
-    fn temp_component(label: &str, temp: i64, class: &str) -> Component {
-        Component::new(label.to_ascii_lowercase(), label, class).with_publishers(vec![
-            Publisher::new("temp", "Temperature", "temperature")
-                .value(json!(temp))
-                .unit("C"),
-        ])
+    fn temp_signal(value: i64) -> Signal {
+        Signal::producer("u:c:temp", "u:c", "temperature")
+            .value(json!(value))
+            .uom("C")
     }
 
-    fn report(
-        key: &str,
-        generation: u32,
-        status: TickStatus,
-        components: Vec<Component>,
-    ) -> TickReport {
+    fn report(key: &str, generation: u32, status: TickStatus, signals: Vec<Signal>) -> TickReport {
         TickReport {
             key: key.to_string(),
             generation,
             result: TickResult {
                 status,
                 error: None,
-                components,
+                units: Vec::new(),
+                components: Vec::new(),
+                signals,
             },
             latency: Duration::from_millis(7),
         }
@@ -686,7 +658,9 @@ mod tests {
                 unit_type: "gpu".into(),
                 last_status: "starting".into(),
                 last_error: None,
+                last_units: Vec::new(),
                 last_components: Vec::new(),
+                last_signals: Vec::new(),
                 restart_count: 0,
                 last_seen: Instant::now(),
                 cmd_tx: tx,
@@ -694,7 +668,7 @@ mod tests {
             },
         );
 
-        let mk = |t: i64| vec![temp_component("GPU", t, "gpu")];
+        let mk = |t: i64| vec![temp_signal(t)];
         apply_results(
             &mut s,
             vec![
@@ -728,7 +702,9 @@ mod tests {
                 unit_type: "gpu".into(),
                 last_status: "starting".into(),
                 last_error: None,
+                last_units: Vec::new(),
                 last_components: Vec::new(),
+                last_signals: Vec::new(),
                 restart_count: 0,
                 last_seen: Instant::now(),
                 cmd_tx: tx,
@@ -765,7 +741,9 @@ mod tests {
                 unit_type: "gpu".into(),
                 last_status: "starting".into(),
                 last_error: None,
+                last_units: Vec::new(),
                 last_components: Vec::new(),
+                last_signals: Vec::new(),
                 restart_count: 1, // respawned -> generation 1
                 last_seen: Instant::now(),
                 cmd_tx: tx,
@@ -784,12 +762,7 @@ mod tests {
         // A stale report from the dead predecessor (generation 0).
         apply_results(
             &mut s,
-            vec![report(
-                "mod:a",
-                0,
-                TickStatus::Ok,
-                vec![temp_component("GPU", 50, "gpu")],
-            )],
+            vec![report("mod:a", 0, TickStatus::Ok, vec![temp_signal(50)])],
         );
         assert!(
             s.sched["mod:a"].busy,
@@ -847,28 +820,23 @@ mod tests {
                 unit_type: "board".into(),
                 last_status: "ok".into(),
                 last_error: None,
+                last_units: Vec::new(),
                 last_components: Vec::new(),
+                last_signals: Vec::new(),
                 restart_count: 0,
                 last_seen: Instant::now(),
                 cmd_tx: tx,
                 stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             },
         );
-        s.blackboard.insert(
-            "nvidia:GPU-1".into(),
-            vec![temp_component("GPU", 63, "gpu")],
-        );
-        s.blackboard.insert(
-            "nvme:SER-A".into(),
-            vec![temp_component("Composite", 40, "ssd")],
-        );
-        s.blackboard.insert(
-            "nvme:SER-B".into(),
-            vec![temp_component("Composite", 44, "ssd")],
-        );
-        // Unrelated module — must NOT be routed to the board-fan module.
         s.blackboard
-            .insert("other:x".into(), vec![temp_component("x", 99, "mock")]);
+            .insert("nvidia:GPU-1".into(), vec![temp_signal(63)]);
+        s.blackboard
+            .insert("nvme:SER-A".into(), vec![temp_signal(40)]);
+        s.blackboard
+            .insert("nvme:SER-B".into(), vec![temp_signal(44)]);
+        // Unrelated module — must NOT be routed to the board-fan module.
+        s.blackboard.insert("other:x".into(), vec![temp_signal(99)]);
 
         let mut input_map: HashMap<String, Vec<String>> = HashMap::new();
         input_map.insert("rome2d-fans".into(), vec!["nvidia".into(), "nvme".into()]);
@@ -904,7 +872,9 @@ mod tests {
                     unit_type: "board".into(),
                     last_status: "ok".into(),
                     last_error: None,
+                    last_units: Vec::new(),
                     last_components: Vec::new(),
+                    last_signals: Vec::new(),
                     restart_count: 0,
                     last_seen: Instant::now(),
                     cmd_tx: tx,
@@ -922,10 +892,8 @@ mod tests {
 
         // (b) two sources, only one has components -> only the present source is routed.
         let (mut s, map) = consumer(vec!["nvidia".into(), "nvme".into()]);
-        s.blackboard.insert(
-            "nvidia:GPU-1".into(),
-            vec![temp_component("GPU", 70, "gpu")],
-        );
+        s.blackboard
+            .insert("nvidia:GPU-1".into(), vec![temp_signal(70)]);
         let got = build_inputs(&s, &map);
         let inputs = got["rome2d-fans:board"]
             .as_ref()

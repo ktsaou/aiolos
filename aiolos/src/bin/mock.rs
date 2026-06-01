@@ -1,5 +1,5 @@
 //! Test-only mock anemos — a helper binary used by the orchestrator integration tests. It is
-//! never installed (packaging copies only aiolos/nvidia/rome2d-fans).
+//! never installed (packaging copies only aiolos + the real anemoi).
 //!
 //! Behaviour is driven by env vars namespaced by the MODULE NAME (argv[0]'s file name), so one
 //! binary plays several roles via differently-named symlinks in the test bin dir:
@@ -10,23 +10,15 @@
 //!   MOCK_<MOD>_TEMP       °C this module reports (default 50)
 //!   MOCK_<MOD>_SLOW_MS    apply duration for the `slow` behavior, ms (default 800)
 //!   MOCK_<MOD>_WORKDIR    dir for observable side-effect marker files
-//!
-//! Side-effect markers (under WORKDIR), used by tests instead of HTTP (no port binding):
-//!   <mod>-<id>.starts     appended on each run-process startup (respawn count)
-//!   <mod>-<id>.applies    appended on each apply (tick count)
-//!   <mod>-<id>.restored   created on graceful shutdown OR stdin EOF OR a signal (fail-safe ran)
-//!   <mod>-<id>.signaled   created when the restore was triggered by SIGTERM/SIGINT (decision 17)
-//!   <mod>-<id>.lastinput  overwritten each apply with the max routed input temp (or -1)
 
 use anemos::{Event, StdinReader};
-use protocol::{Applied, Component, Detected, FoundEntry, Inputs, Publisher, Request};
+use protocol::{Component, Inputs, Report, Request, Signal, Unit};
 use serde_json::json;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn main() {
-    // Use the real SDK signal-restore path so the integration tests exercise it (decision 17).
     anemos::install_shutdown_handlers();
     let module = module_name();
     let mode = std::env::args().nth(1).unwrap_or_else(|| "detect".into());
@@ -37,8 +29,6 @@ fn main() {
             &module,
             &std::env::args().nth(2).expect("run requires <ID>"),
         ),
-        // One-shot fail-safe invoked by `aiolos restore` (uniform across anemoi). Emulate restoring
-        // every device this module manages, mark it, exit 0.
         "restore" => {
             if let Some(d) = envk(&module, "WORKDIR") {
                 let _ = std::fs::write(
@@ -54,29 +44,72 @@ fn main() {
     }
 }
 
+/// One mock unit's entities (a `self` component + a temperature signal; optionally a `from_input`
+/// component echoing the max routed temp). `temp = None` => schema only (no value).
+fn mock_unit(
+    id: &str,
+    temp: Option<i64>,
+    in_max: Option<i64>,
+) -> (Unit, Vec<Component>, Vec<Signal>) {
+    let comp = format!("{id}:self");
+    let mut components = vec![Component::new(&comp, id).name("self").typed("mock")];
+    let mut t = Signal::producer(format!("{comp}:temp"), &comp, "temperature")
+        .uom("C")
+        .name("temp");
+    if let Some(v) = temp {
+        t = t.value(json!(v));
+    }
+    let mut signals = vec![t];
+    if let Some(m) = in_max {
+        let fc = format!("{id}:from_input");
+        components.push(Component::new(&fc, id).name("from_input").typed("mock"));
+        signals.push(
+            Signal::producer(format!("{fc}:temp"), &fc, "temperature")
+                .value(json!(m))
+                .uom("C")
+                .name("from_input"),
+        );
+    }
+    (
+        Unit::new(id).name(format!("mock {id}")).typed("MOCK"),
+        components,
+        signals,
+    )
+}
+
 fn info_once(module: &str, wanted: Option<String>) {
     let ids = envk(module, "IDS").unwrap_or_else(|| "thing0".into());
     let temp: i64 = envk(module, "TEMP")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    let mut found = Vec::new();
+    let (mut units, mut components, mut signals) = (Vec::new(), Vec::new(), Vec::new());
+    let mut any = false;
     for id in ids.split(',').filter(|s| !s.is_empty()) {
         if wanted.as_deref().is_some_and(|w| w != id) {
             continue;
         }
-        found.push(FoundEntry {
-            id: id.to_string(),
-            kind: "MOCK".into(),
-            name: format!("mock {id}"),
-            components: vec![mock_component("self", "self", Some(temp))],
-            extra: Default::default(),
-        });
+        any = true;
+        let (u, mut c, mut s) = mock_unit(id, Some(temp), None);
+        units.push(u);
+        components.append(&mut c);
+        signals.append(&mut s);
     }
-    if wanted.is_some() && found.is_empty() {
-        emit_line(Detected::fatal("mock id not found").to_line());
+    if wanted.is_some() && !any {
+        emit_line(Report::fatal("mock id not found").to_line());
     } else {
-        emit_line(Detected::ok(found).to_line());
+        emit_line(Report::ok(units, components, signals).to_line());
     }
+}
+
+fn detect_report(ids: &str) -> Report {
+    let (mut units, mut components, mut signals) = (Vec::new(), Vec::new(), Vec::new());
+    for id in ids.split(',').filter(|s| !s.is_empty()) {
+        let (u, mut c, mut s) = mock_unit(id, None, None);
+        units.push(u);
+        components.append(&mut c);
+        signals.append(&mut s);
+    }
+    Report::ok(units, components, signals)
 }
 
 fn detect_loop(module: &str) {
@@ -86,11 +119,8 @@ fn detect_loop(module: &str) {
     let switch_ms: u64 = envk(module, "SWITCH_MS")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    // After SWITCH_MS, switch detect behaviour: ok (default, using IDS2 if set), or error/fatal.
     let after = envk(module, "AFTER").unwrap_or_else(|| "ok".into());
 
-    // Use the signal-aware reader (like the production modules) so the mock faithfully mirrors the
-    // protocol; detect holds no device, so a signal/EOF just exits.
     let mut stdin = match StdinReader::new() {
         Ok(s) => s,
         Err(_) => return,
@@ -100,31 +130,20 @@ fn detect_loop(module: &str) {
             Ok(Request::Detect) => {
                 let switched = switch_ms > 0 && start.elapsed() >= Duration::from_millis(switch_ms);
                 let d = if switched && after == "error" {
-                    Detected::error("mock detect error")
+                    Report::error("mock detect error")
                 } else if switched && after == "fatal" {
-                    Detected::fatal("mock detect fatal")
+                    Report::fatal("mock detect fatal")
                 } else {
                     let ids = match (&ids2, switched) {
                         (Some(i2), true) => i2.clone(),
                         _ => ids1.clone(),
                     };
-                    let found = ids
-                        .split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(|id| FoundEntry {
-                            id: id.to_string(),
-                            kind: "MOCK".into(),
-                            name: format!("mock {id}"),
-                            components: vec![mock_component("self", "self", None)],
-                            extra: Default::default(),
-                        })
-                        .collect();
-                    Detected::ok(found)
+                    detect_report(&ids)
                 };
                 emit_line(d.to_line());
             }
             Ok(Request::Shutdown) => {
-                emit_line(Applied::ok_empty().to_line());
+                emit_line(Report::ok_empty().to_line());
                 break;
             }
             _ => eprintln!("mock detect: unexpected request"),
@@ -146,10 +165,13 @@ fn run_loop(module: &str, id: &str) {
             return;
         }
     };
+    let ok_report = |in_max: Option<i64>| {
+        let (u, c, s) = mock_unit(id, Some(temp), in_max);
+        Report::ok(vec![u], c, s)
+    };
     loop {
         let line = match stdin.next_event(Duration::from_millis(100)) {
             Event::Line(l) => l,
-            // SIGTERM/SIGINT: prove self-restore on a signal (no EOF needed).
             Event::Shutdown => {
                 append_marker(module, id, "signaled");
                 restore(module, id);
@@ -167,26 +189,17 @@ fn run_loop(module: &str, id: &str) {
                 write_marker(module, id, "lastinput", &in_max.unwrap_or(-1).to_string());
 
                 match behavior.as_str() {
-                    // Sleep a configurable time, then reply ok normally. Exercises delay-not-skip:
-                    // the apply completes (within a generous timeout) but takes longer than `every`,
-                    // so the instance's effective period stretches to ~SLOW_MS without skipping.
                     "slow" => {
                         let slow_ms: u64 = envk(module, "SLOW_MS")
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(800);
                         std::thread::sleep(Duration::from_millis(slow_ms));
-                        let mut components = vec![mock_component("self", "self", Some(temp))];
-                        if let Some(m) = in_max {
-                            components.push(mock_component("from_input", "from_input", Some(m)));
-                        }
-                        emit_line(Applied::ok(components).to_line());
+                        emit_line(ok_report(in_max).to_line());
                     }
                     "hang" => loop {
                         std::thread::sleep(Duration::from_secs(60));
                     },
                     "partial" => {
-                        // Write a partial line (NO newline) then hang — exercises the orchestrator's
-                        // deadline-bounded read (must kill within ~timeout, never block).
                         let mut out = std::io::stdout();
                         let _ = out.write_all(br#"{"status":"#);
                         let _ = out.flush();
@@ -194,25 +207,19 @@ fn run_loop(module: &str, id: &str) {
                             std::thread::sleep(Duration::from_secs(60));
                         }
                     }
-                    "error" => emit_line(Applied::error("mock error").to_line()),
-                    "fatal" => emit_line(Applied::fatal("mock fatal").to_line()),
+                    "error" => emit_line(Report::error("mock error").to_line()),
+                    "fatal" => emit_line(Report::fatal("mock fatal").to_line()),
                     "exit" => std::process::exit(0),
-                    _ => {
-                        let mut components = vec![mock_component("self", "self", Some(temp))];
-                        if let Some(m) = in_max {
-                            components.push(mock_component("from_input", "from_input", Some(m)));
-                        }
-                        emit_line(Applied::ok(components).to_line());
-                    }
+                    _ => emit_line(ok_report(in_max).to_line()),
                 }
             }
             Ok(Request::Shutdown) => {
                 restore(module, id);
-                emit_line(Applied::ok_empty().to_line());
+                emit_line(Report::ok_empty().to_line());
                 break;
             }
             Ok(Request::Detect) => eprintln!("mock run: unexpected detect"),
-            Err(e) => emit_line(Applied::error(format!("malformed: {e}")).to_line()),
+            Err(e) => emit_line(Report::error(format!("malformed: {e}")).to_line()),
         }
     }
 }
@@ -221,18 +228,9 @@ fn max_input_temp(inputs: Option<&Inputs>) -> Option<i64> {
     inputs?
         .values()
         .flatten()
-        .flat_map(|c| &c.publishers)
-        .filter(|p| p.kind == "temperature")
-        .filter_map(Publisher::value_i64)
+        .filter(|s| s.kind() == Some("temperature"))
+        .filter_map(Signal::value_i64)
         .max()
-}
-
-fn mock_component(id: &str, label: &str, temp: Option<i64>) -> Component {
-    let mut publisher = Publisher::new("temp", "Temperature", "temperature").unit("C");
-    if let Some(temp) = temp {
-        publisher = publisher.value(json!(temp));
-    }
-    Component::new(id, label, "mock").with_publishers(vec![publisher])
 }
 
 fn restore(module: &str, id: &str) {

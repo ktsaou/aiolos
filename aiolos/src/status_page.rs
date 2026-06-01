@@ -19,8 +19,9 @@
 
 use crate::AppState;
 use anyhow::Result;
-use protocol::{Component, Publisher, Sink};
+use protocol::{Component, Signal};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -189,34 +190,65 @@ fn percent_decode(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
-struct StatusJson<'a> {
+struct StatusJson {
     tick: u64,
-    modules: Vec<ModuleJson<'a>>,
-    instances: Vec<InstanceJson<'a>>,
+    modules: Vec<ModuleJson>,
+    units: Vec<UnitJson>,
+    components: Vec<Component>,
+    signals: Vec<Signal>,
+    instances: Vec<InstanceHealthJson>,
 }
 
 #[derive(Serialize)]
-struct ModuleJson<'a> {
-    module: &'a str,
-    detect_status: &'a str,
+struct ModuleJson {
+    module: String,
+    detect_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    detect_error: Option<&'a str>,
+    detect_error: Option<String>,
 }
 
+/// An assembled hardware unit: labels merged across every anemos that contributes to it (e.g. the
+/// motherboard's temps from `ipmi-temps` + fans from `rome2d-fans`), the source modules, and the
+/// worst contributing-instance status.
 #[derive(Serialize)]
-struct InstanceJson<'a> {
-    module: &'a str,
-    id: &'a str,
-    name: &'a str,
+struct UnitJson {
+    id: String,
+    labels: protocol::Labels,
+    sources: Vec<String>,
+    status: String,
+}
+
+/// Per-instance health only (the data is assembled into units/components/signals above).
+#[derive(Serialize)]
+struct InstanceHealthJson {
+    module: String,
+    id: String,
+    name: String,
     #[serde(rename = "type")]
-    unit_type: &'a str,
-    status: &'a str,
+    unit_type: String,
+    status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'a str>,
+    error: Option<String>,
     restart_count: u32,
     seconds_since_seen: u64,
-    components: &'a [Component],
     stderr_tail: Vec<String>,
+}
+
+/// Worse of two instance statuses (for a unit assembled from several anemoi).
+fn worse_status<'a>(a: &'a str, b: &'a str) -> &'a str {
+    fn rank(s: &str) -> u8 {
+        match s {
+            "ok" => 0,
+            "starting" => 1,
+            "error" => 2,
+            _ => 3,
+        }
+    }
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
 }
 
 fn render_json(state: &Arc<RwLock<AppState>>) -> String {
@@ -229,35 +261,68 @@ fn render_json(state: &Arc<RwLock<AppState>>) -> String {
         .modules
         .iter()
         .map(|(name, h)| ModuleJson {
-            module: name,
-            detect_status: &h.detect_status,
-            detect_error: h.detect_error.as_deref(),
+            module: name.clone(),
+            detect_status: h.detect_status.clone(),
+            detect_error: h.detect_error.clone(),
         })
         .collect();
-    modules.sort_by(|a, b| a.module.cmp(b.module));
-    let mut instances: Vec<InstanceJson> = s
-        .instances
-        .values()
-        .map(|i| InstanceJson {
-            module: &i.module_name,
-            id: &i.id,
-            name: &i.name,
-            unit_type: &i.unit_type,
-            status: &i.last_status,
-            error: i.last_error.as_deref(),
+    modules.sort_by(|a, b| a.module.cmp(&b.module));
+
+    // Assemble across instances: merge units by id, collect components + signals, per-instance health.
+    let mut units: BTreeMap<String, UnitJson> = BTreeMap::new();
+    let mut comps: BTreeMap<String, Component> = BTreeMap::new();
+    let mut signals: Vec<Signal> = Vec::new();
+    let mut instances: Vec<InstanceHealthJson> = Vec::new();
+    for i in s.instances.values() {
+        for u in &i.last_units {
+            let e = units.entry(u.id.clone()).or_insert_with(|| UnitJson {
+                id: u.id.clone(),
+                labels: protocol::Labels::new(),
+                sources: Vec::new(),
+                status: i.last_status.clone(),
+            });
+            for (k, v) in &u.labels {
+                e.labels.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            if !e.sources.contains(&i.module_name) {
+                e.sources.push(i.module_name.clone());
+            }
+            e.status = worse_status(&e.status, &i.last_status).to_string();
+        }
+        for c in &i.last_components {
+            comps.entry(c.id.clone()).or_insert_with(|| c.clone());
+        }
+        signals.extend(i.last_signals.iter().cloned());
+        instances.push(InstanceHealthJson {
+            module: i.module_name.clone(),
+            id: i.id.clone(),
+            name: i.name.clone(),
+            unit_type: i.unit_type.clone(),
+            status: i.last_status.clone(),
+            error: i.last_error.clone(),
             restart_count: i.restart_count,
             seconds_since_seen: i.last_seen.elapsed().as_secs(),
-            // Defensive ANSI strip: stale tails captured before the SDK's `.with_ansi(false)` fix
-            // could still carry escape codes; never let them reach the UI.
-            components: &i.last_components,
             stderr_tail: tail_lines(i, 12).iter().map(|l| strip_ansi(l)).collect(),
-        })
-        .collect();
-    instances.sort_by(|a, b| (a.module, a.id).cmp(&(b.module, b.id)));
+        });
+    }
+    let mut units: Vec<UnitJson> = units.into_values().collect();
+    for u in &mut units {
+        u.sources.sort();
+    }
+    units.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut components: Vec<Component> = comps.into_values().collect();
+    components.sort_by(|a, b| a.id.cmp(&b.id));
+    signals.sort_by(|a, b| a.id.cmp(&b.id));
+    instances.sort_by(|a, b| {
+        (a.module.as_str(), a.id.as_str()).cmp(&(b.module.as_str(), b.id.as_str()))
+    });
 
     serde_json::to_string(&StatusJson {
         tick,
         modules,
+        units,
+        components,
+        signals,
         instances,
     })
     .unwrap_or_else(|_| "{}".to_string())
@@ -267,21 +332,19 @@ fn render_json(state: &Arc<RwLock<AppState>>) -> String {
 // Time-series ring buffer (/history.json)
 // ---------------------------------------------------------------------------
 
-/// One per-instance sample inside a history snapshot: the numeric series we chart.
+/// One per-UNIT sample inside a history snapshot: the numeric series we chart. Keyed by the stable
+/// unit id (so a chart series survives renames); `name` is the short label shown in the legend.
 #[derive(Clone, Serialize)]
 struct HistInstance {
     key: String,
-    module: String,
-    /// max temp this instance reported (driving temp preferred if present, else max `temp` component).
+    name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     temp: Option<f64>,
-    /// commanded/observed max fan duty % across this instance's fans (or the driving `pct`).
     #[serde(skip_serializing_if = "Option::is_none")]
     duty: Option<f64>,
-    /// max fan RPM across this instance's fans.
     #[serde(skip_serializing_if = "Option::is_none")]
     rpm: Option<f64>,
-    /// 1 if last_status==ok at snapshot time, else 0.
+    /// 1 if every contributing instance was ok at snapshot time, else 0.
     up: u8,
 }
 
@@ -323,19 +386,15 @@ fn spawn_snapshotter(state: Arc<RwLock<AppState>>, history: Arc<Mutex<History>>)
             if s.instances.is_empty() {
                 continue;
             }
-            let mut instances: Vec<HistInstance> = s
-                .instances
-                .values()
-                .map(|i| {
-                    let agg = aggregate_components(&i.last_components);
-                    HistInstance {
-                        key: format!("{}:{}", i.module_name, i.id),
-                        module: i.module_name.clone(),
-                        temp: agg.temp,
-                        duty: agg.duty,
-                        rpm: agg.rpm,
-                        up: u8::from(i.last_status == "ok"),
-                    }
+            let mut instances: Vec<HistInstance> = unit_aggregates(&s)
+                .into_iter()
+                .map(|(id, name, agg, up)| HistInstance {
+                    key: id,
+                    name,
+                    temp: agg.temp,
+                    duty: agg.duty,
+                    rpm: agg.rpm,
+                    up: u8::from(up),
                 })
                 .collect();
             instances.sort_by(|a, b| a.key.cmp(&b.key));
@@ -350,63 +409,88 @@ fn spawn_snapshotter(state: Arc<RwLock<AppState>>, history: Arc<Mutex<History>>)
     });
 }
 
-/// Per-instance numeric aggregates used both by the history snapshotter and the live KPIs.
+/// Per-unit numeric aggregates used by the history snapshotter.
 struct Agg {
     temp: Option<f64>,
     duty: Option<f64>,
     rpm: Option<f64>,
 }
 
-/// Reduce a component list to the headline series: representative temp (driving smoothed temp if the
-/// instance publishes one, else the max temperature publisher), max fan duty (driving duty or sink
-/// value), and max fan RPM.
-fn aggregate_components(components: &[Component]) -> Agg {
+/// Reduce a set of signals to the headline series: representative temp (driving smoothed temp if
+/// present, else the max temperature), max fan duty (driving duty or fan-duty), and max fan RPM.
+fn aggregate_signals<'a>(signals: impl IntoIterator<Item = &'a Signal>) -> Agg {
     let mut max_temp: Option<f64> = None;
     let mut driving_temp: Option<f64> = None;
     let mut driving_pct: Option<f64> = None;
-    let mut max_pwm: Option<f64> = None;
+    let mut max_duty: Option<f64> = None;
     let mut max_rpm: Option<f64> = None;
-
-    for c in components {
-        for p in &c.publishers {
-            match p.kind.as_str() {
-                "temperature" => {
-                    if let Some(t) = pnum(p) {
-                        max_temp = Some(max_temp.map_or(t, |m: f64| m.max(t)));
-                    }
-                }
-                "driving-temperature" => {
-                    driving_temp = pnum(p).or(driving_temp);
-                }
-                "driving-duty" => {
-                    driving_pct = pnum(p).or(driving_pct);
-                }
-                "fan-duty" => {
-                    if let Some(pct) = pnum(p) {
-                        max_pwm = Some(max_pwm.map_or(pct, |m: f64| m.max(pct)));
-                    }
-                }
-                "fan-rpm" => {
-                    if let Some(rp) = pnum(p) {
-                        max_rpm = Some(max_rpm.map_or(rp, |m: f64| m.max(rp)));
-                    }
-                }
-                _ => {}
-            }
-        }
-        for s in &c.sinks {
-            if s.kind == "fan-duty" {
-                if let Some(pct) = snum(s) {
-                    max_pwm = Some(max_pwm.map_or(pct, |m: f64| m.max(pct)));
-                }
-            }
+    for sig in signals {
+        let Some(v) = signal_num(sig) else { continue };
+        match sig.kind() {
+            Some("temperature") => max_temp = Some(max_temp.map_or(v, |m: f64| m.max(v))),
+            Some("driving-temperature") => driving_temp = Some(v),
+            Some("driving-duty") => driving_pct = Some(v),
+            Some("fan-duty") => max_duty = Some(max_duty.map_or(v, |m: f64| m.max(v))),
+            Some("fan-rpm") => max_rpm = Some(max_rpm.map_or(v, |m: f64| m.max(v))),
+            _ => {}
         }
     }
     Agg {
         temp: driving_temp.or(max_temp),
-        duty: driving_pct.or(max_pwm),
+        duty: driving_pct.or(max_duty),
         rpm: max_rpm,
     }
+}
+
+/// Group every instance's signals by their hardware unit (signal → component → unit), and aggregate
+/// each unit's headline series. Returns `(unit_id, unit_name, agg, up)`. This is where the two
+/// motherboard anemoi (`ipmi-temps` + `rome2d-fans`) fold into one `board` series.
+fn unit_aggregates(s: &AppState) -> Vec<(String, String, Agg, bool)> {
+    use std::collections::HashMap;
+    let mut comp_unit: HashMap<&str, &str> = HashMap::new();
+    let mut unit_name: HashMap<&str, String> = HashMap::new();
+    let mut unit_up: HashMap<&str, bool> = HashMap::new();
+    for i in s.instances.values() {
+        for c in &i.last_components {
+            comp_unit.insert(c.id.as_str(), c.unit.as_str());
+        }
+        for u in &i.last_units {
+            unit_name.entry(u.id.as_str()).or_insert_with(|| {
+                u.labels
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| u.id.clone())
+            });
+            let up = i.last_status == "ok";
+            unit_up
+                .entry(u.id.as_str())
+                .and_modify(|e| *e = *e && up)
+                .or_insert(up);
+        }
+    }
+    let mut by_unit: HashMap<&str, Vec<&Signal>> = HashMap::new();
+    for i in s.instances.values() {
+        for sig in &i.last_signals {
+            if let Some(u) = comp_unit.get(sig.component.as_str()) {
+                by_unit.entry(u).or_default().push(sig);
+            }
+        }
+    }
+    by_unit
+        .into_iter()
+        .map(|(uid, sigs)| {
+            let agg = aggregate_signals(sigs);
+            (
+                uid.to_string(),
+                unit_name
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or_else(|| uid.to_string()),
+                agg,
+                unit_up.get(uid).copied().unwrap_or(false),
+            )
+        })
+        .collect()
 }
 
 fn render_history_json(history: &Arc<Mutex<History>>) -> String {
@@ -550,114 +634,57 @@ fn render_metrics(state: &Arc<RwLock<AppState>>) -> String {
             i.last_seen.elapsed().as_secs()
         ));
 
-        for c in &i.last_components {
-            let cbase = format!(
-                "{base},component={},component_class={}",
-                json_str(&c.id),
-                json_str(&c.class)
+        for sig in &i.last_signals {
+            let name = sig.labels.get("name").map(String::as_str).unwrap_or("");
+            let full = format!(
+                "{base},component={},signal={},label={}",
+                json_str(&sig.component),
+                json_str(&sig.id),
+                json_str(name)
             );
-            for p in &c.publishers {
-                let full = format!(
-                    "{cbase},publisher={},label={}",
-                    json_str(&p.id),
-                    json_str(&p.label)
-                );
-                match p.kind.as_str() {
-                    "temperature" => {
-                        if let Some(t) = pnum(p) {
-                            m.temp
-                                .push(format!("aiolos_temp_celsius{{{full}}} {}", fmt_num(t)));
-                        }
-                    }
-                    "fan-duty" => {
-                        if let Some(v) = pnum(p) {
-                            m.duty
-                                .push(format!("aiolos_fan_duty_percent{{{full}}} {}", fmt_num(v)));
-                        }
-                    }
-                    "fan-rpm" => {
-                        if let Some(v) = pnum(p) {
-                            m.rpm
-                                .push(format!("aiolos_fan_rpm{{{full}}} {}", fmt_num(v)));
-                        }
-                    }
-                    "driving-temperature" => {
-                        if let Some(v) = pnum(p) {
-                            m.driving
-                                .push(format!("aiolos_driving_celsius{{{full}}} {}", fmt_num(v)));
-                        }
-                    }
-                    "driving-raw-temperature" => {
-                        if let Some(v) = pnum(p) {
-                            m.driving_raw.push(format!(
-                                "aiolos_driving_raw_celsius{{{full}}} {}",
-                                fmt_num(v)
-                            ));
-                        }
-                    }
-                    "driving-duty" => {
-                        if let Some(v) = pnum(p) {
-                            m.driving_duty.push(format!(
-                                "aiolos_driving_duty_percent{{{full}}} {}",
-                                fmt_num(v)
-                            ));
-                        }
-                    }
-                    "powercap-capped" => {
-                        if let Some(v) = pbool(p).or_else(|| pnum(p)) {
-                            m.pc_capped
-                                .push(format!("aiolos_powercap_capped{{{full}}} {}", fmt_num(v)));
-                        }
-                    }
-                    "power-limit" => {
-                        if let Some(v) = pnum(p) {
-                            m.pc_limit
-                                .push(format!("aiolos_powercap_limit_mw{{{full}}} {}", fmt_num(v)));
-                        }
-                    }
-                    "power-draw" => {
-                        if let Some(v) = pnum(p) {
-                            m.pc_draw
-                                .push(format!("aiolos_powercap_draw_mw{{{full}}} {}", fmt_num(v)));
-                        }
-                    }
-                    "power-on-battery" => {
-                        if let Some(v) = pbool(p).or_else(|| pnum(p)) {
-                            m.ps_on_battery
-                                .push(format!("aiolos_power_on_battery{{{full}}} {}", fmt_num(v)));
-                        }
-                    }
-                    "power-runtime" => {
-                        if let Some(v) = pnum(p) {
-                            m.ps_runtime.push(format!(
-                                "aiolos_power_runtime_seconds{{{full}}} {}",
-                                fmt_num(v)
-                            ));
-                        }
-                    }
-                    "power-charge" => {
-                        if let Some(v) = pnum(p) {
-                            m.ps_charge.push(format!(
-                                "aiolos_power_charge_percent{{{full}}} {}",
-                                fmt_num(v)
-                            ));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for s in &c.sinks {
-                if s.kind == "fan-duty" {
-                    let full = format!(
-                        "{cbase},sink={},label={}",
-                        json_str(&s.id),
-                        json_str(&s.label)
-                    );
-                    if let Some(v) = snum(s) {
-                        m.duty
-                            .push(format!("aiolos_fan_duty_percent{{{full}}} {}", fmt_num(v)));
-                    }
-                }
+            let Some(v) = signal_num(sig) else { continue };
+            match sig.kind() {
+                Some("temperature") => m
+                    .temp
+                    .push(format!("aiolos_temp_celsius{{{full}}} {}", fmt_num(v))),
+                Some("fan-duty") => m
+                    .duty
+                    .push(format!("aiolos_fan_duty_percent{{{full}}} {}", fmt_num(v))),
+                Some("fan-rpm") => m
+                    .rpm
+                    .push(format!("aiolos_fan_rpm{{{full}}} {}", fmt_num(v))),
+                Some("driving-temperature") => m
+                    .driving
+                    .push(format!("aiolos_driving_celsius{{{full}}} {}", fmt_num(v))),
+                Some("driving-raw-temperature") => m.driving_raw.push(format!(
+                    "aiolos_driving_raw_celsius{{{full}}} {}",
+                    fmt_num(v)
+                )),
+                Some("driving-duty") => m.driving_duty.push(format!(
+                    "aiolos_driving_duty_percent{{{full}}} {}",
+                    fmt_num(v)
+                )),
+                Some("powercap-capped") => m
+                    .pc_capped
+                    .push(format!("aiolos_powercap_capped{{{full}}} {}", fmt_num(v))),
+                Some("power-limit") => m
+                    .pc_limit
+                    .push(format!("aiolos_powercap_limit_mw{{{full}}} {}", fmt_num(v))),
+                Some("power-draw") => m
+                    .pc_draw
+                    .push(format!("aiolos_powercap_draw_mw{{{full}}} {}", fmt_num(v))),
+                Some("power-on-battery") => m
+                    .ps_on_battery
+                    .push(format!("aiolos_power_on_battery{{{full}}} {}", fmt_num(v))),
+                Some("power-runtime") => m.ps_runtime.push(format!(
+                    "aiolos_power_runtime_seconds{{{full}}} {}",
+                    fmt_num(v)
+                )),
+                Some("power-charge") => m.ps_charge.push(format!(
+                    "aiolos_power_charge_percent{{{full}}} {}",
+                    fmt_num(v)
+                )),
+                _ => {}
             }
         }
     }
@@ -822,26 +849,13 @@ fn emit(out: &mut String, name: &str, kind: &str, help: &str, lines: &[String]) 
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Read a publisher value as f64 (ints or floats).
-fn pnum(p: &Publisher) -> Option<f64> {
-    p.value
-        .as_ref()
-        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
-}
-
-/// Read a publisher bool value as a Prometheus 0/1 gauge.
-fn pbool(p: &Publisher) -> Option<f64> {
-    p.value
-        .as_ref()
-        .and_then(|v| v.as_bool())
-        .map(|b| if b { 1.0 } else { 0.0 })
-}
-
-/// Read a sink value as f64 (ints or floats).
-fn snum(s: &Sink) -> Option<f64> {
-    s.value
-        .as_ref()
-        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+/// Read a signal value as f64: ints/floats directly, bools as a 0/1 gauge.
+fn signal_num(s: &Signal) -> Option<f64> {
+    s.value.as_ref().and_then(|v| {
+        v.as_f64()
+            .or_else(|| v.as_i64().map(|i| i as f64))
+            .or_else(|| v.as_bool().map(|b| if b { 1.0 } else { 0.0 }))
+    })
 }
 
 /// Format an f64 for Prometheus: drop the trailing `.0` for whole numbers, else plain decimal.
@@ -949,14 +963,23 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Instant;
 
+    use protocol::Unit;
+
     fn mk_instance(
         module: &str,
         id: &str,
         name: &str,
         status: &str,
-        components: Vec<Component>,
+        signals: Vec<Signal>,
     ) -> InstanceEntry {
         let (tx, _rx) = mpsc::channel();
+        // Derive the unit + the components the signals reference so the assembly stays consistent.
+        let mut comps: BTreeMap<String, Component> = BTreeMap::new();
+        for s in &signals {
+            comps
+                .entry(s.component.clone())
+                .or_insert_with(|| Component::new(s.component.clone(), id).typed("test"));
+        }
         InstanceEntry {
             module_name: module.into(),
             id: id.into(),
@@ -964,7 +987,9 @@ mod tests {
             unit_type: "test".into(),
             last_status: status.into(),
             last_error: None,
-            last_components: components,
+            last_units: vec![Unit::new(id).name(name).typed("test")],
+            last_components: comps.into_values().collect(),
+            last_signals: signals,
             restart_count: 0,
             last_seen: Instant::now(),
             cmd_tx: tx,
@@ -996,94 +1021,78 @@ mod tests {
         Arc::new(RwLock::new(s))
     }
 
-    fn pub_i64(id: &str, label: &str, kind: &str, value: i64, unit: Option<&str>) -> Publisher {
-        let mut p = Publisher::new(id, label, kind).value(json!(value));
-        if let Some(unit) = unit {
-            p = p.unit(unit);
-        }
-        p
-    }
-
-    fn temp_component(id: &str, label: &str, class: &str, temp: i64) -> Component {
-        Component::new(id, label, class).with_publishers(vec![pub_i64(
-            "temp",
-            label,
-            "temperature",
-            temp,
-            Some("C"),
-        )])
+    fn sig(id: &str, component: &str, kind: &str, value: i64, name: &str) -> Signal {
+        Signal::producer(id, component, kind)
+            .value(json!(value))
+            .name(name)
     }
 
     #[test]
-    fn metrics_render_all_component_kinds() {
+    fn metrics_render_all_signal_kinds() {
         let inst = mk_instance(
             "nvidia",
             "GPU-1",
             "RTX 6000",
             "ok",
-            vec![Component::new("gpu", "GPU", "gpu").with_publishers(vec![
-                pub_i64("temp", "GPU", "temperature", 63, Some("C")),
-                pub_i64("fan0.duty", "fan0", "fan-duty", 72, Some("%")),
-                pub_i64("fan0.rpm", "fan0", "fan-rpm", 2200, Some("rpm")),
-                pub_i64(
-                    "driving.temp",
-                    "driving",
+            vec![
+                sig("g:gpu:temp", "g:gpu", "temperature", 63, "GPU"),
+                sig("g:gpu:fan0.duty", "g:gpu", "fan-duty", 72, "fan0"),
+                sig("g:gpu:fan0.rpm", "g:gpu", "fan-rpm", 2200, "fan0"),
+                sig(
+                    "g:gpu:driving.temp",
+                    "g:gpu",
                     "driving-temperature",
                     60,
-                    Some("C"),
-                ),
-                pub_i64(
-                    "driving.raw",
                     "driving",
+                ),
+                sig(
+                    "g:gpu:driving.raw",
+                    "g:gpu",
                     "driving-raw-temperature",
                     63,
-                    Some("C"),
+                    "driving",
                 ),
-                pub_i64("driving.duty", "driving", "driving-duty", 80, Some("%")),
-            ])],
+                sig("g:gpu:driving.duty", "g:gpu", "driving-duty", 80, "driving"),
+            ],
         );
         let state = state_with(vec![inst], vec![("nvidia", "ok")], 42);
         let m = render_metrics(&state);
 
         assert!(m.contains("aiolos_tick 42"));
-        assert!(m.contains(r#"aiolos_temp_celsius{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="temp",label="GPU"} 63"#));
-        assert!(m.contains(r#"aiolos_fan_duty_percent{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="fan0.duty",label="fan0"} 72"#));
-        assert!(m.contains(r#"aiolos_fan_rpm{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="fan0.rpm",label="fan0"} 2200"#));
-        assert!(m.contains(r#"aiolos_driving_celsius{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="driving.temp",label="driving"} 60"#));
-        assert!(m.contains(r#"aiolos_driving_raw_celsius{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="driving.raw",label="driving"} 63"#));
-        assert!(m.contains(r#"aiolos_driving_duty_percent{module="nvidia",id="GPU-1",instance_name="RTX 6000",component="gpu",component_class="gpu",publisher="driving.duty",label="driving"} 80"#));
-        assert!(m.contains(
-            r#"aiolos_instance_up{module="nvidia",id="GPU-1",instance_name="RTX 6000"} 1"#
-        ));
+        let base = r#"module="nvidia",id="GPU-1",instance_name="RTX 6000""#;
+        assert!(m.contains(&format!(r#"aiolos_temp_celsius{{{base},component="g:gpu",signal="g:gpu:temp",label="GPU"}} 63"#)), "{m}");
+        assert!(m.contains(&format!(r#"aiolos_fan_duty_percent{{{base},component="g:gpu",signal="g:gpu:fan0.duty",label="fan0"}} 72"#)));
+        assert!(m.contains(&format!(r#"aiolos_fan_rpm{{{base},component="g:gpu",signal="g:gpu:fan0.rpm",label="fan0"}} 2200"#)));
+        assert!(m.contains(&format!(r#"aiolos_driving_celsius{{{base},component="g:gpu",signal="g:gpu:driving.temp",label="driving"}} 60"#)));
+        assert!(m.contains(&format!(r#"aiolos_driving_raw_celsius{{{base},component="g:gpu",signal="g:gpu:driving.raw",label="driving"}} 63"#)));
+        assert!(m.contains(&format!(r#"aiolos_driving_duty_percent{{{base},component="g:gpu",signal="g:gpu:driving.duty",label="driving"}} 80"#)));
+        assert!(m.contains(&format!(r#"aiolos_instance_up{{{base}}} 1"#)));
         assert!(m.contains(r#"aiolos_module_detect_up{module="nvidia"} 1"#));
-        // Each family header appears exactly once.
         assert_eq!(m.matches("# TYPE aiolos_temp_celsius gauge").count(), 1);
         assert_eq!(m.matches("# TYPE aiolos_fan_rpm gauge").count(), 1);
     }
 
     #[test]
     fn metrics_disambiguate_duplicate_labels() {
-        // Two CPU sockets may share the display label; publisher ids keep the series distinct.
+        // Two CPU sockets may share the display name; signal ids keep the series distinct.
         let inst = mk_instance(
             "rome2d-fans",
             "board",
             "board",
             "ok",
             vec![
-                Component::new("board", "Board", "board").with_publishers(vec![
-                    pub_i64("cpu0.temp", "CPU", "temperature", 50, Some("C")),
-                    pub_i64("cpu1.temp", "CPU", "temperature", 55, Some("C")),
-                ]),
+                sig("board:cpu0:temp", "board:cpu0", "temperature", 50, "CPU"),
+                sig("board:cpu1:temp", "board:cpu1", "temperature", 55, "CPU"),
             ],
         );
         let state = state_with(vec![inst], vec![], 1);
         let m = render_metrics(&state);
         assert!(
-            m.contains(r#"publisher="cpu0.temp",label="CPU"} 50"#),
+            m.contains(r#"signal="board:cpu0:temp",label="CPU"} 50"#),
             "{m}"
         );
         assert!(
-            m.contains(r#"publisher="cpu1.temp",label="CPU"} 55"#),
+            m.contains(r#"signal="board:cpu1:temp",label="CPU"} 55"#),
             "{m}"
         );
     }
@@ -1106,7 +1115,7 @@ mod tests {
             "id",
             "na\"me",
             "ok",
-            vec![temp_component("sensor", "a\\b", "mock", 1)],
+            vec![sig("sensor:c:temp", "sensor:c", "temperature", 1, "a\\b")],
         );
         let state = state_with(vec![inst], vec![], 1);
         let m = render_metrics(&state);
@@ -1123,30 +1132,30 @@ mod tests {
 
     #[test]
     fn aggregate_prefers_driving_and_takes_maxima() {
-        let agg = aggregate_components(&[Component::new("board", "Board", "board")
-            .with_publishers(vec![
-                pub_i64("gpu.temp", "GPU", "temperature", 40, Some("C")),
-                pub_i64("nvme.temp", "NVMe", "temperature", 55, Some("C")),
-                pub_i64(
-                    "driving.temp",
-                    "driving",
-                    "driving-temperature",
-                    58,
-                    Some("C"),
-                ),
-                pub_i64(
-                    "driving.raw",
-                    "driving",
-                    "driving-raw-temperature",
-                    60,
-                    Some("C"),
-                ),
-                pub_i64("driving.duty", "driving", "driving-duty", 77, Some("%")),
-                pub_i64("fan0.duty", "fan0", "fan-duty", 70, Some("%")),
-                pub_i64("fan0.rpm", "fan0", "fan-rpm", 1800, Some("rpm")),
-                pub_i64("fan1.duty", "fan1", "fan-duty", 90, Some("%")),
-                pub_i64("fan1.rpm", "fan1", "fan-rpm", 2400, Some("rpm")),
-            ])]);
+        let signals = vec![
+            sig("b:c:gpu.temp", "b:c", "temperature", 40, "GPU"),
+            sig("b:c:nvme.temp", "b:c", "temperature", 55, "NVMe"),
+            sig(
+                "b:c:driving.temp",
+                "b:c",
+                "driving-temperature",
+                58,
+                "driving",
+            ),
+            sig(
+                "b:c:driving.raw",
+                "b:c",
+                "driving-raw-temperature",
+                60,
+                "driving",
+            ),
+            sig("b:c:driving.duty", "b:c", "driving-duty", 77, "driving"),
+            sig("b:c:fan0.duty", "b:c", "fan-duty", 70, "fan0"),
+            sig("b:c:fan0.rpm", "b:c", "fan-rpm", 1800, "fan0"),
+            sig("b:c:fan1.duty", "b:c", "fan-duty", 90, "fan1"),
+            sig("b:c:fan1.rpm", "b:c", "fan-rpm", 2400, "fan1"),
+        ];
+        let agg = aggregate_signals(&signals);
         assert_eq!(agg.temp, Some(58.0), "driving temp preferred");
         assert_eq!(agg.duty, Some(77.0), "driving pct preferred");
         assert_eq!(agg.rpm, Some(2400.0), "max rpm");
@@ -1154,12 +1163,12 @@ mod tests {
 
     #[test]
     fn aggregate_falls_back_to_max_temp_and_pwm() {
-        let agg = aggregate_components(&[Component::new("board", "Board", "board")
-            .with_publishers(vec![
-                pub_i64("a.temp", "A", "temperature", 30, Some("C")),
-                pub_i64("b.temp", "B", "temperature", 48, Some("C")),
-                pub_i64("fan0.duty", "fan0", "fan-duty", 65, Some("%")),
-            ])]);
+        let signals = vec![
+            sig("b:c:a.temp", "b:c", "temperature", 30, "A"),
+            sig("b:c:b.temp", "b:c", "temperature", 48, "B"),
+            sig("b:c:fan0.duty", "b:c", "fan-duty", 65, "fan0"),
+        ];
+        let agg = aggregate_signals(&signals);
         assert_eq!(agg.temp, Some(48.0));
         assert_eq!(agg.duty, Some(65.0));
         assert_eq!(agg.rpm, None);

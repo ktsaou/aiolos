@@ -1,36 +1,35 @@
-//! rome2d-fans anemos — ASRockRack ROME2D16-2T board fan control via inband IPMI.
+//! rome2d-fans anemos — ASRockRack ROME2D16-2T board fan control via inband IPMI (label-driven
+//! signal model, SOW-0018).
 //!
 //! Level-3: device logic ONLY. The `anemos` SDK owns the lifecycle (CLI/signals/logging/curve+EMA/
 //! protocol/restore); `ipmi` is the IPMI transport; `board` is the board's OEM fan commands; `hwmon`
-//! reads CPU temps. detect → one board.
+//! reads CPU temps.
 //!
-//! apply (SOW-0010) drives the 8 fans in one of two modes, decided live each tick from the config:
-//! - **uniform** (default, back-compatible): one `curve(max(all routed inputs, CPU))` for all 8 fans
-//!   — the SDK-provided controller reading `rome2d-fans.curve.json`.
-//! - **per-zone**: when BOTH optional zone curve files load a non-empty curve, drive FAN1/2 (the
-//!   Noctua CPU coolers) from CPU temps via `rome2d-fans.cpu.curve.json`, and FAN3–8 (case fans)
-//!   from `max(all routed inputs = GPU+NVMe+…)` via `rome2d-fans.case.curve.json`. Two internal
-//!   `anemos::Controller`s (own EMA/deadband/sensitivity), commanded via the per-fan `0xd6` path.
+//! It reports the **motherboard unit** (`id` = `board`, shared with `ipmi-temps` so the BMC temps and
+//! these fans merge into one unit): `fan1..fan8` components (an `rpm` producer + a `duty` sink each),
+//! a `cpu` component (the k10temp CPU sensors that drive the CPU fans), and a `control` component
+//! carrying the driving-decision signals.
 //!
-//! Fan-fault detection (SOW-0008): a fan commanded above a duty threshold that reads ≈0 RPM for
-//! several consecutive ticks (after a spin-up grace) is flagged (`"fault":true` component + warn), and
-//! the surviving fans in its zone are boosted to 100% for more airflow.
-//!
-//! restore → release to BMC auto. A `query` subcommand reads the live duty (read-only diagnostic).
+//! The control path (read routed temps, compute duties via curve+EMA, drive the 8 fans, fault
+//! detection, release-to-auto fail-safe) is UNCHANGED from v1 — this is a reporting refactor.
 
 mod board;
 mod fault;
 mod zones;
 
 use anemos::{
-    Anemos, Applied, Component, Controller, Detected, Device, DrivenBy, ExtraCmd, FoundEntry,
-    Inputs, ModuleInfo, OpenMode, Publisher, Sink, SinkState,
+    Anemos, Component, Control, Controller, Device, ExtraCmd, Inputs, ModuleInfo, OpenMode,
+    Provenance, Report, Signal, SinkState, Unit,
 };
 use board::Board;
 use fault::FanFaultTracker;
 use serde_json::json;
 use std::collections::HashMap;
 use zones::ZoneControllers;
+
+/// The stable id of the physical motherboard unit (shared with `ipmi-temps` so they merge).
+const BOARD_ID: &str = "board";
+const BOARD_DESC: &str = "ASRockRack ROME2D16-2T";
 
 fn main() -> ! {
     let mut extra: HashMap<&'static str, ExtraCmd> = HashMap::new();
@@ -49,28 +48,59 @@ fn main() -> ! {
 struct Rome2dFans;
 
 impl Anemos for Rome2dFans {
-    fn detect(&mut self) -> Detected {
-        Detected::ok(vec![FoundEntry {
-            id: "board".to_string(),
-            kind: "board".to_string(),
-            name: "ROME2D16-2T".to_string(),
-            components: vec![board_schema_component()],
-            extra: Default::default(),
-        }])
+    fn detect(&mut self) -> Report {
+        let (mut components, mut signals) = (Vec::new(), Vec::new());
+        let cc = format!("{BOARD_ID}:control");
+        components.push(
+            Component::new(&cc, BOARD_ID)
+                .name("control")
+                .typed("control"),
+        );
+        signals.push(
+            Signal::producer(format!("{cc}:driving.temp"), &cc, "driving-temperature")
+                .uom("C")
+                .name("driving temperature"),
+        );
+        signals.push(
+            Signal::producer(format!("{cc}:driving.duty"), &cc, "driving-duty")
+                .uom("%")
+                .name("driving duty"),
+        );
+        for i in 1..=8 {
+            let fc = format!("{BOARD_ID}:fan{i}");
+            components.push(
+                Component::new(&fc, BOARD_ID)
+                    .name(format!("fan{i}"))
+                    .typed("fan"),
+            );
+            signals.push(
+                Signal::producer(format!("{fc}:rpm"), &fc, "fan-rpm")
+                    .uom("rpm")
+                    .name("rpm"),
+            );
+            signals.push(
+                Signal::sink(format!("{fc}:duty"), &fc, "fan-duty")
+                    .uom("%")
+                    .range(0.0, 100.0)
+                    .name("duty")
+                    .control(Control {
+                        needs_claim: true,
+                        safe: Some(json!("auto")),
+                        direction: Some("up=more-cooling".into()),
+                        readback: Some(format!("{fc}:rpm")),
+                        ..Default::default()
+                    }),
+            );
+        }
+        Report::ok(vec![board_unit()], components, signals)
     }
 
     fn open(&mut self, _id: &str, mode: OpenMode) -> anyhow::Result<Box<dyn Device>> {
         let mut board = Board::open()?;
-        // Warm the per-fan tach conversion-factor cache once here (off the apply deadline) so the
-        // first tick is no heavier than the rest; any that fail are retried lazily during ticks.
         board.prefetch_fan_factors();
         Ok(Box::new(Rome2dFansDevice {
             board,
-            // Control mode owes a release-to-auto on every exit path. Observe/info is read-only and
-            // must not release the board on drop, because it never claimed manual control.
             restore_armed: mode == OpenMode::Control,
-            // Lazily built on the first apply, once the SDK controller reveals the curve path
-            // (so the zone curve files sit next to the main one and honour `$AIOLOS_ETC_DIR`).
             zones: None,
             faults: FanFaultTracker::new(),
         }))
@@ -90,105 +120,49 @@ impl Anemos for Rome2dFans {
 struct Rome2dFansDevice {
     board: Board,
     restore_armed: bool,
-    /// Per-zone controllers (CPU coolers vs case fans), built lazily on the first apply from the
-    /// SDK controller's curve path. Present only when both zone curve files exist; otherwise the
-    /// uniform SDK controller drives all 8 fans.
     zones: Option<ZoneControllers>,
-    /// Per-fan stall detector (commanded-above-threshold vs measured RPM, with grace + hysteresis).
     faults: FanFaultTracker,
 }
 
 impl Device for Rome2dFansDevice {
-    fn collect(&mut self, _inputs: Option<&Inputs>) -> Applied {
+    fn collect(&mut self, _inputs: Option<&Inputs>) -> Report {
         // Read-only snapshot for `rome2d-fans info`: local CPU sensors plus BMC duty/RPM readbacks.
-        // It never claims, sets, or releases the board, so it is safe while another controller owns
-        // fan control.
-        let mut publishers = Vec::new();
-        for (label, t) in hwmon::read_temps("k10temp") {
-            publishers.push(
-                Publisher::new(temp_publisher_id(&label), label, "temperature")
-                    .value(json!(t))
-                    .unit("C"),
-            );
-        }
+        // Never claims, sets, or releases the board, so it is safe while another controller owns it.
+        let cpu_temps = hwmon::read_temps("k10temp");
+        let (mut components, mut signals) = cpu_components(&cpu_temps);
 
         let (duty_readback, fan_rpms) = self.board.read_fan_status();
-        let mut sinks = Vec::new();
-        for (i, (label, rpm)) in fan_rpms.into_iter().enumerate() {
-            if let Some(pwm) = duty_readback.as_ref().and_then(|d| d.get(i)).copied() {
-                publishers.push(
-                    Publisher::new(
-                        format!("fan{}.duty", i + 1),
-                        format!("{label} duty"),
-                        "fan-duty",
-                    )
-                    .value(json!(pwm))
-                    .unit("%")
-                    .range(0.0, 100.0),
-                );
-            }
-            if let Some(r) = rpm {
-                publishers.push(
-                    Publisher::new(
-                        format!("fan{}.rpm", i + 1),
-                        format!("{label} RPM"),
-                        "fan-rpm",
-                    )
-                    .value(json!(r))
-                    .unit("rpm"),
-                );
-            }
-            sinks.push(
-                Sink::new(format!("fan{}", i + 1), label, "fan-duty")
-                    .range(0.0, 100.0)
-                    .unit("%")
-                    .readback(format!("fan{}.duty", i + 1))
-                    .safe(json!("auto"))
-                    .needs_claim(true)
-                    .state(SinkState::Unknown)
-                    .direction("up=more-cooling"),
-            );
-        }
-
-        Applied::ok(vec![Component::new("board", "ROME2D16-2T", "board")
-            .with_publishers(publishers)
-            .with_sinks(sinks)])
+        let (mut fc, mut fs) = fan_components(
+            &fan_rpms,
+            duty_readback.as_deref(),
+            None, // no commanded value in read-only collect
+            SinkState::Unknown,
+            &[],         // no driver provenance
+            &[false; 8], // no fault state
+        );
+        components.append(&mut fc);
+        signals.append(&mut fs);
+        Report::ok(vec![board_unit()], components, signals)
     }
 
-    fn apply(&mut self, inputs: Option<&Inputs>, ctrl: &mut Controller) -> Applied {
-        // Routed temps arrive keyed by `module:id`; partition by source so GPU and NVMe are
-        // labelled distinctly in the components. The uniform driving max uses ALL routed temps (robust
-        // if more sources are wired later) plus the local CPU sensors. The per-zone path (SOW-0010)
-        // splits these: CPU coolers (FAN1/2) by CPU temp; case fans (FAN3–8) by the routed-input max.
+    fn apply(&mut self, inputs: Option<&Inputs>, ctrl: &mut Controller) -> Report {
+        // --- control path (UNCHANGED from v1) ---------------------------------------------------
         let gpu_temps = input_temps_from(inputs, "nvidia");
         let nvme_temps = input_temps_from(inputs, "nvme");
         let cpu_temps = hwmon::read_temps("k10temp");
         let gpu_max = gpu_temps.iter().copied().max();
         let nvme_max = nvme_temps.iter().copied().max();
         let cpu_max = cpu_temps.iter().map(|(_, t)| *t).max();
-        let input_max = input_temps(inputs).into_iter().max(); // GPU+NVMe+any routed source
+        let input_max = input_temps(inputs).into_iter().max();
         let raw_driving = [input_max, cpu_max].into_iter().flatten().max();
 
-        // Build (lazily, once) the per-zone controllers next to the main curve file. The SDK
-        // controller's path reveals the etc dir + env override; we never touch the SDK controller's
-        // EMA when in zone mode.
         let zones = self
             .zones
             .get_or_insert_with(|| ZoneControllers::for_main_path(ctrl.path()));
-
-        // Decide the mode LIVE each tick (so dropping in / removing the zone files takes effect on
-        // the next tick): zone mode iff BOTH zone curve files load a non-empty curve. This is a pure
-        // config read; it does not perturb any controller's EMA.
         let zone_mode = zones.both_present();
-
-        // Compensation set from PRIOR ticks: zones with a confirmed-faulted fan get their surviving
-        // fans boosted this tick. Computed before the duty math so it can override the base duties.
         let confirmed = self.faults.confirmed();
 
         let outcome = if zone_mode {
-            // Per-zone: each zone needs a present temp AND (guaranteed non-empty) curve; if either
-            // zone is blind we cannot split safely, so release the WHOLE board (one 0xd6 sets all 8
-            // fans — we cannot release one zone and hold the other). Mirrors the uniform fail-safe.
             let (Some(cpu_raw), Some(case_raw)) = (cpu_max, input_max) else {
                 self.reset_zone_dampers();
                 return release_or_error(
@@ -216,7 +190,7 @@ impl Device for Rome2dFansDevice {
                 "decision: set board fans (zone mode)"
             );
             if let Err(e) = self.board.set_fans_per_fan(&commanded.map(|p| p as i32)) {
-                return Applied::error(format!("set fans: {e}"));
+                return Report::error(format!("set fans: {e}"));
             }
             ApplyOutcome::zone(
                 commanded,
@@ -226,7 +200,6 @@ impl Device for Rome2dFansDevice {
                 case_duty.smoothed,
             )
         } else {
-            // Uniform (default, back-compatible): one curve over max(all inputs, CPU), all 8 fans.
             let Some(raw) = raw_driving else {
                 return release_or_error(&mut self.board, "indeterminable temp");
             };
@@ -240,98 +213,56 @@ impl Device for Rome2dFansDevice {
                 raw_driving = raw, smoothed_driving = duty.smoothed,
                 commanded_pct = pct, ?commanded, ?confirmed,
                 "decision: set all board fans (uniform)");
-            // Uniform with no active compensation -> the dedicated uniform set; a fault boost makes
-            // the duties non-uniform, so use the per-fan path in that case.
             let set = if commanded == base {
                 self.board.set_all_fans(pct as i32)
             } else {
                 self.board.set_fans_per_fan(&commanded.map(|p| p as i32))
             };
             if let Err(e) = set {
-                return Applied::error(format!("set fans: {e}"));
+                return Report::error(format!("set fans: {e}"));
             }
             ApplyOutcome::uniform(commanded, raw, duty.smoothed, pct)
         };
+        // --- end control path -------------------------------------------------------------------
 
-        let mut publishers = Vec::new();
-        for (label, t) in &cpu_temps {
-            publishers.push(
-                Publisher::new(temp_publisher_id(label), label.clone(), "temperature")
-                    .value(json!(t))
-                    .unit("C"),
-            );
-        }
-        publishers.extend(outcome.driving_publishers());
+        // Report stage: CPU temps + control/driving signals + the 8 fans.
+        let (mut components, mut signals) = cpu_components(&cpu_temps);
+        let (mut cc, mut cs) = outcome.control_component();
+        components.append(&mut cc);
+        signals.append(&mut cs);
 
-        // Observability, read AFTER the control decision (and under a short timeout) so a sensor
-        // hiccup never affects cooling or fails the tick: the true per-fan duty (0xda readback) and
-        // each fan's tachometer RPM. pwm falls back to the commanded duty if the readback is
-        // unavailable; rpm is omitted if the tach is unreadable.
+        // Observability read AFTER the control decision (short timeout): true per-fan duty + RPM.
         let (duty_readback, fan_rpms) = self.board.read_fan_status();
-        // Update the per-fan stall detector with what we COMMANDED this tick and what each tach now
-        // reads, producing the confirmed-fault set used for compensation next tick.
         let commanded = outcome.commanded();
         let rpms: [Option<i32>; 8] = std::array::from_fn(|i| fan_rpms.get(i).and_then(|(_, r)| *r));
         let now_faulted = self.faults.update(&commanded, &rpms);
-        let drivers = driven_by_for_board(gpu_max, nvme_max, cpu_max);
-        let mut sinks = Vec::new();
-        for (i, (label, rpm)) in fan_rpms.into_iter().enumerate() {
-            let pwm = duty_readback
-                .as_ref()
-                .and_then(|d| d.get(i))
-                .map(|&b| b as i64)
-                .unwrap_or(commanded[i] as i64);
-            publishers.push(
-                Publisher::new(
-                    format!("fan{}.duty", i + 1),
-                    format!("{label} duty"),
-                    "fan-duty",
-                )
-                .value(json!(pwm))
-                .unit("%")
-                .range(0.0, 100.0),
-            );
-            if let Some(r) = rpm {
-                publishers.push(
-                    Publisher::new(
-                        format!("fan{}.rpm", i + 1),
-                        format!("{label} RPM"),
-                        "fan-rpm",
-                    )
-                    .value(json!(r))
-                    .unit("rpm"),
+        for (i, f) in now_faulted.iter().enumerate() {
+            if *f {
+                tracing::warn!(
+                    fan = i + 1,
+                    commanded = commanded[i],
+                    "FAN FAULT: commanded above threshold but reads ~0 RPM (stalled/failed fan)"
                 );
             }
-            if now_faulted[i] {
-                tracing::warn!(fan = %label, commanded = commanded[i], rpm = ?rpm,
-                    "FAN FAULT: commanded above threshold but reads ~0 RPM (stalled/failed fan)");
-            }
-            let mut sink = Sink::new(format!("fan{}", i + 1), label, "fan-duty")
-                .range(0.0, 100.0)
-                .unit("%")
-                .value(json!(commanded[i]))
-                .readback(format!("fan{}.duty", i + 1))
-                .safe(json!("auto"))
-                .needs_claim(true)
-                .state(SinkState::Claimed)
-                .direction("up=more-cooling")
-                .driven_by(drivers.clone());
-            if now_faulted[i] {
-                sink.extra.insert("fault".to_string(), json!(true));
-            }
-            sinks.push(sink);
         }
-        Applied::ok(vec![Component::new("board", "ROME2D16-2T", "board")
-            .with_publishers(publishers)
-            .with_sinks(sinks)])
+        let drivers = driven_by_for_board(gpu_max, nvme_max, cpu_max);
+        let (mut fc, mut fs) = fan_components(
+            &fan_rpms,
+            duty_readback.as_deref(),
+            Some(&commanded),
+            SinkState::Claimed,
+            &drivers,
+            &now_faulted,
+        );
+        components.append(&mut fc);
+        signals.append(&mut fs);
+        Report::ok(vec![board_unit()], components, signals)
     }
 
     fn restore(&mut self) {
         if !self.restore_armed {
             return;
         }
-        // Open a FRESH handle (independent of the main one, which may be wedged) and release; disarm
-        // ONLY on success so a failed release is retried by `Drop`. [R8]
         let result = (|| -> anyhow::Result<()> { Board::open()?.release_auto() })();
         match &result {
             Ok(()) => tracing::info!("released BMC auto control"),
@@ -342,8 +273,6 @@ impl Device for Rome2dFansDevice {
 }
 
 impl Rome2dFansDevice {
-    /// Reset both zone dampers when we abandon a zone-mode tick (release path), mirroring the SDK's
-    /// `ctrl.reset()` on a non-Ok tick so the per-zone EMA/deadband re-seed cleanly on recovery.
     fn reset_zone_dampers(&mut self) {
         if let Some(z) = self.zones.as_mut() {
             z.cpu.reset();
@@ -362,8 +291,88 @@ impl Drop for Rome2dFansDevice {
     }
 }
 
-/// What the apply tick decided, carried to the components stage: the 8 commanded duties plus the
-/// `driving` record (uniform: one curve; zone: the two zones' raw/smoothed temps).
+fn board_unit() -> Unit {
+    Unit::new(BOARD_ID)
+        .name("board")
+        .description(BOARD_DESC)
+        .typed("board")
+}
+
+/// Build the `cpu` component + its k10temp producer signals (the sensors driving the CPU fans).
+fn cpu_components(cpu_temps: &[(String, i32)]) -> (Vec<Component>, Vec<Signal>) {
+    if cpu_temps.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let cid = format!("{BOARD_ID}:cpu");
+    let components = vec![Component::new(&cid, BOARD_ID).name("cpu").typed("cpu")];
+    let signals = cpu_temps
+        .iter()
+        .map(|(label, t)| {
+            Signal::producer(format!("{cid}:{}", slug(label)), &cid, "temperature")
+                .value(json!(t))
+                .uom("C")
+                .name(label.clone())
+        })
+        .collect();
+    (components, signals)
+}
+
+/// Build the `fan1..fan8` components: an `rpm` producer (when readable) + a `duty` sink. `commanded`
+/// is the per-fan duty when this process drove the fans (else the firmware-readback duty is used).
+fn fan_components(
+    fan_rpms: &[(String, Option<i32>)],
+    duty_readback: Option<&[u8]>,
+    commanded: Option<&[u32; 8]>,
+    state: SinkState,
+    drivers: &[Provenance],
+    faulted: &[bool; 8],
+) -> (Vec<Component>, Vec<Signal>) {
+    let mut components = Vec::new();
+    let mut signals = Vec::new();
+    for (i, (_label, rpm)) in fan_rpms.iter().enumerate() {
+        let n = i + 1;
+        let fc = format!("{BOARD_ID}:fan{n}");
+        components.push(
+            Component::new(&fc, BOARD_ID)
+                .name(format!("fan{n}"))
+                .typed("fan"),
+        );
+        if let Some(r) = rpm {
+            signals.push(
+                Signal::producer(format!("{fc}:rpm"), &fc, "fan-rpm")
+                    .value(json!(r))
+                    .uom("rpm")
+                    .name("rpm"),
+            );
+        }
+        // Sink value: the commanded duty if we drove it, else the firmware readback.
+        let value = commanded
+            .map(|c| c[i] as i64)
+            .or_else(|| duty_readback.and_then(|d| d.get(i)).map(|&b| b as i64));
+        let mut sink = Signal::sink(format!("{fc}:duty"), &fc, "fan-duty")
+            .uom("%")
+            .range(0.0, 100.0)
+            .name("duty");
+        if let Some(v) = value {
+            sink = sink.value(json!(v));
+        }
+        if faulted[i] {
+            sink = sink.label("fault", "true");
+        }
+        sink = sink.control(Control {
+            needs_claim: true,
+            state,
+            safe: Some(json!("auto")),
+            direction: Some("up=more-cooling".into()),
+            readback: Some(format!("{fc}:rpm")),
+            driven_by: drivers.to_vec(),
+        });
+        signals.push(sink);
+    }
+    (components, signals)
+}
+
+/// What the apply tick decided, carried to the report stage.
 enum ApplyOutcome {
     Uniform {
         commanded: [u32; 8],
@@ -411,27 +420,53 @@ impl ApplyOutcome {
             }
         }
     }
-    /// Publishers describing this tick's control decision (mode-specific fields).
-    fn driving_publishers(&self) -> Vec<Publisher> {
-        match self {
+    /// The `control` component + its driving-decision producer signals (mode-specific fields).
+    fn control_component(&self) -> (Vec<Component>, Vec<Signal>) {
+        let cc = format!("{BOARD_ID}:control");
+        let comp = Component::new(&cc, BOARD_ID)
+            .name("control")
+            .typed("control");
+        let p = |id: &str, kind: &str, name: &str, v: serde_json::Value, uom: Option<&str>| {
+            let mut s = Signal::producer(format!("{cc}:{id}"), &cc, kind)
+                .value(v)
+                .name(name);
+            if let Some(u) = uom {
+                s = s.uom(u);
+            }
+            s
+        };
+        let signals = match self {
             ApplyOutcome::Uniform {
                 raw, smoothed, pct, ..
             } => vec![
-                Publisher::new("driving.mode", "Driving mode", "driving-mode")
-                    .value(json!("uniform")),
-                Publisher::new("driving.temp", "Driving temperature", "driving-temperature")
-                    .value(json!(smoothed))
-                    .unit("C"),
-                Publisher::new(
+                p(
+                    "driving.mode",
+                    "driving-mode",
+                    "driving mode",
+                    json!("uniform"),
+                    None,
+                ),
+                p(
+                    "driving.temp",
+                    "driving-temperature",
+                    "driving temperature",
+                    json!(smoothed),
+                    Some("C"),
+                ),
+                p(
                     "driving.raw",
-                    "Raw driving temperature",
                     "driving-raw-temperature",
-                )
-                .value(json!(raw))
-                .unit("C"),
-                Publisher::new("driving.duty", "Driving duty", "driving-duty")
-                    .value(json!(pct))
-                    .unit("%"),
+                    "raw driving temperature",
+                    json!(raw),
+                    Some("C"),
+                ),
+                p(
+                    "driving.duty",
+                    "driving-duty",
+                    "driving duty",
+                    json!(pct),
+                    Some("%"),
+                ),
             ],
             ApplyOutcome::Zone {
                 cpu_raw,
@@ -440,57 +475,70 @@ impl ApplyOutcome {
                 case_smoothed,
                 commanded,
             } => vec![
-                Publisher::new("driving.mode", "Driving mode", "driving-mode").value(json!("zone")),
-                Publisher::new(
+                p(
+                    "driving.mode",
+                    "driving-mode",
+                    "driving mode",
+                    json!("zone"),
+                    None,
+                ),
+                p(
                     "driving.cpu.raw",
-                    "CPU raw driving temperature",
                     "driving-raw-temperature",
-                )
-                .value(json!(cpu_raw))
-                .unit("C"),
-                Publisher::new(
+                    "cpu raw driving temperature",
+                    json!(cpu_raw),
+                    Some("C"),
+                ),
+                p(
                     "driving.cpu.temp",
-                    "CPU driving temperature",
                     "driving-temperature",
-                )
-                .value(json!(cpu_smoothed))
-                .unit("C"),
-                Publisher::new("driving.cpu.duty", "CPU driving duty", "driving-duty")
-                    .value(json!(commanded[0]))
-                    .unit("%"),
-                Publisher::new(
+                    "cpu driving temperature",
+                    json!(cpu_smoothed),
+                    Some("C"),
+                ),
+                p(
+                    "driving.cpu.duty",
+                    "driving-duty",
+                    "cpu driving duty",
+                    json!(commanded[0]),
+                    Some("%"),
+                ),
+                p(
                     "driving.case.raw",
-                    "Case raw driving temperature",
                     "driving-raw-temperature",
-                )
-                .value(json!(case_raw))
-                .unit("C"),
-                Publisher::new(
+                    "case raw driving temperature",
+                    json!(case_raw),
+                    Some("C"),
+                ),
+                p(
                     "driving.case.temp",
-                    "Case driving temperature",
                     "driving-temperature",
-                )
-                .value(json!(case_smoothed))
-                .unit("C"),
-                Publisher::new("driving.case.duty", "Case driving duty", "driving-duty")
-                    .value(json!(commanded[2]))
-                    .unit("%"),
+                    "case driving temperature",
+                    json!(case_smoothed),
+                    Some("C"),
+                ),
+                p(
+                    "driving.case.duty",
+                    "driving-duty",
+                    "case driving duty",
+                    json!(commanded[2]),
+                    Some("%"),
+                ),
             ],
-        }
+        };
+        (vec![comp], signals)
     }
 }
 
 /// Release the board to BMC auto and report it as an `error` apply (the safe fallback when we cannot
 /// determine a duty); used by both the no-temp and empty-curve paths.
-fn release_or_error(board: &mut Board, why: &str) -> Applied {
+fn release_or_error(board: &mut Board, why: &str) -> Report {
     match board.release_auto() {
-        Ok(()) => Applied::error(format!("{why} — released to BMC auto")),
-        Err(e) => Applied::error(format!("{why}; release failed: {e}")),
+        Ok(()) => Report::error(format!("{why} — released to BMC auto")),
+        Err(e) => Report::error(format!("{why}; release failed: {e}")),
     }
 }
 
-/// New `armed` state after a restore attempt: stays armed until a release SUCCEEDS, so a failed
-/// release is retried later by `Drop`. [R8]
 fn still_armed_after(released_ok: bool) -> bool {
     !released_ok
 }
@@ -518,111 +566,70 @@ fn query_mode() -> i32 {
     }
 }
 
-fn board_schema_component() -> Component {
-    let publishers = vec![
-        Publisher::new("cpu.temp", "CPU temperature", "temperature").unit("C"),
-        Publisher::new("driving.temp", "Driving temperature", "driving-temperature").unit("C"),
-        Publisher::new("driving.duty", "Driving duty", "driving-duty").unit("%"),
-    ];
-    let sinks = (1..=8)
-        .map(|i| {
-            Sink::new(format!("fan{i}"), format!("FAN{i}"), "fan-duty")
-                .range(0.0, 100.0)
-                .unit("%")
-                .safe(json!("auto"))
-                .needs_claim(true)
-                .direction("up=more-cooling")
-        })
-        .collect();
-    Component::new("board", "ROME2D16-2T", "board")
-        .with_publishers(publishers)
-        .with_sinks(sinks)
-}
-
-fn temp_publisher_id(label: &str) -> String {
-    format!(
-        "temp.{}",
-        label
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() {
+fn slug(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
                 c.to_ascii_lowercase()
             } else {
                 '_'
-            })
-            .collect::<String>()
-            .trim_matches('_')
-    )
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
 }
 
 fn driven_by_for_board(
     gpu_max: Option<i32>,
     nvme_max: Option<i32>,
     cpu_max: Option<i32>,
-) -> Vec<DrivenBy> {
+) -> Vec<Provenance> {
     let mut out = Vec::new();
     if let Some(v) = gpu_max {
-        out.push(
-            DrivenBy::new("nvidia")
-                .publisher("gpu/temp")
-                .value(json!(v))
-                .unit("C"),
-        );
+        out.push(Provenance::new("nvidia (max)").value(json!(v)).uom("C"));
     }
     if let Some(v) = nvme_max {
-        out.push(
-            DrivenBy::new("nvme")
-                .publisher("drive/temp")
-                .value(json!(v))
-                .unit("C"),
-        );
+        out.push(Provenance::new("nvme (max)").value(json!(v)).uom("C"));
     }
     if let Some(v) = cpu_max {
-        out.push(
-            DrivenBy::new("self")
-                .publisher("board/cpu.temp")
-                .value(json!(v))
-                .unit("C"),
-        );
+        out.push(Provenance::new("self:cpu (max)").value(json!(v)).uom("C"));
     }
     out
 }
 
-/// Extract every temperature publisher from ALL routed peer inputs, source-agnostic (used for the
-/// driving max, which must reflect every routed source). `inputs` are keyed `module:id`.
+/// Extract every temperature value from ALL routed peer inputs (source-agnostic; the driving max).
 fn input_temps(inputs: Option<&Inputs>) -> Vec<i32> {
     let mut v = Vec::new();
     if let Some(inputs) = inputs {
-        for components in inputs.values() {
-            push_temps(components, &mut v);
+        for signals in inputs.values() {
+            push_temps(signals, &mut v);
         }
     }
     v
 }
 
-/// Extract temperature publishers only from inputs whose SOURCE MODULE is `src` (keys are
-/// `module:id`; module names cannot contain `:` — enforced by the registry — so the `module:`
-/// prefix is unambiguous). Used to label GPU vs NVMe distinctly in the components.
+/// Extract temperature values only from inputs whose SOURCE MODULE is `src` (keys are `module:id`).
 fn input_temps_from(inputs: Option<&Inputs>, src: &str) -> Vec<i32> {
     let mut v = Vec::new();
     if let Some(inputs) = inputs {
         let prefix = format!("{src}:");
-        for (key, components) in inputs {
+        for (key, signals) in inputs {
             if key.starts_with(&prefix) {
-                push_temps(components, &mut v);
+                push_temps(signals, &mut v);
             }
         }
     }
     v
 }
 
-/// Append the value of every `temperature` publisher to `out`.
-fn push_temps(components: &[Component], out: &mut Vec<i32>) {
-    for c in components {
-        for p in &c.publishers {
-            if p.kind == "temperature" {
-                if let Some(t) = p.value_i64() {
-                    out.push(t as i32);
-                }
+/// Append the value of every `temperature` producer signal to `out`.
+fn push_temps(signals: &[Signal], out: &mut Vec<i32>) {
+    for s in signals {
+        if s.kind() == Some("temperature") {
+            if let Some(t) = s.value_i64() {
+                out.push(t as i32);
             }
         }
     }
@@ -632,57 +639,27 @@ fn push_temps(components: &[Component], out: &mut Vec<i32>) {
 mod tests {
     use super::*;
 
-    fn temp_component(label: &str, temp: i64, class: &str) -> Component {
-        Component::new(label.to_ascii_lowercase(), label, class).with_publishers(vec![
-            Publisher::new("temp", "Temperature", "temperature")
-                .value(json!(temp))
-                .unit("C"),
-        ])
-    }
-
-    fn fan_component(label: &str, duty: i64) -> Component {
-        Component::new(label, label, "fan").with_publishers(vec![Publisher::new(
-            "duty", "Duty", "fan-duty",
+    fn temp_signal(unit_kind: &str, value: i64) -> Signal {
+        Signal::producer(
+            format!("{unit_kind}:c:temp"),
+            format!("{unit_kind}:c"),
+            "temperature",
         )
-        .value(json!(duty))
-        .unit("%")])
-    }
-
-    fn pub_value<'a>(publishers: &'a [Publisher], id: &str) -> &'a serde_json::Value {
-        publishers
-            .iter()
-            .find(|p| p.id == id)
-            .and_then(|p| p.value.as_ref())
-            .unwrap_or_else(|| panic!("missing publisher {id}"))
-    }
-
-    fn pub_i64(publishers: &[Publisher], id: &str) -> Option<i64> {
-        publishers
-            .iter()
-            .find(|p| p.id == id)
-            .and_then(Publisher::value_i64)
+        .value(json!(value))
+        .uom("C")
     }
 
     #[test]
     fn fan_restore_stays_armed_until_release_succeeds() {
-        assert!(
-            still_armed_after(false),
-            "a failed release must stay armed for a Drop retry"
-        );
-        assert!(!still_armed_after(true), "a successful release must disarm");
+        assert!(still_armed_after(false));
+        assert!(!still_armed_after(true));
     }
 
     #[test]
     fn input_temps_extracts_all_temps_source_agnostic() {
         let mut inputs: Inputs = HashMap::new();
-        inputs.insert(
-            "nvidia:GPU-1".into(),
-            vec![temp_component("GPU", 63, "gpu"), fan_component("fan0", 70)],
-        );
-        inputs.insert(
-            "nvme:SER-A".into(),
-            vec![temp_component("Composite", 44, "ssd")],
-        );
+        inputs.insert("nvidia:GPU-1".into(), vec![temp_signal("gpu", 63)]);
+        inputs.insert("nvme:SER-A".into(), vec![temp_signal("ssd", 44)]);
         let mut temps = input_temps(Some(&inputs));
         temps.sort();
         assert_eq!(temps, vec![44, 63], "driving max sees every routed source");
@@ -691,78 +668,74 @@ mod tests {
     #[test]
     fn input_temps_from_partitions_by_source_module() {
         let mut inputs: Inputs = HashMap::new();
-        inputs.insert(
-            "nvidia:GPU-1".into(),
-            vec![temp_component("GPU", 63, "gpu")],
-        );
-        inputs.insert(
-            "nvidia:GPU-2".into(),
-            vec![temp_component("GPU", 71, "gpu")],
-        );
+        inputs.insert("nvidia:GPU-1".into(), vec![temp_signal("gpu", 63)]);
+        inputs.insert("nvidia:GPU-2".into(), vec![temp_signal("gpu", 71)]);
         inputs.insert(
             "nvme:SER-A".into(),
-            vec![
-                temp_component("Composite", 40, "ssd"),
-                temp_component("Sensor 2", 44, "ssd"),
-            ],
+            vec![temp_signal("ssd", 40), temp_signal("ssd", 44)],
         );
 
         let mut gpu = input_temps_from(Some(&inputs), "nvidia");
         gpu.sort();
         assert_eq!(gpu, vec![63, 71]);
-
         let mut nv = input_temps_from(Some(&inputs), "nvme");
         nv.sort();
         assert_eq!(nv, vec![40, 44]);
-
         // A short source name must not match a longer module (the `:` guards it); unknown -> empty.
         assert!(input_temps_from(Some(&inputs), "nv").is_empty());
         assert!(input_temps_from(Some(&inputs), "other").is_empty());
-
-        // No routed inputs at all -> empty, never a panic (both helpers).
         assert!(input_temps_from(None, "nvidia").is_empty());
         assert!(input_temps(None).is_empty());
     }
 
     #[test]
-    fn uniform_outcome_reports_one_curve_decision() {
+    fn uniform_control_component_reports_one_curve_decision() {
         let o = ApplyOutcome::uniform([60; 8], 70, 68, 60);
         assert_eq!(o.commanded(), [60; 8]);
-        let pubs = o.driving_publishers();
-        assert_eq!(pub_value(&pubs, "driving.mode"), "uniform");
-        assert_eq!(pub_i64(&pubs, "driving.duty"), Some(60));
-        assert_eq!(pub_i64(&pubs, "driving.raw"), Some(70));
+        let (_c, s) = o.control_component();
+        let val = |id: &str| {
+            s.iter()
+                .find(|x| x.id.ends_with(id))
+                .and_then(|x| x.value.clone())
+        };
+        assert_eq!(val("driving.mode"), Some(json!("uniform")));
+        assert_eq!(val("driving.duty"), Some(json!(60)));
+        assert_eq!(val("driving.raw"), Some(json!(70)));
     }
 
     #[test]
-    fn zone_outcome_reports_both_zones_from_commanded() {
-        // FAN1/2 = cpu duty (30), FAN3-8 = case duty (75); the driving record reads them back from
-        // the commanded array so a fault boost would be visible there too.
+    fn zone_control_component_reports_both_zones() {
         let commanded = zones::per_fan_duties(30, 75);
         let o = ApplyOutcome::zone(commanded, 55, 72, 54, 70);
         assert_eq!(o.commanded(), [30, 30, 75, 75, 75, 75, 75, 75]);
-        let pubs = o.driving_publishers();
-        assert_eq!(pub_value(&pubs, "driving.mode"), "zone");
-        assert_eq!(pub_i64(&pubs, "driving.cpu.duty"), Some(30));
-        assert_eq!(pub_i64(&pubs, "driving.case.duty"), Some(75));
-        assert_eq!(pub_i64(&pubs, "driving.cpu.raw"), Some(55));
-        assert_eq!(pub_i64(&pubs, "driving.case.raw"), Some(72));
+        let (_c, s) = o.control_component();
+        let val = |id: &str| {
+            s.iter()
+                .find(|x| x.id.ends_with(id))
+                .and_then(|x| x.value.clone())
+        };
+        assert_eq!(val("driving.mode"), Some(json!("zone")));
+        assert_eq!(val("driving.cpu.duty"), Some(json!(30)));
+        assert_eq!(val("driving.case.duty"), Some(json!(75)));
     }
 
     #[test]
-    fn zone_outcome_driving_reflects_a_case_fan_boost() {
-        // A confirmed case-fan fault boosts the surviving case fans to 100; the driving record's
-        // case_pct (read from commanded[2]) follows.
+    fn zone_control_reflects_a_case_fan_boost() {
         let base = zones::per_fan_duties(30, 60);
         let mut confirmed = [false; 8];
-        confirmed[4] = true; // a case fan down -> siblings (incl. FAN3=idx2) boosted
+        confirmed[4] = true;
         let commanded = fault::compensate(base, &confirmed);
         let o = ApplyOutcome::zone(commanded, 50, 65, 50, 64);
-        let pubs = o.driving_publishers();
-        assert_eq!(pub_i64(&pubs, "driving.case.duty"), Some(100));
+        let (_c, s) = o.control_component();
+        let val = |id: &str| {
+            s.iter()
+                .find(|x| x.id.ends_with(id))
+                .and_then(|x| x.value.clone())
+        };
+        assert_eq!(val("driving.case.duty"), Some(json!(100)));
         assert_eq!(
-            pub_i64(&pubs, "driving.cpu.duty"),
-            Some(30),
+            val("driving.cpu.duty"),
+            Some(json!(30)),
             "CPU zone unaffected"
         );
     }

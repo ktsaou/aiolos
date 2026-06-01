@@ -1,18 +1,36 @@
-//! aiolos ↔ anemos wire protocol types.
+//! aiolos ↔ anemos wire protocol types (v2: label-driven signal model).
 //!
 //! One line = one complete JSON object. Requests flow aiolos → module (the module's stdin);
 //! responses flow module → aiolos (the module's stdout). stdout is protocol-only; all logs go
 //! to stderr. Authoritative contract: `.agents/sow/specs/aiolos-protocol.spec.md`.
+//!
+//! # The data model (SOW-0018)
+//! A module reports a flat stream of **signals**; the orchestrator assembles **units → components →
+//! producers/sinks** from labels, user config enriches, and the UI groups by any label.
+//!
+//! - **`Unit`** — a piece of HARDWARE (a GPU, an SSD, the motherboard, a UPS), NOT an anemos. One
+//!   physical unit reported by several anemoi merges on its `id`.
+//! - **`Component`** — a sub-thing within a unit (a fan, a temperature, a CPU socket, a DIMM).
+//! - **`Signal`** — the atom: a **producer** (read-only measurement) or a **sink** (controllable
+//!   output). Carries a stable `id`, a value domain (`value`/`uom`/`range`), a `labels` bag, and —
+//!   for sinks — typed `control` metadata.
+//!
+//! Every entity has a stable, system-derived `id` (the time-series key; never shown) and a `labels`
+//! bag whose reserved keys are `type` (semantic kind), `name` (short user handle), and `description`
+//! (long). `unit`/`component` are structural parent references; `uom` is the unit of MEASURE
+//! (distinct from the `unit` entity).
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap};
 
-// Wire types only. The module-side SDK (signal-aware stdin, curve, EMA, the run() driver and the
-// Anemos/Device traits) lives in the `anemos` crate; the orchestrator depends only on these types.
+/// Current wire protocol version (the `proto` field of `hello`). v2 = the label-driven signal model.
+pub const PROTO_VERSION: u32 = 2;
 
-/// Current wire protocol version (the `proto` field of `hello`).
-pub const PROTO_VERSION: u32 = 1;
+/// An open bag of string labels. Reserved keys understood across the system: `type` (semantic kind,
+/// an open tag aiolos matches but never interprets), `name` (short unique-ish user handle, e.g.
+/// `gpu0`), `description` (long, non-unique). Ordered so serialization is stable.
+pub type Labels = BTreeMap<String, String>;
 
 // ---------------------------------------------------------------------------
 // Requests: aiolos → module
@@ -22,101 +40,251 @@ pub const PROTO_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub enum Request {
-    /// Sent to a `detect` process; expects a `Found` response.
+    /// Sent to a `detect` process; expects a `Report` (schema only — signals carry no `value`).
     Detect,
-    /// Sent to a `run <id>` process each heartbeat; expects an `Applied` response.
+    /// Sent to a `run <id>` process each heartbeat; expects a `Report` (with live signal values).
     /// `inputs` is present only when the registry wires `input=<peer>`; omitted otherwise.
     Apply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inputs: Option<Inputs>,
     },
-    /// Graceful stop; the module restores its device and replies `{"status":"ok"}`.
+    /// Graceful stop; the module restores its devices and replies `{"status":"ok"}`.
     Shutdown,
 }
 
-/// Component reports relayed from source modules' instances, keyed by `module:id` (the source module
-/// name and the peer instance id), so a consumer wired to multiple `input=` sources can attribute each
-/// publisher to its source module and keys never collide across sources.
-///
-/// Each peer instance reports a *list* of components; aiolos relays the whole list verbatim and
-/// uninterpreted (it never picks "the temperature" — the consumer decides, optionally filtering by
-/// the `module:` key prefix and publisher `kind`). Mirrors the protocol spec's normative text.
-pub type Inputs = HashMap<String, Vec<Component>>;
+/// Routed signals relayed from wired source instances, keyed by the source `module:id` so a consumer
+/// wired to several `input=` peers can attribute each signal to its source and keys never collide.
+/// aiolos relays them verbatim and uninterpreted — the consumer selects what it needs (typically
+/// producers with `labels.type == "temperature"`, optionally filtered by the `module:` key prefix).
+pub type Inputs = HashMap<String, Vec<Signal>>;
+
+impl Request {
+    /// Serialize to a single JSON line (no trailing newline — the caller adds `\n`).
+    pub fn to_line(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+    pub fn from_line(line: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(line)
+    }
+}
 
 // ---------------------------------------------------------------------------
-// Component reports
+// Entities: unit → component → signal
 // ---------------------------------------------------------------------------
 
-/// One device/entity reported by an anemos. This is the stable SOW-0014-ready schema:
-/// publishers are measurements/readbacks; sinks are outputs this component can drive.
+/// A piece of hardware. Assembled by the orchestrator across all anemoi by `id`: the same physical
+/// unit reported by several anemoi (e.g. the motherboard's temps and fans) merges into one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Unit {
+    /// Stable, system-derived identity (never shown to users).
+    pub id: String,
+    /// Reserved keys: `type` (e.g. `gpu`/`board`/`ssd`/`ups`), `name`, `description`; plus arbitrary.
+    #[serde(default, skip_serializing_if = "Labels::is_empty")]
+    pub labels: Labels,
+}
+
+impl Unit {
+    pub fn new(id: impl Into<String>) -> Self {
+        Unit {
+            id: id.into(),
+            labels: Labels::new(),
+        }
+    }
+    /// Set a label (chainable).
+    pub fn label(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), val.into());
+        self
+    }
+    /// Reserved-label convenience: `name`, `description`, `type`.
+    pub fn name(self, v: impl Into<String>) -> Self {
+        self.label("name", v)
+    }
+    pub fn description(self, v: impl Into<String>) -> Self {
+        self.label("description", v)
+    }
+    pub fn typed(self, v: impl Into<String>) -> Self {
+        self.label("type", v)
+    }
+}
+
+/// A sub-thing within a unit (a fan, a temperature sensor group, a CPU socket, a DIMM).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Component {
+    /// Stable identity (never shown). Conventionally namespaced by its unit.
     pub id: String,
-    pub label: String,
-    #[serde(rename = "class")]
-    pub class: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub publishers: Vec<Publisher>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sinks: Vec<Sink>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub icon: Option<String>,
-    /// Extra descriptive fields for forward compatibility. Empty by default.
-    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
-    pub extra: Map<String, Value>,
+    /// Parent unit id (structural).
+    pub unit: String,
+    /// Reserved keys: `type` (e.g. `fan`/`temperature`/`cpu`/`dimm`), `name`, `description`; plus arbitrary.
+    #[serde(default, skip_serializing_if = "Labels::is_empty")]
+    pub labels: Labels,
 }
 
 impl Component {
-    pub fn new(id: impl Into<String>, label: impl Into<String>, class: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>, unit: impl Into<String>) -> Self {
         Component {
             id: id.into(),
-            label: label.into(),
-            class: class.into(),
-            publishers: Vec::new(),
-            sinks: Vec::new(),
-            icon: None,
-            extra: Map::new(),
+            unit: unit.into(),
+            labels: Labels::new(),
         }
     }
-
-    pub fn with_publishers(mut self, publishers: Vec<Publisher>) -> Self {
-        self.publishers = publishers;
+    pub fn label(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), val.into());
         self
     }
-
-    pub fn with_sinks(mut self, sinks: Vec<Sink>) -> Self {
-        self.sinks = sinks;
-        self
+    pub fn name(self, v: impl Into<String>) -> Self {
+        self.label("name", v)
+    }
+    pub fn description(self, v: impl Into<String>) -> Self {
+        self.label("description", v)
+    }
+    pub fn typed(self, v: impl Into<String>) -> Self {
+        self.label("type", v)
     }
 }
 
-/// One normalised scalar stream published by a component. `value` is omitted in schema-only detect
-/// output and present in live `apply` reports/status surfaces.
+/// Whether a signal is a read-only measurement or a controllable output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Producer,
+    Sink,
+}
+
+/// Control ownership state of a sink, as the module observes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SinkState {
+    /// Firmware/auto owns it (not claimed by aiolos).
+    #[default]
+    Released,
+    /// aiolos owns it (manual control asserted).
+    Claimed,
+    /// Claimed, but the readback disagrees with the command (something else moved it).
+    Diverged,
+    /// State could not be determined this tick.
+    Unknown,
+}
+
+/// One driver of a sink: which producer signal contributed, and its value (for "what drives what").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Publisher {
-    pub id: String,
-    pub label: String,
-    pub kind: String,
+pub struct Provenance {
+    /// The source producer signal's stable `id`.
+    pub signal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range: Option<[f64; 2]>,
-    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
-    pub extra: Map<String, Value>,
+    pub uom: Option<String>,
 }
 
-impl Publisher {
-    pub fn new(id: impl Into<String>, label: impl Into<String>, kind: impl Into<String>) -> Self {
-        Publisher {
-            id: id.into(),
-            label: label.into(),
-            kind: kind.into(),
+impl Provenance {
+    pub fn new(signal: impl Into<String>) -> Self {
+        Provenance {
+            signal: signal.into(),
             value: None,
-            unit: None,
+            uom: None,
+        }
+    }
+    pub fn value(mut self, value: impl Into<Value>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+    pub fn uom(mut self, uom: impl Into<String>) -> Self {
+        self.uom = Some(uom.into());
+        self
+    }
+}
+
+/// Sink-only control metadata (typed, not labels — the control engine depends on these).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Control {
+    /// True if the sink must be claimed (manual control asserted) before it can be set.
+    #[serde(default)]
+    pub needs_claim: bool,
+    /// Current ownership state.
+    #[serde(default)]
+    pub state: SinkState,
+    /// The value to drive on fail-safe (e.g. `"auto"`/`"default"`/`100`) — the safe direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe: Option<Value>,
+    /// Free-form semantics of the axis (e.g. `up=more-cooling`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// The id of the producer signal that reads back this sink's actual value (for verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback: Option<String>,
+    /// What drove the current value (provenance / "what drives what").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub driven_by: Vec<Provenance>,
+}
+
+/// The atom: a producer (read-only) or sink (controllable) within a component.
+///
+/// `value` is omitted in schema-only `detect` output and present in live reports. Reserved labels:
+/// `type` (the semantic kind / open tag), `name`, `description`. `uom` is the unit of MEASURE.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Signal {
+    /// Stable, system-derived identity — the time-series key (never shown).
+    pub id: String,
+    /// Parent component id (structural).
+    pub component: String,
+    /// Producer (measurement) or sink (control).
+    pub role: Role,
+    /// Current value (absent in pure schema/detect; present in live reports).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    /// Unit of measure (e.g. `C`, `%`, `rpm`, `V`, `s`, `mW`). Distinct from the `unit` entity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uom: Option<String>,
+    /// Valid value domain `[min, max]` where meaningful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<[f64; 2]>,
+    /// Reserved keys `type`/`name`/`description`; plus arbitrary (vendor, zone, slot, …).
+    #[serde(default, skip_serializing_if = "Labels::is_empty")]
+    pub labels: Labels,
+    /// Sink-only control metadata; `None`/absent for producers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<Control>,
+}
+
+impl Signal {
+    /// A read-only measurement. `kind` is the semantic `type` label (e.g. `temperature`).
+    pub fn producer(
+        id: impl Into<String>,
+        component: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> Self {
+        let mut labels = Labels::new();
+        labels.insert("type".to_string(), kind.into());
+        Signal {
+            id: id.into(),
+            component: component.into(),
+            role: Role::Producer,
+            value: None,
+            uom: None,
             range: None,
-            extra: Map::new(),
+            labels,
+            control: None,
+        }
+    }
+
+    /// A controllable output. `kind` is the semantic `type` label (e.g. `fan-duty`). Starts with an
+    /// empty (default) `Control`; refine it with `.control(..)` or the `with_*` helpers.
+    pub fn sink(
+        id: impl Into<String>,
+        component: impl Into<String>,
+        kind: impl Into<String>,
+    ) -> Self {
+        let mut labels = Labels::new();
+        labels.insert("type".to_string(), kind.into());
+        Signal {
+            id: id.into(),
+            component: component.into(),
+            role: Role::Sink,
+            value: None,
+            uom: None,
+            range: None,
+            labels,
+            control: Some(Control::default()),
         }
     }
 
@@ -124,167 +292,41 @@ impl Publisher {
         self.value = Some(value.into());
         self
     }
-
-    pub fn unit(mut self, unit: impl Into<String>) -> Self {
-        self.unit = Some(unit.into());
+    pub fn uom(mut self, uom: impl Into<String>) -> Self {
+        self.uom = Some(uom.into());
         self
     }
-
     pub fn range(mut self, min: f64, max: f64) -> Self {
         self.range = Some([min, max]);
         self
     }
-
+    pub fn label(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), val.into());
+        self
+    }
+    pub fn name(self, v: impl Into<String>) -> Self {
+        self.label("name", v)
+    }
+    pub fn description(self, v: impl Into<String>) -> Self {
+        self.label("description", v)
+    }
+    /// Replace the sink's control metadata (no-op semantics on a producer, but allowed).
+    pub fn control(mut self, control: Control) -> Self {
+        self.control = Some(control);
+        self
+    }
+    /// The semantic `type` label, if set.
+    pub fn kind(&self) -> Option<&str> {
+        self.labels.get("type").map(String::as_str)
+    }
     /// Read `value` as i64 (handles ints and whole floats).
     pub fn value_i64(&self) -> Option<i64> {
         self.value
             .as_ref()
             .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)))
     }
-
     pub fn value_f64(&self) -> Option<f64> {
         self.value.as_ref().and_then(Value::as_f64)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SinkState {
-    #[default]
-    Released,
-    Claimed,
-    Diverged,
-    Unknown,
-}
-
-/// One output a component can drive. In SOW-0017 modules still compute/report `value` locally; SOW-0014
-/// reuses this detect/report schema and changes apply so aiolos commands sink targets.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Sink {
-    pub id: String,
-    pub label: String,
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub range: Option<[f64; 2]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub readback: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub safe: Option<Value>,
-    #[serde(default)]
-    pub needs_claim: bool,
-    #[serde(default)]
-    pub state: SinkState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub direction: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub driven_by: Vec<DrivenBy>,
-    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
-    pub extra: Map<String, Value>,
-}
-
-impl Sink {
-    pub fn new(id: impl Into<String>, label: impl Into<String>, kind: impl Into<String>) -> Self {
-        Sink {
-            id: id.into(),
-            label: label.into(),
-            kind: kind.into(),
-            range: None,
-            unit: None,
-            value: None,
-            readback: None,
-            safe: None,
-            needs_claim: false,
-            state: SinkState::Released,
-            direction: None,
-            driven_by: Vec::new(),
-            extra: Map::new(),
-        }
-    }
-
-    pub fn range(mut self, min: f64, max: f64) -> Self {
-        self.range = Some([min, max]);
-        self
-    }
-
-    pub fn unit(mut self, unit: impl Into<String>) -> Self {
-        self.unit = Some(unit.into());
-        self
-    }
-
-    pub fn value(mut self, value: impl Into<Value>) -> Self {
-        self.value = Some(value.into());
-        self
-    }
-
-    pub fn readback(mut self, publisher_id: impl Into<String>) -> Self {
-        self.readback = Some(publisher_id.into());
-        self
-    }
-
-    pub fn safe(mut self, safe: impl Into<Value>) -> Self {
-        self.safe = Some(safe.into());
-        self
-    }
-
-    pub fn needs_claim(mut self, needs_claim: bool) -> Self {
-        self.needs_claim = needs_claim;
-        self
-    }
-
-    pub fn state(mut self, state: SinkState) -> Self {
-        self.state = state;
-        self
-    }
-
-    pub fn direction(mut self, direction: impl Into<String>) -> Self {
-        self.direction = Some(direction.into());
-        self
-    }
-
-    pub fn driven_by(mut self, driven_by: Vec<DrivenBy>) -> Self {
-        self.driven_by = driven_by;
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DrivenBy {
-    pub from: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub publisher: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit: Option<String>,
-}
-
-impl DrivenBy {
-    pub fn new(from: impl Into<String>) -> Self {
-        DrivenBy {
-            from: from.into(),
-            publisher: None,
-            value: None,
-            unit: None,
-        }
-    }
-
-    pub fn publisher(mut self, publisher: impl Into<String>) -> Self {
-        self.publisher = Some(publisher.into());
-        self
-    }
-
-    pub fn value(mut self, value: impl Into<Value>) -> Self {
-        self.value = Some(value.into());
-        self
-    }
-
-    pub fn unit(mut self, unit: impl Into<String>) -> Self {
-        self.unit = Some(unit.into());
-        self
     }
 }
 
@@ -292,13 +334,12 @@ impl DrivenBy {
 // Responses: module → aiolos
 // ---------------------------------------------------------------------------
 
-/// Outcome a module declares on every `detect`/`apply` (and the supervisor reacts to EXPLICITLY —
-/// it never infers faults from empty data, exits, or silence):
-/// - `ok`     — the module did its job; `found`/`components` are authoritative (empty is real). An
+/// Outcome a module declares on every `detect`/report (the supervisor reacts EXPLICITLY — never
+/// inferring faults from empty data, exit, or silence):
+/// - `ok`     — did the job; `units`/`components`/`signals` authoritative (empty is real). An
 ///   accompanying `error` is a non-fatal warning ("done, with errors").
-/// - `error`  — transient: it could NOT do its job this time (NOT "no devices"). Keep going, retry.
-/// - `fatal`  — it cannot work on this host (wrong hw, missing capability). Retried only on a long
-///   backoff; surfaced/alerted. Never inferred — the module says so.
+/// - `error`  — transient: could NOT do the job this time (NOT "no devices"). Keep instances, retry.
+/// - `fatal`  — cannot work on this host. Long-backoff retry; surfaced. Never inferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -315,6 +356,84 @@ impl Status {
             Status::Error => "error",
             Status::Fatal => "fatal",
         }
+    }
+}
+
+/// The response to BOTH `detect` and `apply` — one shape. `detect` emits schema only (signals carry
+/// no `value`); a live report includes values. `units`/`components`/`signals` are meaningful only
+/// when `status == ok`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Report {
+    #[serde(default)]
+    pub status: Status,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<Unit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<Component>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<Signal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Report {
+    pub fn ok(units: Vec<Unit>, components: Vec<Component>, signals: Vec<Signal>) -> Self {
+        Report {
+            status: Status::Ok,
+            units,
+            components,
+            signals,
+            error: None,
+        }
+    }
+    /// `ok` with a non-fatal warning ("done, with errors").
+    pub fn ok_warn(
+        units: Vec<Unit>,
+        components: Vec<Component>,
+        signals: Vec<Signal>,
+        msg: impl Into<String>,
+    ) -> Self {
+        Report {
+            status: Status::Ok,
+            units,
+            components,
+            signals,
+            error: Some(msg.into()),
+        }
+    }
+    /// An `ok` report carrying no entities (e.g. a control tick that reports nothing new).
+    pub fn ok_empty() -> Self {
+        Report {
+            status: Status::Ok,
+            units: Vec::new(),
+            components: Vec::new(),
+            signals: Vec::new(),
+            error: None,
+        }
+    }
+    pub fn error(msg: impl Into<String>) -> Self {
+        Report {
+            status: Status::Error,
+            units: Vec::new(),
+            components: Vec::new(),
+            signals: Vec::new(),
+            error: Some(msg.into()),
+        }
+    }
+    pub fn fatal(msg: impl Into<String>) -> Self {
+        Report {
+            status: Status::Fatal,
+            units: Vec::new(),
+            components: Vec::new(),
+            signals: Vec::new(),
+            error: Some(msg.into()),
+        }
+    }
+    pub fn to_line(&self) -> serde_json::Result<String> {
+        serde_json::to_string(self)
+    }
+    pub fn from_line(line: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(line)
     }
 }
 
@@ -345,133 +464,6 @@ pub fn is_hello(line: &str) -> bool {
     serde_json::from_str::<Hello>(line).is_ok()
 }
 
-/// Response to `detect`. `found` is meaningful only when `status == ok`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Detected {
-    #[serde(default)]
-    pub status: Status,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub found: Vec<FoundEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl Detected {
-    pub fn ok(found: Vec<FoundEntry>) -> Self {
-        Detected {
-            status: Status::Ok,
-            found,
-            error: None,
-        }
-    }
-    /// `ok` with a non-fatal warning ("done, with errors").
-    pub fn ok_warn(found: Vec<FoundEntry>, msg: impl Into<String>) -> Self {
-        Detected {
-            status: Status::Ok,
-            found,
-            error: Some(msg.into()),
-        }
-    }
-    pub fn error(msg: impl Into<String>) -> Self {
-        Detected {
-            status: Status::Error,
-            found: Vec::new(),
-            error: Some(msg.into()),
-        }
-    }
-    pub fn fatal(msg: impl Into<String>) -> Self {
-        Detected {
-            status: Status::Fatal,
-            found: Vec::new(),
-            error: Some(msg.into()),
-        }
-    }
-    pub fn to_line(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
-    }
-    pub fn from_line(line: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(line)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FoundEntry {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub components: Vec<Component>,
-    /// Extra descriptive fields (surfaced on the status page). Empty by default.
-    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
-    pub extra: Map<String, Value>,
-}
-
-/// Response to `apply` (and `shutdown`). `components` is meaningful only when `status == ok`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Applied {
-    pub status: Status,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub components: Option<Vec<Component>>,
-}
-
-impl Applied {
-    pub fn ok(components: Vec<Component>) -> Self {
-        Applied {
-            status: Status::Ok,
-            error: None,
-            components: Some(components),
-        }
-    }
-
-    pub fn ok_empty() -> Self {
-        Applied {
-            status: Status::Ok,
-            error: None,
-            components: None,
-        }
-    }
-
-    pub fn error(msg: impl Into<String>) -> Self {
-        Applied {
-            status: Status::Error,
-            error: Some(msg.into()),
-            components: None,
-        }
-    }
-
-    pub fn fatal(msg: impl Into<String>) -> Self {
-        Applied {
-            status: Status::Fatal,
-            error: Some(msg.into()),
-            components: None,
-        }
-    }
-
-    pub fn to_line(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
-    }
-    pub fn from_line(line: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(line)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Line (de)serialization
-// ---------------------------------------------------------------------------
-
-impl Request {
-    /// Serialize to a single JSON line (no trailing newline — the caller adds `\n`).
-    pub fn to_line(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
-    }
-    pub fn from_line(line: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(line)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,16 +483,15 @@ mod tests {
 
     #[test]
     fn apply_without_inputs_omits_field() {
-        // Absent inputs MUST NOT serialize as "inputs":null (spec: absent or {}).
         let req = Request::Apply { inputs: None };
         assert_eq!(req.to_line().unwrap(), r#"{"cmd":"apply"}"#);
-        // And it parses back identically.
         assert_eq!(Request::from_line(r#"{"cmd":"apply"}"#).unwrap(), req);
     }
 
     #[test]
     fn apply_with_inputs_round_trip() {
-        let line = r#"{"cmd":"apply","inputs":{"gpu0":[{"id":"gpu0","label":"GPU 0","class":"gpu","publishers":[{"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"}]}]}}"#;
+        // A routed producer signal, keyed by the source module:id.
+        let line = r#"{"cmd":"apply","inputs":{"nvidia:GPU-1":[{"id":"nvidia:GPU-1:temperature:temp","component":"nvidia:GPU-1:temperature","role":"producer","value":63,"uom":"C","labels":{"type":"temperature"}}]}}"#;
         let req = Request::from_line(line).unwrap();
         let Request::Apply {
             inputs: Some(inputs),
@@ -508,59 +499,121 @@ mod tests {
         else {
             panic!("expected Apply with inputs");
         };
-        let gpu0 = inputs.get("gpu0").unwrap();
-        assert_eq!(gpu0[0].publishers[0].value_i64(), Some(63));
+        let gpu = inputs.get("nvidia:GPU-1").unwrap();
+        assert_eq!(gpu[0].value_i64(), Some(63));
+        assert_eq!(gpu[0].kind(), Some("temperature"));
         assert_eq!(req.to_line().unwrap(), line);
     }
 
     #[test]
-    fn detect_ok_round_trip() {
-        let line = r#"{"status":"ok","found":[{"id":"GPU-uuid-1234","type":"GPU","name":"NVIDIA RTX 6000"}]}"#;
-        let d = Detected::from_line(line).unwrap();
-        assert_eq!(d.status, Status::Ok);
-        assert_eq!(d.found.len(), 1);
-        assert_eq!(d.to_line().unwrap(), line);
+    fn detect_report_is_schema_only() {
+        // detect: signals carry no value; labels present.
+        let report = Report::ok(
+            vec![Unit::new("nvml:GPU-1")
+                .name("gpu0")
+                .description("NVIDIA RTX PRO 6000")
+                .typed("gpu")],
+            vec![Component::new("nvml:GPU-1:fan0", "nvml:GPU-1")
+                .name("fan0")
+                .typed("fan")],
+            vec![
+                Signal::producer("nvml:GPU-1:fan0:rpm", "nvml:GPU-1:fan0", "fan-rpm").uom("rpm"),
+                Signal::sink("nvml:GPU-1:fan0:duty", "nvml:GPU-1:fan0", "fan-duty")
+                    .uom("%")
+                    .range(0.0, 100.0),
+            ],
+        );
+        let line = report.to_line().unwrap();
+        assert!(
+            !line.contains("\"value\""),
+            "detect must omit values: {line}"
+        );
+        let back = Report::from_line(&line).unwrap();
+        assert_eq!(back, report);
+        // labels survive; type readable.
+        assert_eq!(back.units[0].labels.get("name").unwrap(), "gpu0");
+        assert_eq!(back.signals[1].kind(), Some("fan-duty"));
     }
 
     #[test]
-    fn detect_status_defaults_ok_for_legacy_found() {
-        // A bare `{"found":[...]}` (no status) is accepted as ok (back-compat / lenient).
-        let d = Detected::from_line(r#"{"found":[]}"#).unwrap();
-        assert_eq!(d.status, Status::Ok);
-        assert!(d.found.is_empty());
+    fn live_report_round_trip_with_sink_control() {
+        let sink = Signal::sink("nvml:GPU-1:fan0:duty", "nvml:GPU-1:fan0", "fan-duty")
+            .value(json!(32))
+            .uom("%")
+            .range(0.0, 100.0)
+            .name("duty")
+            .control(Control {
+                needs_claim: true,
+                state: SinkState::Claimed,
+                safe: Some(json!("auto")),
+                direction: Some("up=more-cooling".into()),
+                readback: Some("nvml:GPU-1:fan0:rpm".into()),
+                driven_by: vec![Provenance::new("nvml:GPU-1:temperature:temp")
+                    .value(json!(27))
+                    .uom("C")],
+            });
+        let report = Report::ok(
+            vec![Unit::new("nvml:GPU-1").name("gpu0")],
+            vec![Component::new("nvml:GPU-1:fan0", "nvml:GPU-1")
+                .name("fan0")
+                .typed("fan")],
+            vec![
+                Signal::producer("nvml:GPU-1:fan0:rpm", "nvml:GPU-1:fan0", "fan-rpm")
+                    .value(json!(1247))
+                    .uom("rpm"),
+                sink,
+            ],
+        );
+        let line = report.to_line().unwrap();
+        let back = Report::from_line(&line).unwrap();
+        assert_eq!(back, report);
+        let s = &back.signals[1];
+        assert_eq!(s.role, Role::Sink);
+        assert_eq!(s.value_i64(), Some(32));
+        let ctrl = s.control.as_ref().unwrap();
+        assert_eq!(ctrl.state, SinkState::Claimed);
+        assert!(ctrl.needs_claim);
+        assert_eq!(ctrl.driven_by[0].signal, "nvml:GPU-1:temperature:temp");
     }
 
     #[test]
-    fn detect_error_and_fatal() {
-        let e = Detected::error("NVML init failed");
+    fn producer_has_no_control_field_on_wire() {
+        let p = Signal::producer("u:c:temp", "u:c", "temperature")
+            .value(json!(40))
+            .uom("C");
+        let line = serde_json::to_string(&p).unwrap();
+        assert!(
+            !line.contains("control"),
+            "producer must omit control: {line}"
+        );
+        assert!(!line.contains("range"), "unset range omitted: {line}");
+    }
+
+    #[test]
+    fn report_status_defaults_ok_for_legacy() {
+        let r = Report::from_line(r#"{"signals":[]}"#).unwrap();
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.signals.is_empty());
+    }
+
+    #[test]
+    fn report_error_and_fatal() {
+        let e = Report::error("NVML init failed");
         assert_eq!(e.status, Status::Error);
         assert_eq!(
             e.to_line().unwrap(),
             r#"{"status":"error","error":"NVML init failed"}"#
         );
-        let f = Detected::fatal("no /dev/ipmi0");
+        let f = Report::fatal("no /dev/ipmi0");
         assert_eq!(f.status, Status::Fatal);
-        assert_eq!(Detected::from_line(&f.to_line().unwrap()).unwrap(), f);
-    }
-
-    #[test]
-    fn apply_ok_error_fatal_round_trip() {
-        for line in [
-            r#"{"status":"ok","components":[{"id":"gpu0","label":"GPU 0","class":"gpu","publishers":[{"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"}]}]}"#,
-            r#"{"status":"error","error":"gpu lost"}"#,
-            r#"{"status":"fatal","error":"device unsupported"}"#,
-        ] {
-            let a = Applied::from_line(line).unwrap();
-            assert_eq!(a.to_line().unwrap(), line);
-        }
+        assert_eq!(Report::from_line(&f.to_line().unwrap()).unwrap(), f);
     }
 
     #[test]
     fn hello_detection_is_distinct() {
-        let hello = r#"{"hello":{"proto":1,"name":"nvidia","modes":["detect","run"]}}"#;
+        let hello = r#"{"hello":{"proto":2,"name":"nvidia","modes":["detect","run"]}}"#;
         assert!(is_hello(hello));
-        // Real responses are NOT mistaken for hello.
-        assert!(!is_hello(r#"{"status":"ok","found":[]}"#));
+        assert!(!is_hello(r#"{"status":"ok","signals":[]}"#));
         assert!(!is_hello(r#"{"status":"error","error":"x"}"#));
         let h = Hello::from_line(hello).unwrap();
         assert_eq!(h.hello.proto, PROTO_VERSION);
@@ -569,34 +622,16 @@ mod tests {
     #[test]
     fn malformed_line_is_error_not_panic() {
         assert!(Request::from_line("not json").is_err());
-        assert!(Applied::from_line("{").is_err());
-        assert!(Detected::from_line("{").is_err());
+        assert!(Report::from_line("{").is_err());
     }
 
     #[test]
-    fn publisher_sink_helpers_round_trip() {
-        let p = Publisher::new("fan0.rpm", "fan0", "fan-rpm")
-            .value(json!(2200))
-            .unit("rpm");
-        assert_eq!(p.value_i64(), Some(2200));
-        let s = Sink::new("fans", "fans", "fan-duty")
-            .range(0.0, 100.0)
-            .unit("%")
-            .value(json!(72))
-            .safe(json!("auto"))
-            .needs_claim(true)
-            .state(SinkState::Claimed)
-            .readback("fan0.rpm")
-            .direction("up=more-cooling")
-            .driven_by(vec![DrivenBy::new("nvidia:GPU-1")
-                .publisher("gpu.temp")
-                .value(json!(63))
-                .unit("C")]);
-        let c = Component::new("gpu0", "GPU 0", "gpu")
-            .with_publishers(vec![p])
-            .with_sinks(vec![s]);
-        let line = serde_json::to_string(&c).unwrap();
-        let back: Component = serde_json::from_str(&line).unwrap();
-        assert_eq!(back, c);
+    fn labels_serialize_in_stable_order() {
+        // BTreeMap → keys sorted, so the wire line is deterministic.
+        let u = Unit::new("x").typed("gpu").name("gpu0").description("d");
+        assert_eq!(
+            serde_json::to_string(&u).unwrap(),
+            r#"{"id":"x","labels":{"description":"d","name":"gpu0","type":"gpu"}}"#
+        );
     }
 }

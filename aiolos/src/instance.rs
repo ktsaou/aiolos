@@ -8,7 +8,7 @@
 //! the instance thread (which would otherwise defeat the isolation guarantee).
 
 use anyhow::Result;
-use protocol::{Applied, Inputs, Request};
+use protocol::{Inputs, Report, Request};
 use std::ffi::c_void;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -80,7 +80,9 @@ impl TickStatus {
 pub struct TickResult {
     pub status: TickStatus,
     pub error: Option<String>,
+    pub units: Vec<protocol::Unit>,
     pub components: Vec<protocol::Component>,
+    pub signals: Vec<protocol::Signal>,
 }
 
 impl TickResult {
@@ -88,7 +90,9 @@ impl TickResult {
         TickResult {
             status,
             error,
+            units: Vec::new(),
             components: Vec::new(),
+            signals: Vec::new(),
         }
     }
 }
@@ -198,17 +202,19 @@ impl Instance {
                         debug!(module=%self.module_name, id=%self.id, "hello");
                         continue; // skip optional hello, keep component within the deadline
                     }
-                    match Applied::from_line(&s) {
-                        Ok(ap) => {
-                            let status = match ap.status {
+                    match Report::from_line(&s) {
+                        Ok(rep) => {
+                            let status = match rep.status {
                                 protocol::Status::Ok => TickStatus::Ok,
                                 protocol::Status::Error => TickStatus::Error,
                                 protocol::Status::Fatal => TickStatus::Fatal,
                             };
                             return TickResult {
                                 status,
-                                error: ap.error,
-                                components: ap.components.unwrap_or_default(),
+                                error: rep.error,
+                                units: rep.units,
+                                components: rep.components,
+                                signals: rep.signals,
                             };
                         }
                         Err(e) => {

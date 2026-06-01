@@ -8,7 +8,7 @@
 
 use crate::stdio::{Event, StdinReader};
 use crate::Controller;
-use protocol::{Applied, Detected, Inputs, Request, Status};
+use protocol::{Inputs, Report, Request, Status};
 use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
@@ -18,10 +18,11 @@ use tracing::{error, info};
 const STEP: Duration = Duration::from_millis(200);
 
 /// The device-agnostic surface each anemos implements. The SDK owns the lifecycle and calls this;
-/// faults MUST be declared explicitly (`Detected`/`Applied` `error`/`fatal`), never via exit/empty.
+/// faults MUST be declared explicitly (`Report` `error`/`fatal`), never via exit/empty.
 pub trait Anemos {
-    /// Report the IDs this module currently manages (answers `detect`).
-    fn detect(&mut self) -> Detected;
+    /// Report the units/components/signals this module currently manages, schema-only — no live
+    /// values (answers `detect`). `units[].id` are the stable ids aiolos spawns `run <id>` per.
+    fn detect(&mut self) -> Report;
     /// Bind one detected id. `mode` is `Control` for normal `run <id>` and `Observe` for read-only
     /// collection (the `info` one-shot); observe mode MUST NOT claim/set/release hardware.
     /// `Err` => the SDK declares `fatal` (supervisor retries on a long backoff in run mode);
@@ -42,13 +43,14 @@ pub enum OpenMode {
 
 /// One bound device. The SDK ticks it and guarantees a restore on shutdown/EOF/signal.
 pub trait Device {
-    /// Read-only snapshot: collect sensors/readbacks and return live components without changing the
-    /// device state. This backs `<module> info` and can also be reused by sensor-only `apply`.
-    fn collect(&mut self, inputs: Option<&Inputs>) -> Applied;
+    /// Read-only snapshot: collect sensors/readbacks and return this unit's live `Report`
+    /// (units/components/signals with values) without changing device state. Backs `<module> info`
+    /// and can be reused by sensor-only `apply`.
+    fn collect(&mut self, inputs: Option<&Inputs>) -> Report;
 
     /// One tick: read sensors, compute a duty via `ctrl.duty(raw_temp)`, drive the device, return
-    /// components. Declare faults via `Applied::error`/`fatal`; on error, restore the device first.
-    fn apply(&mut self, inputs: Option<&Inputs>, _ctrl: &mut Controller) -> Applied {
+    /// the live `Report`. Declare faults via `Report::error`/`fatal`; on error, restore first.
+    fn apply(&mut self, inputs: Option<&Inputs>, _ctrl: &mut Controller) -> Report {
         self.collect(inputs)
     }
 
@@ -93,7 +95,7 @@ pub fn run_with<A: Anemos>(
     let code = match mode {
         "detect" => {
             if stdin_is_tty() {
-                emit_detected(&anemos.detect());
+                emit_report(&anemos.detect());
             } else {
                 detect_loop(&mut anemos);
             }
@@ -108,7 +110,7 @@ pub fn run_with<A: Anemos>(
             info_once(&mut anemos, id)
         }
         "schema" => {
-            emit_detected(&anemos.detect());
+            emit_report(&anemos.detect());
             0
         }
         "run" => {
@@ -149,10 +151,10 @@ fn detect_loop<A: Anemos>(anemos: &mut A) {
                 if let Some(err) = &d.error {
                     error!(status=%d.status.as_str(), error=%err, "detect");
                 }
-                emit_detected(&d);
+                emit_report(&d);
             }
             Ok(Request::Shutdown) => {
-                emit_applied(&Applied::ok_empty());
+                emit_report(&Report::ok_empty());
                 break;
             }
             Ok(Request::Apply { .. }) => eprintln!("unexpected apply in detect mode"),
@@ -235,21 +237,21 @@ fn run_loop<A: Anemos>(info: &ModuleInfo, anemos: &mut A, id: &str) -> i32 {
                     }
                     // Couldn't open the device: declare fatal so the supervisor retries on a long
                     // backoff (re-running open) instead of limping every tick.
-                    None => Applied::fatal("device unavailable for this id"),
+                    None => Report::fatal("device unavailable for this id"),
                 };
-                emit_applied(&applied);
+                emit_report(&applied);
             }
             Ok(Request::Shutdown) => {
                 if let Some(d) = dev.as_mut() {
                     d.restore();
                 }
-                emit_applied(&Applied::ok_empty());
+                emit_report(&Report::ok_empty());
                 break;
             }
             Ok(Request::Detect) => eprintln!("unexpected detect in run mode"),
             Err(e) => {
                 eprintln!("malformed request: {e}");
-                emit_applied(&Applied::error(format!("malformed: {e}")));
+                emit_report(&Report::error(format!("malformed: {e}")));
             }
         }
     }
@@ -281,12 +283,12 @@ fn startup_curve_fatal_loop(info: &ModuleInfo, reason: &str) -> i32 {
                 // First (and any) apply: declare fatal with the reason, then exit non-zero. The
                 // supervisor records the declared-fatal and respawns on the long (capped) backoff.
                 Ok(Request::Apply { .. }) => {
-                    emit_applied(&Applied::fatal(format!("startup: {reason}")));
+                    emit_report(&Report::fatal(format!("startup: {reason}")));
                     return 1;
                 }
                 // aiolos asked us to stop: nothing was regulated, so this is a clean stop.
                 Ok(Request::Shutdown) => {
-                    emit_applied(&Applied::ok_empty());
+                    emit_report(&Report::ok_empty());
                     return 0;
                 }
                 Ok(Request::Detect) => eprintln!("unexpected detect in run mode"),
@@ -310,50 +312,56 @@ fn curve_path(info: &ModuleInfo) -> Option<String> {
 }
 
 fn info_once<A: Anemos>(anemos: &mut A, id: Option<&str>) -> i32 {
-    let mut detected = anemos.detect();
+    let detected = anemos.detect();
     if detected.status != Status::Ok {
-        emit_detected(&detected);
+        emit_report(&detected);
         return 1;
     }
 
+    let mut units = detected.units;
     if let Some(wanted) = id {
-        detected.found.retain(|f| f.id == wanted);
-        if detected.found.is_empty() {
-            emit_detected(&Detected::fatal(format!("id not found: {wanted}")));
+        units.retain(|u| u.id == wanted);
+        if units.is_empty() {
+            emit_report(&Report::fatal(format!("id not found: {wanted}")));
             return 1;
         }
     }
 
+    // Open each unit read-only and collect its live report; accumulate into one live `Report`.
+    let mut out = Report::ok(Vec::new(), Vec::new(), Vec::new());
     let mut warnings = Vec::new();
-    for found in &mut detected.found {
-        match anemos.open(&found.id, OpenMode::Observe) {
+    for unit in &units {
+        match anemos.open(&unit.id, OpenMode::Observe) {
             Ok(mut dev) => {
-                let applied = dev.collect(None);
-                if applied.status == Status::Ok {
-                    if let Some(components) = applied.components {
-                        found.components = components;
-                    }
-                    if let Some(err) = applied.error {
-                        warnings.push(format!("{}: {err}", found.id));
+                let r = dev.collect(None);
+                if r.status == Status::Ok {
+                    out.units.extend(r.units);
+                    out.components.extend(r.components);
+                    out.signals.extend(r.signals);
+                    if let Some(err) = r.error {
+                        warnings.push(format!("{}: {err}", unit.id));
                     }
                 } else {
                     warnings.push(format!(
                         "{}: {}",
-                        found.id,
-                        applied
-                            .error
-                            .unwrap_or_else(|| format!("collect {}", applied.status.as_str()))
+                        unit.id,
+                        r.error
+                            .unwrap_or_else(|| format!("collect {}", r.status.as_str()))
                     ));
+                    out.units.push(unit.clone()); // keep the schema unit so it still appears
                 }
             }
-            Err(e) => warnings.push(format!("{}: open for collect: {e}", found.id)),
+            Err(e) => {
+                warnings.push(format!("{}: open for collect: {e}", unit.id));
+                out.units.push(unit.clone());
+            }
         }
     }
 
     if !warnings.is_empty() {
-        detected.error = Some(warnings.join("; "));
+        out.error = Some(warnings.join("; "));
     }
-    emit_detected(&detected);
+    emit_report(&out);
     if warnings.is_empty() {
         0
     } else {
@@ -361,12 +369,8 @@ fn info_once<A: Anemos>(anemos: &mut A, id: Option<&str>) -> i32 {
     }
 }
 
-fn emit_detected(detected: &Detected) {
-    emit_serialized(detected.to_line());
-}
-
-fn emit_applied(applied: &Applied) {
-    emit_serialized(applied.to_line());
+fn emit_report(report: &Report) {
+    emit_serialized(report.to_line());
 }
 
 fn emit_serialized(line: serde_json::Result<String>) {
@@ -469,10 +473,10 @@ mod tests {
     fn startup_fatal_applied_line_is_well_formed_protocol() {
         // The line a startup-invalid control module emits on `apply` must be valid protocol JSON
         // with status fatal and the curve reason (so it surfaces on the status page).
-        let line = Applied::fatal("startup: curve invalid: file missing or unreadable")
+        let line = Report::fatal("startup: curve invalid: file missing or unreadable")
             .to_line()
             .unwrap();
-        let parsed = Applied::from_line(&line).unwrap();
+        let parsed = Report::from_line(&line).unwrap();
         assert_eq!(parsed.status, Status::Fatal);
         assert!(parsed.error.as_deref().unwrap().contains("curve"));
         // stdout protocol-only: exactly one JSON object, no embedded newline.

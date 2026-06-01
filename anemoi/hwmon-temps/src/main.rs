@@ -1,29 +1,23 @@
 //! hwmon-temps anemos — generic Linux sysfs temperature sensor (read-only; controls NO device).
 //!
-//! Level-3: device logic ONLY. The `anemos` SDK owns the lifecycle (CLI/signals/logging/protocol/
-//! restore wiring); the `hwmon` tech crate reads labelled temperatures from any chip by name. This
-//! is the BMC-less workstation analog of `ipmi-temps`: it reports board/VRM, DIMM, NIC (and any
-//! other configured) temperatures for the status page (and for routing, if ever wired), and controls
-//! nothing — so `apply` ignores the controller, and `restore`/`restore_all` are no-ops.
-//!
-//! detect → one entry ("hwmon"): all configured chips are read in this single process.
-//! run    → report every readable temperature from the configured chips, with labels that
-//!          disambiguate multiple chips sharing a `name` (e.g. four `spd5118` DIMMs).
+//! Level-3: device logic ONLY. The `anemos` SDK owns the lifecycle; the `hwmon` tech crate reads
+//! labelled temperatures from any chip by name. The BMC-less workstation analog of `ipmi-temps`: it
+//! reports the **board** unit (`id` = `board`, shared with `it87` on that host so they merge), split
+//! into `board`/`dimms`/`lan` components, and controls nothing.
 
 mod config;
 
-use anemos::{
-    Anemos, Applied, Component, Detected, Device, FoundEntry, Inputs, ModuleInfo, OpenMode,
-    Publisher,
-};
+use anemos::{Anemos, Component, Device, Inputs, ModuleInfo, OpenMode, Report, Signal, Unit};
 use hwmon::ChipTemps;
 use serde_json::json;
+use std::collections::{BTreeSet, HashMap};
+
+const BOARD_ID: &str = "board";
 
 fn main() -> ! {
     anemos::run(
         ModuleInfo {
             name: "hwmon-temps",
-            // Sensor-only: no curve, no device control.
             curve_default_path: None,
             curve_env_filename: None,
         },
@@ -34,59 +28,65 @@ fn main() -> ! {
 struct HwmonTempsAnemos;
 
 impl Anemos for HwmonTempsAnemos {
-    fn detect(&mut self) -> Detected {
-        // One instance reads all configured chips (cheap sysfs reads, one process).
-        Detected::ok(vec![FoundEntry {
-            id: "hwmon".to_string(),
-            kind: "board".to_string(),
-            name: "hwmon sysfs temps".to_string(),
-            components: vec![Component::new("hwmon", "hwmon sysfs temps", "board")],
-            extra: Default::default(),
-        }])
+    fn detect(&mut self) -> Report {
+        Report::ok(vec![board_unit()], Vec::new(), Vec::new())
     }
 
     fn open(&mut self, _id: &str, _mode: OpenMode) -> anyhow::Result<Box<dyn Device>> {
         Ok(Box::new(HwmonTemps))
     }
 
-    fn restore_all(&mut self) {
-        // Sensor-only: nothing to restore.
-    }
+    fn restore_all(&mut self) {}
 }
 
 struct HwmonTemps;
 
 impl Device for HwmonTemps {
-    fn collect(&mut self, _inputs: Option<&Inputs>) -> Applied {
-        // Sensor-only: read the configured chips' temps and report them; control nothing.
+    fn collect(&mut self, _inputs: Option<&Inputs>) -> Report {
         let chips = config::chips();
-        let components = build_components(&hwmon::read_chip_temps(&chips));
-        if components.is_empty() {
-            return Applied::error(format!(
+        let (components, signals) = build(&hwmon::read_chip_temps(&chips));
+        if signals.is_empty() {
+            return Report::error(format!(
                 "no temperatures readable from configured chips: {}",
                 chips.join(", ")
             ));
         }
-        Applied::ok(components)
+        Report::ok(vec![board_unit()], components, signals)
     }
 
-    fn restore(&mut self) {
-        // Sensor-only: nothing to restore.
+    fn restore(&mut self) {}
+}
+
+fn board_unit() -> Unit {
+    Unit::new(BOARD_ID)
+        .name("board")
+        .description("workstation board")
+        .typed("board")
+}
+
+/// Map a chip name to its component (suffix, type): DIMM SPD hubs → `dimms`, NIC → `lan`, the rest
+/// (board/VRM super-I/O, WMI) → `board`.
+fn component_for(chip: &str) -> (&'static str, &'static str) {
+    let c = chip.to_ascii_lowercase();
+    if c.contains("spd5118") || c.contains("dimm") {
+        ("dimms", "dimm")
+    } else if c.contains("r8169") || c.contains("igc") || c.contains("lan") || c.contains("nic") {
+        ("lan", "nic")
+    } else {
+        ("board", "board")
     }
 }
 
-/// Turn per-chip temperature groups into temperature publishers with unambiguous labels:
-/// - a chip name with ONE instance → `chip` (single sensor) or `chip.<sensor>` (multiple sensors);
-/// - a chip name with MULTIPLE instances → `chip@<instance>` / `chip@<instance>.<sensor>`,
-///   where `<instance>` is the chip's stable device discriminator (e.g. an i2c address).
-fn build_components(groups: &[ChipTemps]) -> Vec<Component> {
-    // Count instances per chip name so we only add the `@instance` discriminator where it's needed.
-    let mut instances_per_chip = std::collections::HashMap::<&str, usize>::new();
+/// Build the board's components + temperature producer signals, with unambiguous labels (a chip name
+/// with multiple instances gets `@instance`; multiple sensors get `.sensor`).
+fn build(groups: &[ChipTemps]) -> (Vec<Component>, Vec<Signal>) {
+    let mut instances_per_chip = HashMap::<&str, usize>::new();
     for g in groups {
         *instances_per_chip.entry(g.chip.as_str()).or_insert(0) += 1;
     }
-
-    let mut publishers = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut components = Vec::new();
+    let mut signals = Vec::new();
     for g in groups {
         let multi_instance = instances_per_chip
             .get(g.chip.as_str())
@@ -99,39 +99,41 @@ fn build_components(groups: &[ChipTemps]) -> Vec<Component> {
             g.chip.clone()
         };
         let multi_sensor = g.temps.len() > 1;
+        let (suffix, ctype) = component_for(&g.chip);
+        let cid = format!("{BOARD_ID}:{suffix}");
+        if seen.insert(cid.clone()) {
+            components.push(Component::new(&cid, BOARD_ID).name(suffix).typed(ctype));
+        }
         for (sensor, temp) in &g.temps {
             let label = if multi_sensor {
                 format!("{base}.{sensor}")
             } else {
                 base.clone()
             };
-            publishers.push(
-                Publisher::new(temp_publisher_id(&label), label, "temperature")
+            signals.push(
+                Signal::producer(format!("{cid}:{}", slug(&label)), &cid, "temperature")
                     .value(json!(temp))
-                    .unit("C"),
+                    .uom("C")
+                    .name(label),
             );
         }
     }
-    if publishers.is_empty() {
-        Vec::new()
-    } else {
-        vec![Component::new("hwmon", "hwmon sysfs temps", "board").with_publishers(publishers)]
-    }
+    (components, signals)
 }
 
-fn temp_publisher_id(label: &str) -> String {
-    format!(
-        "temp.{}",
-        label
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() {
+fn slug(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
                 c.to_ascii_lowercase()
             } else {
                 '_'
-            })
-            .collect::<String>()
-            .trim_matches('_')
-    )
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
 }
 
 #[cfg(test)]
@@ -146,73 +148,71 @@ mod tests {
         }
     }
 
-    fn labels(cs: &[Component]) -> Vec<(String, i64)> {
-        cs.iter()
-            .flat_map(|c| c.publishers.iter())
-            .map(|p| (p.label.clone(), p.value_i64().unwrap()))
+    /// (signal display name, value, component id) for each produced signal.
+    fn rows(groups: &[ChipTemps]) -> Vec<(String, i64, String)> {
+        let (_c, s) = build(groups);
+        s.iter()
+            .map(|sig| {
+                (
+                    sig.labels.get("name").cloned().unwrap_or_default(),
+                    sig.value_i64().unwrap(),
+                    sig.component.clone(),
+                )
+            })
             .collect()
     }
 
     #[test]
     fn single_instance_single_sensor_uses_bare_chip_name() {
-        let g = vec![chip("nvme", "0000:02:00.0", &[("Composite", 37)])];
+        let r = rows(&[chip("gigabyte_wmi", "virt", &[("temp1", 31)])]);
         assert_eq!(
-            labels(&build_components(&g)),
-            vec![("nvme".to_string(), 37)]
+            r,
+            vec![("gigabyte_wmi".to_string(), 31, "board:board".to_string())]
         );
     }
 
     #[test]
     fn single_instance_multiple_sensors_appends_sensor() {
-        let g = vec![chip(
+        let r = rows(&[chip(
             "gigabyte_wmi",
             "virt",
             &[("temp1", 31), ("temp2", 40)],
-        )];
+        )]);
         assert_eq!(
-            labels(&build_components(&g)),
+            r,
             vec![
-                ("gigabyte_wmi.temp1".to_string(), 31),
-                ("gigabyte_wmi.temp2".to_string(), 40)
+                (
+                    "gigabyte_wmi.temp1".to_string(),
+                    31,
+                    "board:board".to_string()
+                ),
+                (
+                    "gigabyte_wmi.temp2".to_string(),
+                    40,
+                    "board:board".to_string()
+                ),
             ]
         );
     }
 
     #[test]
-    fn multiple_instances_disambiguate_by_device() {
-        // Four DDR5 DIMMs, each a single-sensor `spd5118` at a distinct i2c address.
-        let g = vec![
+    fn dimms_route_to_the_dimms_component_disambiguated_by_device() {
+        let r = rows(&[
             chip("spd5118", "11-0050", &[("temp1", 36)]),
             chip("spd5118", "11-0051", &[("temp1", 32)]),
-            chip("spd5118", "11-0052", &[("temp1", 35)]),
-            chip("spd5118", "11-0053", &[("temp1", 36)]),
-        ];
+        ]);
         assert_eq!(
-            labels(&build_components(&g)),
+            r,
             vec![
-                ("spd5118@11-0050".to_string(), 36),
-                ("spd5118@11-0051".to_string(), 32),
-                ("spd5118@11-0052".to_string(), 35),
-                ("spd5118@11-0053".to_string(), 36),
+                ("spd5118@11-0050".to_string(), 36, "board:dimms".to_string()),
+                ("spd5118@11-0051".to_string(), 32, "board:dimms".to_string()),
             ]
         );
     }
 
     #[test]
-    fn mixed_names_only_disambiguate_the_duplicated_one() {
-        let g = vec![
-            chip("gigabyte_wmi", "virt", &[("temp1", 31)]),
-            chip("r8169", "0000:06:00", &[("temp1", 38)]),
-            chip("r8169", "0000:07:00", &[("temp1", 32)]),
-        ];
-        // gigabyte_wmi is single-instance single-sensor -> bare; r8169 has two -> @instance.
-        assert_eq!(
-            labels(&build_components(&g)),
-            vec![
-                ("gigabyte_wmi".to_string(), 31),
-                ("r8169@0000:06:00".to_string(), 38),
-                ("r8169@0000:07:00".to_string(), 32),
-            ]
-        );
+    fn nic_routes_to_lan_component() {
+        let r = rows(&[chip("r8169", "0000:06:00", &[("temp1", 38)])]);
+        assert_eq!(r, vec![("r8169".to_string(), 38, "board:lan".to_string())]);
     }
 }
