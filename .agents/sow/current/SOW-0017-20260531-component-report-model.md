@@ -532,6 +532,16 @@ from **both publishers and sinks** (sinks win on overlap, as they carry the clai
 view already rendered all publishers, so it was unaffected. Rebuilt/reinstalled `aiolos` (JS is
 `include_str!`-embedded); requires a browser hard-refresh to drop the cached script.
 
+**CPU-fan management (2026-06-01):** to give the CPU fan a real (commanded) duty instead of the BIOS
+static `100%` placeholder, tested whether `pwm1` is software-controllable. Result: **EC-locked** —
+writes read back but the fan does not respond (swept 35%→100%, rpm held ~1230; the Gigabyte EC owns
+the actual PWM output, a known IT8689E limitation). Per user decision ("enable it" regardless), set
+`cpu=1` in the live `/opt/aiolos/etc/it87.conf` anyway: aiolos now claims `pwm1` (manual) and commands
+a curve duty, so the dashboard shows fan1 at the commanded ~30% (sink `claimed`) rather than the fake
+100%. The fan's real speed is unchanged and the CPU stays protected by the BIOS curve regardless. Repo
+template `packaging/it87.conf` note updated to match. (BIOS Smart Fan 5 → PWM+Manual may unlock real
+control; an operator action, not done here.) Live `etc/` config is deployment state, not committed.
+
 **Follow-ups (not done here):**
 - Optional: make "report all readable channels" a project-wide convention (`project-create-anemos`
   skill + an enumerate helper per tech crate) so future anemoi inherit it.
