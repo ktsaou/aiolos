@@ -297,14 +297,14 @@ impl Supervisor {
         }
 
         // New / dead -> (re)spawn, respecting backoff.
-        let to_spawn: Vec<(String, String)> = self
+        let to_spawn: Vec<(String, String, String)> = self
             .last_found
             .iter()
             .filter(|e| !self.running.contains_key(&e.id) && self.backoff_expired(&e.id))
-            .map(|e| (e.id.clone(), e.name.clone()))
+            .map(|e| (e.id.clone(), e.name.clone(), e.kind.clone()))
             .collect();
-        for (id, name) in to_spawn {
-            self.spawn_instance(id, name);
+        for (id, name, unit_type) in to_spawn {
+            self.spawn_instance(id, name, unit_type);
         }
     }
 
@@ -389,7 +389,7 @@ impl Supervisor {
 
     // ----- spawn --------------------------------------------------------------
 
-    fn spawn_instance(&mut self, id: String, name: String) {
+    fn spawn_instance(&mut self, id: String, name: String, unit_type: String) {
         if SHUTDOWN_FLAG.load(Ordering::Acquire) {
             return;
         }
@@ -438,6 +438,7 @@ impl Supervisor {
                     module_name: self.module_name.clone(),
                     id: id.clone(),
                     name,
+                    unit_type,
                     last_status: "starting".to_string(),
                     last_error: None,
                     last_components: Vec::new(),

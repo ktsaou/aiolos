@@ -83,7 +83,7 @@ Unknowns (decisions — see Pre-Implementation Gate):
 - **Component schema:** each component carries a `class` (device kind, open tag) for grouping + icon;
   components, publishers, and sinks all have stable local `id`s. Publishers are normalised scalar
   streams `{id, label, kind, value?, unit?, range?}`. Sinks carry
-  `{id, label, kind, range?, unit?, value?, readback?, safe, needs_claim, state, direction?, driven_by?}`.
+  `{id, label, kind, range?, unit?, value?, readback?, safe?, needs_claim, state, direction?, driven_by?}`.
   `value` is absent in pure schema surfaces and present in live report/status surfaces.
 - **No duplication:** each device is published by exactly one anemos (its owner); `asrock`'s successor no
   longer publishes GPU/NVMe components — consumed inputs appear only as sink `driven_by` metadata.
@@ -216,8 +216,8 @@ Open decisions (recorded from the discussion; recommendations given — confirm 
   `{id, label, kind, value?, unit?, range?}`; multi-value devices = multiple publishers. **DECIDED
   2026-05-31** as the SOW-0014-ready detect/report schema: `value` is optional so `detect` can return
   schema-only publishers and live reports can return values.
-- **D2 Sink shape** — `{id, label, kind, range?, unit?, value?, readback?, safe, needs_claim,
-  state:released|claimed|diverged, direction?, driven_by?}`. **DECIDED 2026-05-31** as the SOW-0014-ready
+- **D2 Sink shape** — `{id, label, kind, range?, unit?, value?, readback?, safe?, needs_claim,
+  state:released|claimed|diverged|unknown, direction?, driven_by?}`. **DECIDED 2026-05-31** as the SOW-0014-ready
   detect/report schema: modules set/report `value` now; SOW-0014 changes apply/command methodology so
   aiolos computes and commands sink targets later without changing detect/reports.
 - **D3 Class + icons** — `class` (device kind, open tag) on the component drives grouping; aiolos ships
@@ -321,6 +321,39 @@ sequences stay in `board.rs`).
   `rome2d-fans` report live readbacks without claiming or releasing fans; sensor-only anemoi use
   `collect` directly.
 
+### 2026-05-31 (evening) — measurement-level data-model rethink (design; not yet built)
+User feedback: the shipped UI still treats each device as a flat "pool of key-value data". Pivot to a
+**bottom-up, data-driven** model; the UI must render whatever structure the data declares — with **no
+device-organisation rules hardcoded** in aiolos or the page. Grounding (read 2026-05-31): the wire
+types already support this (component granularity is free; `Component.icon` + per-`Publisher`/`Sink`
+`extra` exist; `FoundEntry` already is a "unit"). Every anemos currently collapses a device into ONE
+flat component (nvidia=1 "gpu" with both fans flattened; ipmi-temps=22 temps in one "bmc";
+rome2d-fans=~25 publishers+8 sinks in one "board").
+
+Target model:
+- **Measurement** = a producer OR a sink: `{id, kind, friendly name, value, unit, labels{}}`; sinks add
+  claiming `state`/range/safe/driven_by. Icon comes from a **kind→icon registry** (overridable per
+  measurement / via config) — a generic visual vocabulary, not a device rule.
+- **Component** = a logical sub-thing grouping related measurements (a fan = rpm producer + duty sink;
+  a "CPUs" group = many temp producers). **The anemos owns the grouping** (device knowledge); config can
+  override. e.g. nvidia → {Temperature, Fan 0, Fan 1}; ipmi-temps → {CPUs, DIMMs, LAN, Board}.
+- **Unit** = a device (`FoundEntry`), grouped on the home by type; **may be shared across anemoi** — the
+  orchestrator merges instances reporting the same unit identity (ipmi-temps board + rome2d-fans board
+  → one "ROME2D16-2T"), stamping each measurement with its source anemos as a label.
+
+Forks **decided 2026-05-31 (user delegated to assistant):** **D-A** fine components, grouping owned by
+the anemos (multi-temp groups keep all temps; UI shows the max); **D-B** unit merge = **hybrid** (anemos
+derives a best-effort unit id from DMI/serial, operator config can override/declare); **D-C** measurement
+identity `{id,name,kind,value,unit,labels}` + orchestrator stamps `anemos`/source provenance on merge;
+**D-D** built-in **kind→icon** registry, per-measurement/config override; **D-E** config scope (start) =
+unit-merge/identity + friendly names + hide/show; **D-F** generic per-component layout + **pressure-
+dominant** visuals. Phased: data-model+anemoi → orchestrator merge → config → UI. The simplistic "Sky"
+home (deployed) is a milestone to be superseded by this structured render.
+
+Phase 1 (in progress): the data model, proven bottom-up on `nvidia` first — a GPU unit reports
+`Temperature` + `Fan i` components (each fan = rpm producer + duty sink), with a human unit name
+(product + index), validated on real hardware via `nvidia info` before the UI/other modules follow.
+
 ## Validation
 
 Implementation-pass validation (2026-05-31, refreshed after the SDK collect/apply split):
@@ -403,6 +436,50 @@ visual acceptance, and operator-approved on-hardware validation/cutover.
   (decision ownership flips from modules to aiolos; same wire shape). Update its dependencies accordingly.
 - The component `class` dimension added here also fills a gap in SOW-0014's original schema (which had
   only a measurement `kind`, insufficient to separate GPU from CPU).
+
+## Progress — Bottom-Up Web Dashboard (2026-06-01)
+
+Built the data-driven, bottom-up status dashboard the user specified (measurements are the atoms;
+units group them; nothing about device types is hardcoded in the page).
+
+Data model (so the page never invents structure):
+- `nvidia` now reports a GPU as one unit with **3 components**: `temperature`, then `fan{0..n}`
+  (each an `rpm` publisher + a `duty` sink). `FoundEntry.name` carries the product name; the duty
+  sinks carry the commanded value, claim `state`, and `driven_by` provenance.
+- Threaded a per-unit `type` through the orchestrator (`main.rs` `InstanceEntry.unit_type`,
+  `module.rs` reconcile/spawn, `status_page.rs` `InstanceJson` `#[serde(rename="type")]`), so
+  `/status.json` exposes each instance's `type` for grouping without the page guessing from class.
+- Renamed the board-fan device struct `AsrockDevice` → `Rome2dFansDevice` (board-family name).
+
+Dashboard (front-end, `aiolos/src/assets/*`):
+- Home groups all units by `type`; each unit shows a hero = its **primary measurement's** animated
+  icon (thermometer / battery) — **no device silhouettes** — plus every temperature as a live
+  thermometer and every fan as a **duty-ring gauge**. Units are **stationary** (no bobbing).
+- Pressure is **prominent**: a ring-gauge meter that fills + glows, the aurora reddens, and at high
+  pressure the whole page enters an alarm state (rising red vignette). Verified calm vs. synthetic
+  high-pressure renders in the offline preview.
+- **Build-once-then-patch reconciler**: the stage rebuilds only when the unit/component signature
+  changes; otherwise live values are patched into persistent nodes — SVGs are never recreated per tick.
+
+Two fan-spin defects found in user review and fixed:
+1. **Blades orbited the corner.** The blade group was rotated with an explicit centre
+   `rotate(a 24 24)` while CSS `transform-origin` also applied `50% 50%`; the two stacked, moving the
+   pivot to `(48,48)`. Proven with a headless pivot test (pivot traced a square). Fixed by making the
+   rotation centre-less and letting the CSS origin be the only pivot.
+2. **Blades hiccupped.** They were stepped on the main thread (SVG `transform` attribute via rAF),
+   competing with the poll/reconcile and wind loops. Replaced with a **Web Animations API** rotation
+   (compositor-driven, one 0→360° turn, speed changed only via `playbackRate`). Preview confirmed
+   12/12 fans animate with duty-driven `playbackRate` over a wide range; centre re-proven by pivot test.
+
+Deployed to `/opt/aiolos` after each step; service stayed active with zero restarts, all 7 instances
+`ok`, board fans 8/8 claimed, GPUs held at 400 W.
+
+Still open before this SOW can complete:
+- **Names (#4/#5):** short unique name + long description, consistent across home, time-series (Flux
+  labels still show UUIDs), and logs.
+- **Board split + merge (#2):** split `ipmi-temps` into CPU/DIMM/LAN/Board components; merge the two
+  ROME2D16-2T units (provenance via labels).
+- External reviewer pass and on-screen visual acceptance (the project review gate) remain pending.
 
 ## Regression Log
 

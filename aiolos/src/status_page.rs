@@ -208,6 +208,8 @@ struct InstanceJson<'a> {
     module: &'a str,
     id: &'a str,
     name: &'a str,
+    #[serde(rename = "type")]
+    unit_type: &'a str,
     status: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
@@ -240,6 +242,7 @@ fn render_json(state: &Arc<RwLock<AppState>>) -> String {
             module: &i.module_name,
             id: &i.id,
             name: &i.name,
+            unit_type: &i.unit_type,
             status: &i.last_status,
             error: i.last_error.as_deref(),
             restart_count: i.restart_count,
@@ -958,6 +961,7 @@ mod tests {
             module_name: module.into(),
             id: id.into(),
             name: name.into(),
+            unit_type: "test".into(),
             last_status: status.into(),
             last_error: None,
             last_components: components,

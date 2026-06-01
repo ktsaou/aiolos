@@ -64,7 +64,7 @@ impl Anemos for Rome2dFans {
         // Warm the per-fan tach conversion-factor cache once here (off the apply deadline) so the
         // first tick is no heavier than the rest; any that fail are retried lazily during ticks.
         board.prefetch_fan_factors();
-        Ok(Box::new(AsrockDevice {
+        Ok(Box::new(Rome2dFansDevice {
             board,
             // Control mode owes a release-to-auto on every exit path. Observe/info is read-only and
             // must not release the board on drop, because it never claimed manual control.
@@ -87,7 +87,7 @@ impl Anemos for Rome2dFans {
     }
 }
 
-struct AsrockDevice {
+struct Rome2dFansDevice {
     board: Board,
     restore_armed: bool,
     /// Per-zone controllers (CPU coolers vs case fans), built lazily on the first apply from the
@@ -98,7 +98,7 @@ struct AsrockDevice {
     faults: FanFaultTracker,
 }
 
-impl Device for AsrockDevice {
+impl Device for Rome2dFansDevice {
     fn collect(&mut self, _inputs: Option<&Inputs>) -> Applied {
         // Read-only snapshot for `rome2d-fans info`: local CPU sensors plus BMC duty/RPM readbacks.
         // It never claims, sets, or releases the board, so it is safe while another controller owns
@@ -341,7 +341,7 @@ impl Device for AsrockDevice {
     }
 }
 
-impl AsrockDevice {
+impl Rome2dFansDevice {
     /// Reset both zone dampers when we abandon a zone-mode tick (release path), mirroring the SDK's
     /// `ctrl.reset()` on a non-Ok tick so the per-zone EMA/deadband re-seed cleanly on recovery.
     fn reset_zone_dampers(&mut self) {
@@ -352,7 +352,7 @@ impl AsrockDevice {
     }
 }
 
-impl Drop for AsrockDevice {
+impl Drop for Rome2dFansDevice {
     fn drop(&mut self) {
         if self.restore_armed {
             if let Ok(mut b) = Board::open() {
