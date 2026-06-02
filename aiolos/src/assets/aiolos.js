@@ -92,10 +92,14 @@ function aggregate(components) {
 }
 function powerCtx(c) {
   const g = (kind) => { const p = (c.publishers || []).find(x => x.kind === kind); return p ? p.value : null; };
-  return { charge: Number(g('power-charge')), online: g('power-online') === true || g('power-online') === 'true',
+  // Absent numeric fields must be NaN, NOT 0: a device with power-draw/power-limit telemetry but no
+  // battery charge (e.g. a GPU under nvidia-powercap, merged into the GPU unit) would otherwise read
+  // charge=Number(null)=0 and be mistaken for a UPS, hijacking the unit's primary value from temp.
+  const num = (kind) => { const v = g(kind); return v == null ? NaN : Number(v); };
+  return { charge: num('power-charge'), online: g('power-online') === true || g('power-online') === 'true',
     onBattery: g('power-on-battery') === true || g('power-on-battery') === 'true',
     lowBattery: g('power-low-battery') === true || g('power-low-battery') === 'true',
-    runtime: Number(g('power-runtime')), load: Number(g('power-load')), voltage: Number(g('power-voltage')) };
+    runtime: num('power-runtime'), load: num('power-load'), voltage: num('power-voltage') };
 }
 function deviceCtx(c) { const a = aggregate([c]); return { ...a, power: c.class === 'power' ? powerCtx(c) : null }; }
 function primaryValue(c) {
