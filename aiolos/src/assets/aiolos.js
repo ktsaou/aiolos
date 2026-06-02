@@ -654,20 +654,29 @@ function panSeries(snaps, dir) { const first = snaps[0].t, latest = snaps[snaps.
 /* ===================== LAW (curves — only where one exists) ===================== */
 // Units this module contributes to (by the assembled `sources` list).
 function moduleUnits(module) { return buildUnits(state.status || {}).filter(u => (u.sources || []).includes(module)); }
-function moduleControls(module) { return moduleUnits(module).some(u => u.components.some(c => c.sinks.length || c.publishers.some(p => /^driving/.test(p.kind)))); }
 function viewLaw() {
   const frag = document.createDocumentFragment();
   frag.append(lensHead('Nomos · the law that binds heat to wind', 'Law'));
   const bodyEl = el('div', { class: 'lens-body' });
-  const mm = modulesMap(state.status); const grid = el('div', { class: 'law-grid' }); let any = false;
-  for (const name of Object.keys(mm).sort()) {
-    if (!moduleControls(name)) continue;  // skip sensor-only modules (no curve)
-    const op = moduleOperatingPoint(name); const card = el('div', { class: 'law-card' }); card.append(el('h3', { text: name }));
-    const holder = el('div'); card.append(holder); grid.append(card); any = true;
-    fetchCurve(name).then(c => renderCurve(holder, name, c, op));
-  }
-  bodyEl.append(any ? grid : el('div', { class: 'empty', text: 'No controlling modules — nothing has a curve.' }));
-  frag.append(bodyEl); return frag;
+  const grid = el('div', { class: 'law-grid' });
+  bodyEl.append(grid); frag.append(bodyEl);
+  // A Law card belongs only to a module that actually enforces a CURVE. Decide by curve presence —
+  // NOT by sink presence: a merged unit (the board, from ipmi-temps + rome2d-fans) would otherwise
+  // lend its fan sinks to a temperature-only contributor like ipmi-temps. Fetch each module's curve
+  // and render only the non-empty ones.
+  const names = Object.keys(modulesMap(state.status)).sort();
+  Promise.all(names.map(n => fetchCurve(n).then(c => [n, c]))).then(pairs => {
+    let any = false;
+    for (const [name, c] of pairs) {
+      if (!c || !Array.isArray(c.points) || !c.points.length) continue; // no curve -> not a Law module
+      any = true;
+      const holder = el('div');
+      grid.append(el('div', { class: 'law-card' }, [el('h3', { text: name }), holder]));
+      renderCurve(holder, name, c, moduleOperatingPoint(name));
+    }
+    if (!any) grid.append(el('div', { class: 'empty', text: 'No module enforces a curve.' }));
+  });
+  return frag;
 }
 function moduleOperatingPoint(module) {
   const us = moduleUnits(module);
