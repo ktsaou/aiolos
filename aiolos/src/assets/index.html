@@ -8,11 +8,26 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8C%AC%3C/text%3E%3C/svg%3E">
 </head>
 <body>
-<!-- The open sky: ambient heat-glow + drifting wind currents + faint stars. No boxes. -->
+<!-- The Aegean vista: a sky of drifting winds above a horizon, a shimmering sea below.
+     ambient heat-glow + a low sun/moon + wind currents + stars (night) + sea waves. No boxes. -->
 <div class="sky" aria-hidden="true">
   <div class="aurora" id="aurora"></div>
-  <svg id="wind" class="wind-bg" preserveAspectRatio="xMidYMid slice"></svg>
+  <svg id="wind" class="wind-bg" preserveAspectRatio="none"></svg>
   <div class="stars" id="stars"></div>
+  <svg id="sea" class="sea-bg" preserveAspectRatio="none"></svg>
+  <div class="horizon" id="horizon"></div>
+</div>
+
+<!-- the sun (day) / moon (night): an abstract gauge whose RING FILLS with the fleet's pressure
+     (like a fan's duty arc), holding the number + "pressure" label. -->
+<div class="celes" id="celes" title="fleet pressure — the strongest wind across the host">
+  <svg class="celes-ic" viewBox="0 0 48 48" aria-hidden="true">
+    <circle class="sun-fill" cx="24" cy="24" r="16.6"/>
+    <circle class="track" cx="24" cy="24" r="18"/>
+    <circle class="arc" cx="24" cy="24" r="18" transform="rotate(-90 24 24)"/>
+    <text class="pnum-t" id="pnum" x="24" y="20.5">0</text>
+    <text class="plabel" x="24" y="30.5">pressure</text>
+  </svg>
 </div>
 
 <!-- Floating chrome: a wordmark, four lens-words (no sidebar), pressure, theme. -->
@@ -25,9 +40,6 @@
     <button class="lens" data-view="health">Pulse</button>
   </nav>
   <div class="chrome-right">
-    <span class="pressure-mini" title="Fleet pressure — the strongest wind across the host">
-      <span id="pnum">–</span><i>pressure</i>
-    </span>
     <button id="theme" class="iconbtn" title="Toggle theme" aria-label="Toggle theme">☾</button>
     <span id="conn" class="conn ok">live</span>
   </div>

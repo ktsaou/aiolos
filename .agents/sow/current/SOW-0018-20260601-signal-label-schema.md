@@ -273,6 +273,27 @@ protocol spec + `project-anemos-protocol`/`project-create-anemos` skill rewrites
 external reviewer pass, and merging `schema-v2` → master. Desktop (it87/hwmon-temps) cutover is a
 separate operator action.
 
+## Home page redesign - 2026-06-02
+
+The read-only status home was reworked from a top-stacked cluster grid into an **Aegean vista**
+(operator-directed, iterated live on production with binary rollback points in
+`/opt/aiolos/bin/aiolos.bak-*`). No protocol/contract change - it consumes the same label schema.
+
+- **Two tiers on a sea-level horizon**: actively-cooled units (`gpu`/`cpu`/`board`) ride above the
+  waterline; passive/sensor units (storage, power, ...) sit submerged below. Split is by unit type,
+  so a new module places itself.
+- **Theme-aware temperature palettes**: deep Aegean blue->teal->terracotta on the day (whitewashed)
+  theme so instruments read on white; luminous cyan->red at night. Halos/glows use the luminous ramp
+  on both themes, decoupled from the readable instrument colour (`tempColor` vs `haloColor`).
+- **Pressure gauge = an abstract sun (day) / moon (night)** top-right: a ring that fills with fleet
+  pressure like a fan duty-arc, holding the number + `pressure` label; colour + halo track pressure
+  (calm->storm). Replaces the old chrome pressure ring.
+- `fitSky` scales each tier to its band so the overview stays within one viewport; sky winds + a sea
+  swell that turns choppy under pressure. An earlier WebKit `-webkit-box-reflect` reflection pass was
+  removed as misleading (mirrored geometry but un-mirrored reading order).
+
+Files: `aiolos/src/assets/{index.html,aiolos.css,aiolos.js}`.
+
 ## Lessons Extracted
 
 - Building UI on a schema before the schema is the agreed one wastes effort: nail the wire contract

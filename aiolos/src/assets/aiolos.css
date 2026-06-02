@@ -10,7 +10,9 @@
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, monospace;
   --t: .4s cubic-bezier(.4,.08,.16,1);
-  --t-cool: #5fd3e0; --t-mild: #74d6a6; --t-warm: #e8c466; --t-hot: #f0935a; --t-crit: #f0564a;
+  /* the waterline: sky occupies 0..--horizon, the sea the rest. Active units ride the surface,
+     passive ones float submerged below it. */
+  --horizon: 54vh;
 }
 html[data-theme="dark"] {
   --bg0: #05070e; --bg1: #0a0f1d; --bg2: #111a31;
@@ -20,18 +22,29 @@ html[data-theme="dark"] {
   --good: #6fdca8; --warn: #f0bd55; --bad: #f0706e;
   --line: rgba(150,175,220,.12); --line-strong: rgba(165,190,235,.24);
   --wind: rgba(150,205,228,.5);
-  --ishadow: rgba(0,0,0,.45);
+  --ishadow: rgba(0,0,0,.5);
+  /* Aegean night: deep indigo sky over a near-black sea, a cool low moon. */
+  --sky0: #060c1e; --sky1: #0b1733; --sea0: #050d1f; --sea1: #02060f;
+  --horizon-line: rgba(140,205,225,.55); --horizon-glow: rgba(95,200,224,.28);
+  --celes: rgba(150,185,225,.24); --celes-edge: rgba(190,215,245,.11);
+  --sea-wave: rgba(130,190,220,.16);
   color-scheme: dark;
 }
 html[data-theme="light"] {
-  --bg0: #f6f1e6; --bg1: #efe7d6; --bg2: #e6dcc4;
-  --ink: #2a2316; --ink-soft: #5f5436; --ink-faint: #97895f;
-  --accent: #b07d1f; --accent-glow: rgba(176,125,31,.28);
-  --aether: #2c8da4; --aether-glow: rgba(44,141,164,.26);
-  --good: #2f9e6f; --warn: #c2841f; --bad: #c4493f;
-  --line: rgba(80,62,30,.14); --line-strong: rgba(80,62,30,.26);
-  --wind: rgba(60,120,140,.34);
-  --ishadow: rgba(60,46,18,.14);
+  /* Aegean noon: whitewashed sky meeting a pale teal sea — cooler than parchment so the
+     deep-blue instruments read instead of dissolving. */
+  --bg0: #eef3f1; --bg1: #e9f0ee; --bg2: #dde9e7;
+  --ink: #18303a; --ink-soft: #44606a; --ink-faint: #84999f;
+  --accent: #b06a17; --accent-glow: rgba(176,106,23,.26);
+  --aether: #157089; --aether-glow: rgba(21,112,137,.22);
+  --good: #1d8a5f; --warn: #b07414; --bad: #b23a30;
+  --line: rgba(28,72,86,.15); --line-strong: rgba(28,72,86,.28);
+  --wind: rgba(40,110,135,.30);
+  --ishadow: rgba(30,70,86,.16);
+  --sky0: #f4f7f4; --sky1: #e7efec; --sea0: #d3e4e3; --sea1: #b7d4d4;
+  --horizon-line: rgba(24,96,116,.5); --horizon-glow: rgba(40,130,150,.22);
+  --celes: rgba(255,228,176,.34); --celes-edge: rgba(255,210,148,.15);
+  --sea-wave: rgba(30,100,120,.14);
   color-scheme: light;
 }
 
@@ -40,27 +53,63 @@ html, body { height: 100%; }
 body {
   margin: 0; min-height: 100vh; font-family: var(--sans); color: var(--ink);
   overflow-x: hidden;
-  background:
-    radial-gradient(120% 90% at 50% -20%, var(--bg2), transparent 55%),
-    radial-gradient(80% 60% at 80% 110%, color-mix(in srgb,var(--aether) 12%,transparent), transparent 60%),
-    linear-gradient(180deg, var(--bg1), var(--bg0) 80%);
+  /* one Aegean scene: sky fading down into sea at --horizon (the moon supplies the horizon glow). */
+  background: linear-gradient(180deg, var(--sky0) 0%, var(--sky1) var(--horizon), var(--sea0) var(--horizon), var(--sea1) 100%);
+  background-attachment: fixed;
   -webkit-font-smoothing: antialiased;
 }
 ::selection { background: var(--accent-glow); }
 
 /* ---------- atmosphere ---------- */
 .sky { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
-/* aurora = ambient heat-glow of the whole host; JS tints it by the hottest body */
+/* aurora = ambient heat-glow of the whole host, blooming up off the horizon; JS tints it by the hottest body */
 .aurora {
   position: absolute; inset: -10%;
-  background: radial-gradient(50% 38% at 50% 8%, var(--aura, transparent), transparent 70%);
+  background: radial-gradient(38% 42% at 82% 12%, var(--aura, transparent), transparent 70%);
   opacity: var(--aura-op, .4); transition: opacity 1.2s ease, background 1.2s ease;
   mix-blend-mode: screen;
 }
-html[data-theme="light"] .aurora { mix-blend-mode: multiply; }
+/* on the bright day sky a glow must ADD light, not subtract it — lighten the heat-bloom, drop multiply */
+html[data-theme="light"] .aurora { mix-blend-mode: normal;
+  background: radial-gradient(38% 42% at 82% 12%, color-mix(in srgb, var(--aura, transparent) 40%, white), transparent 72%); }
+
+/* the sun (day) / moon (night) high in the top-right sky: an abstract gauge whose RING FILLS with the
+   fleet's pressure (like a fan's duty arc), holding the number + "pressure" label. */
+.celes { position: fixed; top: 88px; right: 7.5%; width: 138px; height: 138px; z-index: 9; pointer-events: none;
+  color: var(--p-col, var(--aether)); }
+/* a THIN soft glow that hugs the disc and fades out gradually (not a filled ring/disc): stacked
+   small blurs give a smooth falloff — dark at night, warm yellow by day (see light override below). */
+html[data-theme="dark"] .celes { filter:
+  drop-shadow(0 0 3px rgba(2,8,16,.9)) drop-shadow(0 0 7px rgba(2,8,16,.55)) drop-shadow(0 0 13px rgba(2,8,16,.3)); }
+/* day: the same thin glow, warm yellow */
+html[data-theme="light"] .celes { filter:
+  drop-shadow(0 0 3px rgba(255,196,72,.95)) drop-shadow(0 0 7px rgba(255,205,92,.6)) drop-shadow(0 0 13px rgba(255,212,112,.34)); }
+.celes-ic { width: 100%; height: 100%; overflow: visible; }
+.celes-ic .sun-fill { display: none; }
+.celes-ic .track { fill: none; stroke: var(--line-strong); stroke-width: 2.4; opacity: .55; }
+.celes-ic .arc { fill: none; stroke: currentColor; stroke-width: 2.8; stroke-linecap: round;
+  stroke-dasharray: calc(var(--pressure, 0) * 113.1) 113.1;   /* the wind loop already eases --pressure */
+  filter: drop-shadow(0 0 calc(1px + var(--pressure, 0) * 7px) color-mix(in srgb, var(--p-col, var(--aether)) 70%, transparent)); }
+.celes-ic .pnum-t { fill: currentColor; font-family: var(--serif); font-size: 13px; font-variant-numeric: tabular-nums;
+  text-anchor: middle; dominant-baseline: central; }
+.celes-ic .plabel { fill: var(--ink-faint); font-size: 4.2px; letter-spacing: .14em; text-transform: uppercase;
+  text-anchor: middle; dominant-baseline: central; }
+/* day → a yellow sun disc, no rays; number + label go dark for contrast on the yellow */
+html[data-theme="light"] .celes-ic .sun-fill { display: inline; fill: #f3c233; }
+html[data-theme="light"] .celes-ic .pnum-t { fill: #3a2c0a; }
+html[data-theme="light"] .celes-ic .plabel { fill: rgba(58,44,10,.72); }
 .wind-bg { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .7; }
 .wind-path { fill: none; stroke: var(--wind); stroke-linecap: round; }
-.stars { position: absolute; inset: 0; }
+/* the sea: drifting wave currents below the horizon */
+.sea-bg { position: absolute; left: 0; right: 0; top: var(--horizon); height: calc(100% - var(--horizon)); width: 100%; opacity: 0; transition: opacity 1.2s ease; }
+body.is-sky .sea-bg { opacity: 1; }
+.sea-wave { fill: none; stroke: var(--sea-wave); stroke-linecap: round; }
+/* the waterline itself */
+.horizon { position: fixed; left: 0; right: 0; top: var(--horizon); height: 1px; z-index: 1; opacity: 0;
+  transition: opacity 1s ease; background: linear-gradient(90deg, transparent, var(--horizon-line) 30%, var(--horizon-line) 70%, transparent);
+  box-shadow: 0 0 22px 1px var(--horizon-glow); }
+body.is-sky .horizon { opacity: 1; }
+.stars { position: absolute; inset: 0 0 calc(100% - var(--horizon)) 0; }
 .stars i { position: absolute; width: 2px; height: 2px; border-radius: 50%; background: var(--ink); opacity: 0; animation: twinkle 6s ease-in-out infinite; }
 html[data-theme="light"] .stars { display: none; }
 @keyframes twinkle { 0%,100% { opacity: .04; } 50% { opacity: .5; } }
@@ -108,19 +157,36 @@ body.alarm::after { animation: alarm 1.5s ease-in-out infinite; }
 .stage { position: relative; z-index: 2; }
 .loading { color: var(--ink-soft); font-family: var(--serif); font-size: 1.3rem; padding: 6rem 1rem; text-align: center; letter-spacing: .06em; }
 
-/* ===== THE SKY (overview) — constellations of luminous bodies ===== */
-.constellation { display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-start; gap: .7rem 2rem; max-width: 1340px; margin: 0 auto; padding: .5rem 1.4rem 1rem; transform-origin: top center; }
-.cluster { display: flex; flex-direction: column; align-items: center; gap: .5rem; }
+/* ===== THE VISTA (overview) — luminous bodies resting on the Aegean horizon =====
+   The fleet is pinned so its base sits exactly on the waterline (--horizon): sky and its
+   winds breathe above, the sea and the bodies' reflections shimmer below. JS (fitSky) only
+   shrinks it if a large fleet would crowd the sky — for a handful of units it just floats. */
+.constellation { display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-start; gap: 1rem 2.6rem; max-width: 1340px; margin: 0 auto; padding: 1rem 1.4rem; }
+/* two rows, both pinned to the sea level. fitSky scales each to fit its band (never wraps). */
+body.is-sky .constellation { position: fixed; left: 0; right: 0; z-index: 2; flex-wrap: nowrap;
+  justify-content: center; gap: 0 clamp(1.2rem, 3.4vw, 3.4rem); max-width: none; margin: 0; padding: 0 1.6rem; }
+/* ABOVE the waterline — the active fleet rides the surface, bases on the line, reflecting down */
+body.is-sky .constellation.sky-tier { top: var(--horizon); align-items: flex-end;
+  transform: translateY(-100%); transform-origin: bottom center; }
+/* BELOW the waterline — passive units hang submerged just beneath the surface */
+body.is-sky .constellation.sea-tier { top: calc(var(--horizon) + 20px); align-items: flex-start;
+  transform-origin: top center; }
+body.is-sky .bodies { flex-wrap: nowrap; }
+/* submerged: cooler + a touch dimmer, as if seen through water */
+.sea-tier .body .uhero { filter: drop-shadow(0 8px 20px var(--ishadow)) saturate(.86) brightness(.96); }
+.sea-tier .bname, .sea-tier .bval { opacity: .94; }
+.sea-tier .cluster-label { color: color-mix(in srgb, var(--ink-faint) 80%, var(--aether)); }
+.cluster { display: flex; flex-direction: column; align-items: center; gap: 1.1rem; }
 .cluster-label { display: flex; align-items: center; gap: 1rem; font-family: var(--serif); font-size: .66rem;
   letter-spacing: .46em; text-transform: uppercase; color: var(--ink-faint); }
-.cluster-label::before, .cluster-label::after { content: ""; width: 64px; height: 1px;
+.cluster-label::before, .cluster-label::after { content: ""; width: 48px; height: 1px;
   background: linear-gradient(90deg, transparent, var(--line-strong), transparent); }
-.bodies { display: flex; flex-wrap: wrap; justify-content: center; gap: .4rem 1.2rem; }
+.bodies { display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-end; gap: .6rem 1.6rem; }
 
-/* units stick to place — no bobbing; just a subtle hover lift */
-.body { position: relative; width: 196px; display: flex; flex-direction: column; align-items: center;
-  justify-content: flex-start; gap: .1rem; padding: .85rem .4rem .65rem; cursor: pointer; transition: transform var(--t); }
-.body:hover { transform: translateY(-3px); }
+/* units rest on the waterline */
+.body { position: relative; width: 188px; display: flex; flex-direction: column; align-items: center;
+  justify-content: flex-end; gap: .12rem; padding: .85rem .4rem .2rem; cursor: pointer; transition: transform var(--t); }
+.body:hover { transform: translateY(-4px); }
 .body:hover .uhero { transform: scale(1.05); }
 .body:hover .bname { color: var(--accent); }
 
@@ -132,6 +198,11 @@ body.alarm::after { animation: alarm 1.5s ease-in-out infinite; }
   transition: background var(--t), opacity var(--t), width var(--t), height var(--t); }
 .halo.hot { animation: shimmer 2.4s ease-in-out infinite; }
 @keyframes shimmer { 50% { filter: blur(16px); opacity: .9; } }
+/* day: a glow on white must read as LIGHT, not a saturated smudge ("dirt"). Lift the halo colour
+   well toward white so it's a bright, airy bloom, and keep it opaque + soft. */
+html[data-theme="light"] .halo {
+  background: radial-gradient(circle, color-mix(in srgb, var(--halo) 58%, white) 0%, color-mix(in srgb, var(--halo) 34%, white) 36%, transparent 66%);
+  opacity: calc(.85 + var(--heat,0) * .15); filter: blur(13px); }
 
 /* wind = airflow streamers, count/opacity ∝ fan activity */
 .streamers { position: absolute; top: 26px; left: 50%; width: 320px; height: 150px; transform: translateX(-50%);

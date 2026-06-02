@@ -45,20 +45,32 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const fmt = (v, d = 0) => (v == null || isNaN(v)) ? '–' : Number(v).toFixed(d);
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 
-/* ---------- temperature → colour ramp ---------- */
-const RAMP = [[26, '#5fd3e0'], [46, '#74d6a6'], [62, '#e8c466'], [76, '#f0935a'], [88, '#f0564a']];
+/* ---------- temperature → colour ramp (theme-aware) ----------
+   Night (dark): luminous cyan→gold→red that glows on the indigo sky.
+   Day (light): deep Aegean blue→teal→ochre→terracotta — saturated mid-tones that READ on the
+   whitewashed sky instead of dissolving into it. Same stops, different luminance per backdrop. */
+const RAMP_DARK = [[26, '#5fd3e0'], [46, '#74d6a6'], [62, '#e8c466'], [76, '#f0935a'], [88, '#f0564a']];
+const RAMP_LIGHT = [[26, '#176d92'], [46, '#1f8a63'], [62, '#9a7416'], [76, '#bd5a26'], [88, '#a8342b']];
+function isLight() { return document.documentElement.getAttribute('data-theme') === 'light'; }
+function tempRamp() { return isLight() ? RAMP_LIGHT : RAMP_DARK; }
 function mix(a, b, f) {
   const pa = [parseInt(a.slice(1, 3), 16), parseInt(a.slice(3, 5), 16), parseInt(a.slice(5, 7), 16)];
   const pb = [parseInt(b.slice(1, 3), 16), parseInt(b.slice(3, 5), 16), parseInt(b.slice(5, 7), 16)];
   return 'rgb(' + pa.map((c, i) => Math.round(c + (pb[i] - c) * f)).join(',') + ')';
 }
+function rampColor(ramp, t) {
+  if (t <= ramp[0][0]) return ramp[0][1];
+  if (t >= ramp[ramp.length - 1][0]) return ramp[ramp.length - 1][1];
+  for (let i = 1; i < ramp.length; i++) if (t <= ramp[i][0]) { const [t0, c0] = ramp[i - 1], [t1, c1] = ramp[i]; return mix(c0, c1, (t - t0) / (t1 - t0)); }
+  return ramp[ramp.length - 1][1];
+}
 function tempColor(t) {
   if (t == null || isNaN(t)) return 'var(--accent)';
-  if (t <= RAMP[0][0]) return RAMP[0][1];
-  if (t >= RAMP[RAMP.length - 1][0]) return RAMP[RAMP.length - 1][1];
-  for (let i = 1; i < RAMP.length; i++) if (t <= RAMP[i][0]) { const [t0, c0] = RAMP[i - 1], [t1, c1] = RAMP[i]; return mix(c0, c1, (t - t0) / (t1 - t0)); }
-  return RAMP[RAMP.length - 1][1];
+  return rampColor(tempRamp(), t);
 }
+// Halos/glows ALWAYS use the luminous ramp so they read as light on any backdrop — decoupled from the
+// instrument colour, which stays deep + readable on the day theme.
+function haloColor(t) { return (t == null || isNaN(t)) ? 'var(--aether)' : rampColor(RAMP_DARK, t); }
 
 /* ---------- data ---------- */
 function pnum(p) { if (!p || p.value == null) return null; const n = Number(p.value); return Number.isFinite(n) ? n : null; }
@@ -352,22 +364,21 @@ function onData() {
   let p = 0; for (const u of buildUnits(state.status || {})) p = Math.max(p, instPressure(unitCtx(u)));
   state.pressure = p; render();
 }
-// Continuous pressure colour (calm cyan → green → amber → red), INTERPOLATED so it eases instead of
-// jumping between buckets. The Wind loop feeds it an eased pressure for frame-smooth transitions.
-const PRESS_RAMP = [[0, '#6fd9e4'], [0.35, '#6fdca8'], [0.6, '#ecc873'], [0.8, '#f0bd55'], [1, '#f0706e']];
-function pressureColor(p) {
-  const x = clamp(p ?? 0, 0, 1);
-  if (x <= PRESS_RAMP[0][0]) return PRESS_RAMP[0][1];
-  for (let i = 1; i < PRESS_RAMP.length; i++) if (x <= PRESS_RAMP[i][0]) { const [a, ca] = PRESS_RAMP[i - 1], [b, cb] = PRESS_RAMP[i]; return mix(ca, cb, (x - a) / (b - a)); }
-  return PRESS_RAMP[PRESS_RAMP.length - 1][1];
-}
+// Continuous weather colour — calm Aegean → storm — INTERPOLATED so it eases instead of jumping
+// between buckets. Theme-aware (deeper on the daylit sea). The Wind loop feeds it an eased pressure.
+const PRESS_DARK = [[0, '#6fd9e4'], [0.35, '#6fdca8'], [0.6, '#ecc873'], [0.8, '#f0bd55'], [1, '#f0706e']];
+const PRESS_LIGHT = [[0, '#1f8aa0'], [0.35, '#2a9e72'], [0.6, '#b07414'], [0.8, '#c4622a'], [1, '#b23a30']];
+function pressureColor(p) { return rampColor(isLight() ? PRESS_LIGHT : PRESS_DARK, clamp(p ?? 0, 0, 1)); }
 
 /* ---------- render pipeline ---------- */
 function render() { syncChrome(); syncStage(); }
 // Per-poll chrome that is NOT pressure-smoothed: the numeric reading + the active lens. The smooth
 // pressure visuals (ring fill, aurora colour, alarm state, wind) are driven frame-by-frame by `Wind`.
 function syncChrome() {
-  const pn = $('pnum'); if (pn) pn.textContent = Math.round((state.pressure || 0) * 100);
+  // Drive the pressure gauge here too (not only in the wind loop) so it fills under reduced-motion.
+  const ps = state.pressure || 0, root = document.documentElement.style;
+  root.setProperty('--pressure', ps.toFixed(3)); root.setProperty('--p-col', pressureColor(ps));
+  const pn = $('pnum'); if (pn) pn.textContent = Math.round(ps * 100);
   for (const b of document.querySelectorAll('.lens')) b.classList.toggle('active', b.dataset.view === state.view.name);
 }
 function unitsSig() { return flattenUnits(state.status).map(u => u.key + ':' + u.components.length).join(','); }
@@ -378,9 +389,10 @@ function stageSig() {
   return v.name;
 }
 function syncStage() {
+  document.body.classList.toggle('is-sky', state.view.name === 'overview');   // vista mode (sea + horizon)
   const patchable = state.view.name === 'overview' || state.view.name === 'device';
   const sig = stageSig();
-  if (patchable && sig === state.dom.sig && state.dom.run.length) { for (const f of state.dom.run) f(); if (state.view.name === 'overview') fitHome(); return; }
+  if (patchable && sig === state.dom.sig && state.dom.run.length) { for (const f of state.dom.run) f(); if (state.view.name === 'overview') fitSky(); return; }
   const run = []; _reg = run;
   const stage = $('stage'); stage.textContent = '';
   const v = state.view;
@@ -391,20 +403,32 @@ function syncStage() {
   else if (v.name === 'health') stage.append(viewPulse());
   _reg = null;
   state.dom = { sig: patchable ? sig : ' ', run };
-  if (v.name === 'overview') fitHome();
+  if (v.name === 'overview') fitSky();
 }
-// Keep the home within one viewport (responsive): scale the constellation to fit the available
-// height, and pull the freed space up so the page doesn't scroll. Floors at 0.6 (then it may scroll).
-function fitHome() {
-  const c = document.querySelector('.constellation'); if (!c) return;
-  c.style.transform = 'none'; c.style.marginBottom = '';
-  const top = c.getBoundingClientRect().top;
-  const avail = window.innerHeight - top - 8, natural = c.scrollHeight;
-  if (natural <= 0) return;
-  const scale = clamp(avail / natural, 0.6, 1);
-  if (scale < 0.997) {
-    c.style.transform = `scale(${scale.toFixed(3)})`;
-    c.style.marginBottom = `-${Math.round(natural * (1 - scale))}px`;
+// Both tiers float pinned to the sea level (CSS). We only intervene to SHRINK a tier when a large
+// fleet would climb into the chrome or run off-screen — a few units just rest in place. Each tier's
+// transform-origin is the waterline, so any scale keeps its bodies on it.
+function fitSky() {
+  const vh = window.innerHeight;
+  const horizonPx = vh * ((parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--horizon')) || 54) / 100);
+  const chrome = document.querySelector('.chrome');
+  const chromeB = chrome ? chrome.getBoundingClientRect().bottom : 64;
+  const fitWidth = (fw, k) => (fw > 0 ? Math.min(k, (window.innerWidth - 24) / fw) : k);
+  const sky = document.querySelector('.constellation.sky-tier');
+  if (sky) {
+    sky.style.transform = 'translateY(-100%)';                 // natural size for measuring
+    const availH = horizonPx - chromeB - 14;
+    let k = 1; if (sky.scrollHeight > 0 && availH > 0) k = Math.min(k, availH / sky.scrollHeight);
+    k = clamp(fitWidth(sky.scrollWidth, k), 0.45, 1);
+    sky.style.transform = `translateY(-100%) scale(${k.toFixed(3)})`;
+  }
+  const sea = document.querySelector('.constellation.sea-tier');
+  if (sea) {
+    sea.style.transform = 'none';
+    const availH = (vh - horizonPx) - 22;
+    let k = 1; if (sea.scrollHeight > 0 && availH > 0) k = Math.min(k, availH / sea.scrollHeight);
+    k = clamp(fitWidth(sea.scrollWidth, k), 0.45, 1);
+    sea.style.transform = `scale(${k.toFixed(3)})`;
   }
 }
 function go(name, key) {
@@ -420,19 +444,29 @@ function applyHash() {
 }
 
 /* ===================== THE SKY (overview) ===================== */
+// Units aiolos actively cools ride ABOVE the waterline; passive/cooler units float submerged below.
+const TIER_ABOVE = new Set(['gpu', 'cpu', 'board']);
+function clusterEl(t, list) {
+  const cluster = el('section', { class: 'cluster' });
+  cluster.append(el('div', { class: 'cluster-label', text: className(t) }));
+  const bodies = el('div', { class: 'bodies' });
+  list.forEach((u, i) => bodies.append(unitBody(u, i)));
+  cluster.append(bodies); return cluster;
+}
 function viewSky() {
   const frag = document.createDocumentFragment(); const units = flattenUnits(state.status);
   if (!units.length) { frag.append(el('div', { class: 'empty', text: 'No devices yet — the winds are still gathering.' })); return frag; }
   const by = {}; for (const u of units) (by[u.type] ||= []).push(u);
-  const wrap = el('div', { class: 'constellation' });
-  for (const t of Object.keys(by).sort(clusterOrder)) {
-    const cluster = el('section', { class: 'cluster' });
-    cluster.append(el('div', { class: 'cluster-label', text: className(t) }));
-    const bodies = el('div', { class: 'bodies' });
-    by[t].forEach((u, i) => bodies.append(unitBody(u, i)));
-    cluster.append(bodies); wrap.append(cluster);
-  }
-  frag.append(wrap); return frag;
+  const types = Object.keys(by).sort(clusterOrder);
+  const tier = (pred, cls) => {
+    const ts = types.filter(pred); if (!ts.length) return;
+    const wrap = el('div', { class: 'constellation ' + cls });
+    for (const t of ts) wrap.append(clusterEl(t, by[t]));
+    frag.append(wrap);
+  };
+  tier(t => TIER_ABOVE.has(t), 'sky-tier');    // above the waterline
+  tier(t => !TIER_ABOVE.has(t), 'sea-tier');   // submerged below
+  return frag;
 }
 function streamerSvg() {
   const s = svg('svg', { class: 'streamers', viewBox: '0 0 320 150', preserveAspectRatio: 'none' });
@@ -481,7 +515,8 @@ function unitBody(u) {
   const update = () => {
     const unit = findUnit(key); if (!unit) return;
     const ctx = unitCtx(unit), pv = unitPrimary(unit), heat = bodyHeat(ctx, unit.type), view = unitView(unit);
-    halo.style.setProperty('--halo', pv.col); halo.style.setProperty('--heat', heat.toFixed(2)); halo.classList.toggle('hot', heat > 0.72);
+    const _ht = ctx.maxTemp != null ? ctx.maxTemp : ctx.temp;
+    halo.style.setProperty('--halo', _ht != null ? haloColor(_ht) : pv.col); halo.style.setProperty('--heat', heat.toFixed(2)); halo.classList.toggle('hot', heat > 0.72);
     glyph.update(unit);
     bvalText.textContent = pv.v; bvalUnit.textContent = pv.u; bval.style.color = pv.col;
     dot.className = 'bdot ' + (unit.inst.status === 'ok' ? 'ok' : 'bad');
@@ -525,7 +560,8 @@ function viewFocus(key) {
   const update = () => {
     const unit = findUnit(key); if (!unit) return;
     const ctx = unitCtx(unit), pv = unitPrimary(unit), heat = bodyHeat(ctx, unit.type);
-    halo.style.setProperty('--halo', pv.col); halo.style.setProperty('--heat', heat.toFixed(2)); halo.classList.toggle('hot', heat > 0.72);
+    const _ht = ctx.maxTemp != null ? ctx.maxTemp : ctx.temp;
+    halo.style.setProperty('--halo', _ht != null ? haloColor(_ht) : pv.col); halo.style.setProperty('--heat', heat.toFixed(2)); halo.classList.toggle('hot', heat > 0.72);
     core.update && core.update(ctx);
     fvalText.textContent = pv.v; fvalUnit.textContent = pv.u; fval.style.color = pv.col;
     // one section per component — the grouping is the data, not a regex
@@ -733,11 +769,22 @@ function viewPulse() {
   logs.append(stream); bodyEl.append(logs); frag.append(bodyEl); return frag;
 }
 
-/* ---------- wind backdrop + smooth pressure reaction (frame-driven; paused when hidden) ---------- */
+/* ---------- sky winds + sea swell + smooth pressure reaction (frame-driven; paused when hidden) ---------- */
 const Wind = (() => {
-  let svgEl, lines = [], raf = null, t = 0, w = 0, h = 0, running = false, ps = 0; const N = 22;
-  function init() { svgEl = $('wind'); resize(); for (let k = 0; k < N; k++) { const p = svg('path', { class: 'wind-path' }); svgEl.append(p); lines.push({ el: p, y: Math.random(), phase: Math.random() * Math.PI * 2, amp: 0.4 + Math.random() * 0.8, speed: 0.5 + Math.random() }); } window.addEventListener('resize', resize); document.addEventListener('visibilitychange', () => document.hidden ? stop() : start()); start(); }
-  function resize() { w = window.innerWidth; h = window.innerHeight; if (svgEl) svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`); }
+  let windEl, seaEl, winds = [], waves = [], raf = null, t = 0, w = 0, h = 0, hz = 0.6, running = false, ps = 0;
+  const NW = 20, NS = 7;
+  function init() {
+    windEl = $('wind'); seaEl = $('sea'); resize();
+    for (let k = 0; k < NW; k++) { const p = svg('path', { class: 'wind-path' }); windEl.append(p); winds.push({ el: p, y: Math.random(), phase: Math.random() * Math.PI * 2, amp: 0.4 + Math.random() * 0.8, speed: 0.5 + Math.random() }); }
+    for (let k = 0; k < NS; k++) { const p = svg('path', { class: 'sea-wave' }); seaEl.append(p); waves.push({ el: p, y: (k + 0.5) / NS, phase: Math.random() * Math.PI * 2, amp: 0.5 + Math.random() * 0.6, speed: 0.4 + Math.random() * 0.5, sw: 1 + Math.random() }); }
+    window.addEventListener('resize', resize); document.addEventListener('visibilitychange', () => document.hidden ? stop() : start()); start();
+  }
+  function resize() {
+    w = window.innerWidth; h = window.innerHeight;
+    hz = (parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--horizon')) || 60) / 100;
+    if (windEl) windEl.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    if (seaEl) seaEl.setAttribute('viewBox', `0 0 ${w} ${Math.max(1, h * (1 - hz)).toFixed(0)}`);
+  }
   function start() { if (running) return; running = true; loop(); }
   function stop() { running = false; if (raf) cancelAnimationFrame(raf); raf = null; }
   function loop() {
@@ -750,15 +797,19 @@ const Wind = (() => {
     const col = pressureColor(ps), root = document.documentElement.style;
     root.setProperty('--pressure', ps.toFixed(3));
     root.setProperty('--p-col', col);
-    const pn = $('pnum'); if (pn) pn.style.color = col;
+    const pn = $('pnum'); if (pn) pn.textContent = Math.round(ps * 100);   // number eases with the wind
     document.body.classList.toggle('under-pressure', ps >= 0.6);
     document.body.classList.toggle('alarm', ps >= 0.85);
     const aur = $('aurora'); if (aur) { aur.style.setProperty('--aura', col); aur.style.setProperty('--aura-op', (0.14 + ps * 0.6).toFixed(2)); }
     // Wind motion: a WIDE spread idle↔pressure — quadratic so calm is a near-still drift and pressure
-    // is an obvious gust (≈0.0022/frame at rest → ≈0.16/frame maxed, ~70×).
+    // is an obvious gust (~0.0022/frame at rest → ~0.16/frame maxed). Confined to the sky.
     t += 0.0022 + ps * ps * 0.16;
-    svgEl.style.opacity = (0.4 + ps * 0.45).toFixed(2);
-    lines.forEach((ln) => { const yy = ln.y * h, amp = (7 + ps * ps * 90) * ln.amp, segs = 8; let d = ''; for (let i = 0; i <= segs; i++) { const x = (i / segs) * w; const yv = yy + Math.sin(t * ln.speed + ln.phase + i * 0.6) * amp + Math.sin(t * 0.5 * ln.speed + i * 0.3) * amp * 0.4; d += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + yv.toFixed(1) + ' '; } ln.el.setAttribute('d', d); ln.el.setAttribute('stroke-width', (1.2 * (0.5 + ln.amp)).toFixed(2)); ln.el.setAttribute('stroke-opacity', (0.26 * (0.4 + ln.amp * 0.6)).toFixed(2)); });
+    const skyH = h * hz;
+    windEl.style.opacity = (0.4 + ps * 0.45).toFixed(2);
+    winds.forEach((ln) => { const yy = (0.04 + ln.y * 0.9) * skyH, amp = (7 + ps * ps * 80) * ln.amp, segs = 8; let d = ''; for (let i = 0; i <= segs; i++) { const x = (i / segs) * w; const yv = yy + Math.sin(t * ln.speed + ln.phase + i * 0.6) * amp + Math.sin(t * 0.5 * ln.speed + i * 0.3) * amp * 0.4; d += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + yv.toFixed(1) + ' '; } ln.el.setAttribute('d', d); ln.el.setAttribute('stroke-width', (1.2 * (0.5 + ln.amp)).toFixed(2)); ln.el.setAttribute('stroke-opacity', (0.26 * (0.4 + ln.amp * 0.6)).toFixed(2)); });
+    // The sea: a slow swell at rest that turns choppy under pressure (drifts slower than the wind).
+    const seaH = h * (1 - hz), tw = t * 0.5;
+    waves.forEach((wv) => { const yy = wv.y * seaH, amp = (3 + ps * ps * 20) * wv.amp, segs = 10; let d = ''; for (let i = 0; i <= segs; i++) { const x = (i / segs) * w; const yv = yy + Math.sin(tw * wv.speed + wv.phase + i * 0.5) * amp; d += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + yv.toFixed(1) + ' '; } wv.el.setAttribute('d', d); wv.el.setAttribute('stroke-width', wv.sw.toFixed(2)); wv.el.setAttribute('stroke-opacity', (0.5 + ps * 0.4).toFixed(2)); });
     raf = requestAnimationFrame(loop);
   }
   return { init };
@@ -766,7 +817,7 @@ const Wind = (() => {
 function makeStars() { const host = $('stars'); if (!host) return; for (let k = 0; k < 50; k++) { const s = document.createElement('i'); s.style.left = (Math.random() * 100).toFixed(2) + '%'; s.style.top = (Math.random() * 100).toFixed(2) + '%'; s.style.animationDelay = (Math.random() * 6).toFixed(2) + 's'; host.append(s); } }
 
 /* ---------- theme ---------- */
-function initTheme() { const saved = localStorage.getItem('aiolos-theme') || 'dark'; document.documentElement.setAttribute('data-theme', saved); setThemeIcon(saved); $('theme').onclick = () => { const cur = document.documentElement.getAttribute('data-theme'), next = cur === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', next); localStorage.setItem('aiolos-theme', next); setThemeIcon(next); }; }
+function initTheme() { const saved = localStorage.getItem('aiolos-theme') || 'dark'; document.documentElement.setAttribute('data-theme', saved); setThemeIcon(saved); $('theme').onclick = () => { const cur = document.documentElement.getAttribute('data-theme'), next = cur === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', next); localStorage.setItem('aiolos-theme', next); setThemeIcon(next); if (state.status) render(); }; }
 function setThemeIcon(t) { $('theme').textContent = t === 'dark' ? '☀' : '☾'; }
 
 /* ---------- boot ---------- */
@@ -774,7 +825,7 @@ window.addEventListener('DOMContentLoaded', () => {
   initTheme(); applyHash();
   for (const b of document.querySelectorAll('.lens')) b.addEventListener('click', () => go(b.dataset.view));
   window.addEventListener('hashchange', () => { applyHash(); if (state.status) render(); });
-  let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { if (state.view.name === 'overview') fitHome(); }, 120); });
+  let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { if (state.view.name === 'overview') fitSky(); }, 120); });
   const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   if (!reduce) { Wind.init(); makeStars(); } else { $('wind').style.display = 'none'; }
   poll();
