@@ -10,8 +10,8 @@
 //! driven by this GPU's own temperature.
 
 use anemos::{
-    Anemos, Component, Control, Controller, Device, Inputs, OpenMode, Provenance, Report, Signal,
-    SinkState, Unit,
+    Anemos, Component, Control, Controller, Device, Driving, Inputs, OpenMode, Provenance, Report,
+    Signal, SinkState, Unit,
 };
 use nvml::{Detector, Gpu};
 use serde_json::json;
@@ -152,26 +152,64 @@ impl GpuDevice {
                         .name("rpm"),
                 );
             }
-            let control = Control {
-                needs_claim: true,
+            let fw = self.gpu.fan_speed(fan);
+            signals.push(duty_sink(
+                &fcomp,
+                &short,
+                &temp_sig,
+                temp,
+                commanded_pct,
+                fw,
                 state,
-                safe: Some(json!("auto")),
-                direction: Some("up=more-cooling".into()),
-                readback: Some(format!("{fcomp}:rpm")),
-                driven_by: vec![Provenance::new(&temp_sig).value(json!(temp)).uom("C")],
-            };
-            let mut sink = Signal::sink(format!("{fcomp}:duty"), &fcomp, "fan-duty")
-                .uom("%")
-                .range(0.0, 100.0)
-                .name("duty");
-            // Commanded duty when this process drove the fans; else the observed firmware duty.
-            if let Some(pct) = commanded_pct.or_else(|| self.gpu.fan_speed(fan)) {
-                sink = sink.value(json!(pct));
-            }
-            signals.push(sink.control(control));
+            ));
         }
         Report::ok(units, components, signals)
     }
+}
+
+/// Build a GPU fan's `duty` sink. Driven by THIS GPU's own temperature; when commanded (apply) it is
+/// CLAIMED and carries the `driving` record (CI-checked); otherwise (read-only info) it reports the
+/// firmware duty with no decision. Pure (no NVML) so the sink contract is unit-testable.
+fn duty_sink(
+    fcomp: &str,
+    short: &str,
+    temp_sig: &str,
+    temp: i32,
+    commanded_pct: Option<u32>,
+    firmware_pct: Option<u32>,
+    state: SinkState,
+) -> Signal {
+    let mut control = Control {
+        needs_claim: true,
+        state,
+        safe: Some(json!("auto")),
+        direction: Some("up=more-cooling".into()),
+        readback: Some(format!("{fcomp}:rpm")),
+        driven_by: vec![Provenance::new(short)
+            .value(json!(temp))
+            .uom("C")
+            .signal(temp_sig)],
+        driving: None,
+    };
+    let mut sink = Signal::sink(format!("{fcomp}:duty"), fcomp, "fan-duty")
+        .uom("%")
+        .range(0.0, 100.0)
+        .name("duty");
+    if let Some(pct) = commanded_pct {
+        sink = sink.value(json!(pct));
+        control.driving = Some(
+            Driving::new()
+                .kind("temperature")
+                .raw(temp as f64)
+                .input(temp as f64)
+                .uom("C")
+                .output(pct as f64)
+                .how("curve"),
+        );
+    } else if let Some(fw) = firmware_pct {
+        sink = sink.value(json!(fw));
+    }
+    sink.control(control)
 }
 
 fn gpu_unit(uuid: &str, short: &str, product: &str) -> Unit {
@@ -226,4 +264,55 @@ fn gpu_schema(
         );
     }
     (vec![gpu_unit(uuid, &short, product)], components, signals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commanded_gpu_fan_sink_satisfies_the_driving_contract() {
+        // A claimed (commanded) GPU fan sink must carry driving (input temp + output duty).
+        let s = duty_sink(
+            "GPU-x:fan0",
+            "gpu0",
+            "GPU-x:temperature:temp",
+            64,
+            Some(37),
+            None,
+            SinkState::Claimed,
+        );
+        let r = Report::ok(vec![], vec![], vec![s]);
+        assert!(
+            r.sink_contract_violations().is_empty(),
+            "a commanded GPU fan must report driving"
+        );
+        let d = r.signals[0]
+            .control
+            .as_ref()
+            .unwrap()
+            .driving
+            .as_ref()
+            .unwrap();
+        assert_eq!(d.input, Some(64.0));
+        assert_eq!(d.output, Some(37.0));
+        assert_eq!(d.kind.as_deref(), Some("temperature"));
+    }
+
+    #[test]
+    fn read_only_gpu_fan_sink_is_exempt() {
+        // Read-only info: unknown state, firmware duty, no decision — exempt from the contract.
+        let s = duty_sink(
+            "GPU-x:fan0",
+            "gpu0",
+            "t",
+            50,
+            None,
+            Some(40),
+            SinkState::Unknown,
+        );
+        assert!(Report::ok(vec![], vec![], vec![s])
+            .sink_contract_violations()
+            .is_empty());
+    }
 }

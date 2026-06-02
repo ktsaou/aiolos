@@ -26,5 +26,6 @@ pub use stdio::{install_shutdown_handlers, shutdown_requested, Event, StdinReade
 
 // Re-export the wire types so a level-3 anemos needs only `anemos` (+ its tech crates) as deps.
 pub use protocol::{
-    Component, Control, Inputs, Provenance, Report, Request, Role, Signal, SinkState, Status, Unit,
+    Component, Control, Driving, Inputs, Provenance, Report, Request, Role, Signal, SinkState,
+    Status, Unit,
 };

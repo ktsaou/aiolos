@@ -18,8 +18,8 @@ mod fault;
 mod zones;
 
 use anemos::{
-    Anemos, Component, Control, Controller, Device, ExtraCmd, Inputs, ModuleInfo, OpenMode,
-    Provenance, Report, Signal, SinkState, Unit,
+    Anemos, Component, Control, Controller, Device, Driving, ExtraCmd, Inputs, ModuleInfo,
+    OpenMode, Provenance, Report, Signal, SinkState, Unit,
 };
 use board::Board;
 use fault::FanFaultTracker;
@@ -50,22 +50,6 @@ struct Rome2dFans;
 impl Anemos for Rome2dFans {
     fn detect(&mut self) -> Report {
         let (mut components, mut signals) = (Vec::new(), Vec::new());
-        let cc = format!("{BOARD_ID}:control");
-        components.push(
-            Component::new(&cc, BOARD_ID)
-                .name("control")
-                .typed("control"),
-        );
-        signals.push(
-            Signal::producer(format!("{cc}:driving.temp"), &cc, "driving-temperature")
-                .uom("C")
-                .name("driving temperature"),
-        );
-        signals.push(
-            Signal::producer(format!("{cc}:driving.duty"), &cc, "driving-duty")
-                .uom("%")
-                .name("driving duty"),
-        );
         for i in 1..=8 {
             let fc = format!("{BOARD_ID}:fan{i}");
             components.push(
@@ -132,14 +116,8 @@ impl Device for Rome2dFansDevice {
         let (mut components, mut signals) = cpu_components(&cpu_temps);
 
         let (duty_readback, fan_rpms) = self.board.read_fan_status();
-        let (mut fc, mut fs) = fan_components(
-            &fan_rpms,
-            duty_readback.as_deref(),
-            None, // no commanded value in read-only collect
-            SinkState::Unknown,
-            &[],         // no driver provenance
-            &[false; 8], // no fault state
-        );
+        let (mut fc, mut fs) =
+            fan_components(&fan_rpms, duty_readback.as_deref(), None, &[false; 8]);
         components.append(&mut fc);
         signals.append(&mut fs);
         Report::ok(vec![board_unit()], components, signals)
@@ -221,15 +199,13 @@ impl Device for Rome2dFansDevice {
             if let Err(e) = set {
                 return Report::error(format!("set fans: {e}"));
             }
-            ApplyOutcome::uniform(commanded, raw, duty.smoothed, pct)
+            ApplyOutcome::uniform(commanded, raw, duty.smoothed)
         };
         // --- end control path -------------------------------------------------------------------
 
-        // Report stage: CPU temps + control/driving signals + the 8 fans.
+        // Report stage: REAL CPU temps (the only board temperatures) + the 8 fans, each carrying its
+        // own per-zone `driving` record. No driving-* producer signals — driving lives on the sinks.
         let (mut components, mut signals) = cpu_components(&cpu_temps);
-        let (mut cc, mut cs) = outcome.control_component();
-        components.append(&mut cc);
-        signals.append(&mut cs);
 
         // Observability read AFTER the control decision (short timeout): true per-fan duty + RPM.
         let (duty_readback, fan_rpms) = self.board.read_fan_status();
@@ -245,13 +221,11 @@ impl Device for Rome2dFansDevice {
                 );
             }
         }
-        let drivers = driven_by_for_board(gpu_max, nvme_max, cpu_max);
+        let drives = fan_drives(&outcome, gpu_max, nvme_max, cpu_max);
         let (mut fc, mut fs) = fan_components(
             &fan_rpms,
             duty_readback.as_deref(),
-            Some(&commanded),
-            SinkState::Claimed,
-            &drivers,
+            Some(&drives),
             &now_faulted,
         );
         components.append(&mut fc);
@@ -317,14 +291,87 @@ fn cpu_components(cpu_temps: &[(String, i32)]) -> (Vec<Component>, Vec<Signal>) 
     (components, signals)
 }
 
-/// Build the `fan1..fan8` components: an `rpm` producer (when readable) + a `duty` sink. `commanded`
-/// is the per-fan duty when this process drove the fans (else the firmware-readback duty is used).
+/// The per-fan control decision: what drove this fan (`driven_by`) + the generic `driving` record.
+struct FanDrive {
+    driven_by: Vec<Provenance>,
+    driving: Driving,
+}
+
+fn prov(name: &str, v: Option<i32>) -> Option<Provenance> {
+    v.map(|x| Provenance::new(name).value(json!(x)).uom("C"))
+}
+
+/// Per-fan driving from the tick's outcome: uniform → every fan driven by max(gpu,nvme,cpu); zone →
+/// CPU fans (FAN1/2) by CPU temp, case fans (FAN3–8) by the routed (GPU/NVMe) max. Accurate per fan.
+fn fan_drives(
+    outcome: &ApplyOutcome,
+    gpu_max: Option<i32>,
+    nvme_max: Option<i32>,
+    cpu_max: Option<i32>,
+) -> [FanDrive; 8] {
+    let gpu = prov("gpu (max)", gpu_max);
+    let nvme = prov("nvme (max)", nvme_max);
+    let cpu = prov("cpu (max)", cpu_max);
+    match outcome {
+        ApplyOutcome::Uniform {
+            commanded,
+            raw,
+            smoothed,
+            ..
+        } => std::array::from_fn(|i| FanDrive {
+            driven_by: [gpu.clone(), nvme.clone(), cpu.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+            driving: Driving::new()
+                .kind("temperature")
+                .raw(*raw as f64)
+                .input(*smoothed as f64)
+                .uom("C")
+                .output(commanded[i] as f64)
+                .how("uniform: max(gpu,nvme,cpu)→curve"),
+        }),
+        ApplyOutcome::Zone {
+            commanded,
+            cpu_raw,
+            case_raw,
+            cpu_smoothed,
+            case_smoothed,
+        } => std::array::from_fn(|i| {
+            if i < 2 {
+                FanDrive {
+                    driven_by: [cpu.clone()].into_iter().flatten().collect(),
+                    driving: Driving::new()
+                        .kind("temperature")
+                        .raw(*cpu_raw as f64)
+                        .input(*cpu_smoothed as f64)
+                        .uom("C")
+                        .output(commanded[i] as f64)
+                        .how("zone:cpu"),
+                }
+            } else {
+                FanDrive {
+                    driven_by: [gpu.clone(), nvme.clone()].into_iter().flatten().collect(),
+                    driving: Driving::new()
+                        .kind("temperature")
+                        .raw(*case_raw as f64)
+                        .input(*case_smoothed as f64)
+                        .uom("C")
+                        .output(commanded[i] as f64)
+                        .how("zone:case"),
+                }
+            }
+        }),
+    }
+}
+
+/// Build the `fan1..fan8` components: an `rpm` producer + a `duty` sink. `drives` present => aiolos
+/// commands the fans (claimed, value = decision output, driving attached); `None` => read-only info
+/// (firmware readback, no decision).
 fn fan_components(
     fan_rpms: &[(String, Option<i32>)],
     duty_readback: Option<&[u8]>,
-    commanded: Option<&[u32; 8]>,
-    state: SinkState,
-    drivers: &[Provenance],
+    drives: Option<&[FanDrive; 8]>,
     faulted: &[bool; 8],
 ) -> (Vec<Component>, Vec<Signal>) {
     let mut components = Vec::new();
@@ -345,29 +392,43 @@ fn fan_components(
                     .name("rpm"),
             );
         }
-        // Sink value: the commanded duty if we drove it, else the firmware readback.
-        let value = commanded
-            .map(|c| c[i] as i64)
-            .or_else(|| duty_readback.and_then(|d| d.get(i)).map(|&b| b as i64));
         let mut sink = Signal::sink(format!("{fc}:duty"), &fc, "fan-duty")
             .uom("%")
             .range(0.0, 100.0)
             .name("duty");
-        if let Some(v) = value {
-            sink = sink.value(json!(v));
-        }
         if faulted[i] {
             sink = sink.label("fault", "true");
         }
-        sink = sink.control(Control {
-            needs_claim: true,
-            state,
-            safe: Some(json!("auto")),
-            direction: Some("up=more-cooling".into()),
-            readback: Some(format!("{fc}:rpm")),
-            driven_by: drivers.to_vec(),
-        });
-        signals.push(sink);
+        let control = match drives {
+            Some(d) => {
+                let out = d[i].driving.output.unwrap_or(0.0);
+                sink = sink.value(json!(out as i64));
+                Control {
+                    needs_claim: true,
+                    state: SinkState::Claimed,
+                    safe: Some(json!("auto")),
+                    direction: Some("up=more-cooling".into()),
+                    readback: Some(format!("{fc}:rpm")),
+                    driven_by: d[i].driven_by.clone(),
+                    driving: Some(d[i].driving.clone()),
+                }
+            }
+            None => {
+                if let Some(v) = duty_readback.and_then(|d| d.get(i)) {
+                    sink = sink.value(json!(*v as i64));
+                }
+                Control {
+                    needs_claim: true,
+                    state: SinkState::Unknown,
+                    safe: Some(json!("auto")),
+                    direction: Some("up=more-cooling".into()),
+                    readback: Some(format!("{fc}:rpm")),
+                    driven_by: Vec::new(),
+                    driving: None,
+                }
+            }
+        };
+        signals.push(sink.control(control));
     }
     (components, signals)
 }
@@ -378,7 +439,6 @@ enum ApplyOutcome {
         commanded: [u32; 8],
         raw: i32,
         smoothed: i32,
-        pct: u32,
     },
     Zone {
         commanded: [u32; 8],
@@ -390,12 +450,11 @@ enum ApplyOutcome {
 }
 
 impl ApplyOutcome {
-    fn uniform(commanded: [u32; 8], raw: i32, smoothed: i32, pct: u32) -> Self {
+    fn uniform(commanded: [u32; 8], raw: i32, smoothed: i32) -> Self {
         ApplyOutcome::Uniform {
             commanded,
             raw,
             smoothed,
-            pct,
         }
     }
     fn zone(
@@ -419,114 +478,6 @@ impl ApplyOutcome {
                 *commanded
             }
         }
-    }
-    /// The `control` component + its driving-decision producer signals (mode-specific fields).
-    fn control_component(&self) -> (Vec<Component>, Vec<Signal>) {
-        let cc = format!("{BOARD_ID}:control");
-        let comp = Component::new(&cc, BOARD_ID)
-            .name("control")
-            .typed("control");
-        let p = |id: &str, kind: &str, name: &str, v: serde_json::Value, uom: Option<&str>| {
-            let mut s = Signal::producer(format!("{cc}:{id}"), &cc, kind)
-                .value(v)
-                .name(name);
-            if let Some(u) = uom {
-                s = s.uom(u);
-            }
-            s
-        };
-        let signals = match self {
-            ApplyOutcome::Uniform {
-                raw, smoothed, pct, ..
-            } => vec![
-                p(
-                    "driving.mode",
-                    "driving-mode",
-                    "driving mode",
-                    json!("uniform"),
-                    None,
-                ),
-                p(
-                    "driving.temp",
-                    "driving-temperature",
-                    "driving temperature",
-                    json!(smoothed),
-                    Some("C"),
-                ),
-                p(
-                    "driving.raw",
-                    "driving-raw-temperature",
-                    "raw driving temperature",
-                    json!(raw),
-                    Some("C"),
-                ),
-                p(
-                    "driving.duty",
-                    "driving-duty",
-                    "driving duty",
-                    json!(pct),
-                    Some("%"),
-                ),
-            ],
-            ApplyOutcome::Zone {
-                cpu_raw,
-                case_raw,
-                cpu_smoothed,
-                case_smoothed,
-                commanded,
-            } => vec![
-                p(
-                    "driving.mode",
-                    "driving-mode",
-                    "driving mode",
-                    json!("zone"),
-                    None,
-                ),
-                p(
-                    "driving.cpu.raw",
-                    "driving-raw-temperature",
-                    "cpu raw driving temperature",
-                    json!(cpu_raw),
-                    Some("C"),
-                ),
-                p(
-                    "driving.cpu.temp",
-                    "driving-temperature",
-                    "cpu driving temperature",
-                    json!(cpu_smoothed),
-                    Some("C"),
-                ),
-                p(
-                    "driving.cpu.duty",
-                    "driving-duty",
-                    "cpu driving duty",
-                    json!(commanded[0]),
-                    Some("%"),
-                ),
-                p(
-                    "driving.case.raw",
-                    "driving-raw-temperature",
-                    "case raw driving temperature",
-                    json!(case_raw),
-                    Some("C"),
-                ),
-                p(
-                    "driving.case.temp",
-                    "driving-temperature",
-                    "case driving temperature",
-                    json!(case_smoothed),
-                    Some("C"),
-                ),
-                p(
-                    "driving.case.duty",
-                    "driving-duty",
-                    "case driving duty",
-                    json!(commanded[2]),
-                    Some("%"),
-                ),
-            ],
-        };
-        (vec![comp], signals)
     }
 }
 
@@ -579,24 +530,6 @@ fn slug(label: &str) -> String {
         .collect::<String>()
         .trim_matches('_')
         .to_string()
-}
-
-fn driven_by_for_board(
-    gpu_max: Option<i32>,
-    nvme_max: Option<i32>,
-    cpu_max: Option<i32>,
-) -> Vec<Provenance> {
-    let mut out = Vec::new();
-    if let Some(v) = gpu_max {
-        out.push(Provenance::new("nvidia (max)").value(json!(v)).uom("C"));
-    }
-    if let Some(v) = nvme_max {
-        out.push(Provenance::new("nvme (max)").value(json!(v)).uom("C"));
-    }
-    if let Some(v) = cpu_max {
-        out.push(Provenance::new("self:cpu (max)").value(json!(v)).uom("C"));
-    }
-    out
 }
 
 /// Extract every temperature value from ALL routed peer inputs (source-agnostic; the driving max).
@@ -689,54 +622,57 @@ mod tests {
     }
 
     #[test]
-    fn uniform_control_component_reports_one_curve_decision() {
-        let o = ApplyOutcome::uniform([60; 8], 70, 68, 60);
-        assert_eq!(o.commanded(), [60; 8]);
-        let (_c, s) = o.control_component();
-        let val = |id: &str| {
-            s.iter()
-                .find(|x| x.id.ends_with(id))
-                .and_then(|x| x.value.clone())
-        };
-        assert_eq!(val("driving.mode"), Some(json!("uniform")));
-        assert_eq!(val("driving.duty"), Some(json!(60)));
-        assert_eq!(val("driving.raw"), Some(json!(70)));
+    fn uniform_fan_drives_carry_one_curve_decision_on_every_fan() {
+        let o = ApplyOutcome::uniform([60; 8], 70, 68);
+        let d = fan_drives(&o, Some(64), Some(50), Some(45));
+        for fd in &d {
+            assert_eq!(fd.driving.output, Some(60.0));
+            assert_eq!(fd.driving.raw, Some(70.0));
+            assert_eq!(fd.driving.input, Some(68.0));
+            assert_eq!(fd.driving.kind.as_deref(), Some("temperature"));
+            // every fan is driven by all three routed sources.
+            assert_eq!(fd.driven_by.len(), 3);
+        }
     }
 
     #[test]
-    fn zone_control_component_reports_both_zones() {
+    fn zone_fan_drives_split_cpu_and_case() {
         let commanded = zones::per_fan_duties(30, 75);
         let o = ApplyOutcome::zone(commanded, 55, 72, 54, 70);
-        assert_eq!(o.commanded(), [30, 30, 75, 75, 75, 75, 75, 75]);
-        let (_c, s) = o.control_component();
-        let val = |id: &str| {
-            s.iter()
-                .find(|x| x.id.ends_with(id))
-                .and_then(|x| x.value.clone())
-        };
-        assert_eq!(val("driving.mode"), Some(json!("zone")));
-        assert_eq!(val("driving.cpu.duty"), Some(json!(30)));
-        assert_eq!(val("driving.case.duty"), Some(json!(75)));
+        let d = fan_drives(&o, Some(64), Some(50), Some(55));
+        // FAN1/2 = cpu zone, driven by cpu only.
+        assert_eq!(d[0].driving.output, Some(30.0));
+        assert_eq!(d[0].driving.input, Some(54.0));
+        assert_eq!(d[0].driving.how.as_deref(), Some("zone:cpu"));
+        assert_eq!(d[0].driven_by.len(), 1);
+        // FAN3 = case zone, driven by gpu+nvme.
+        assert_eq!(d[2].driving.output, Some(75.0));
+        assert_eq!(d[2].driving.input, Some(70.0));
+        assert_eq!(d[2].driving.how.as_deref(), Some("zone:case"));
+        assert_eq!(d[2].driven_by.len(), 2);
     }
 
     #[test]
-    fn zone_control_reflects_a_case_fan_boost() {
+    fn zone_fan_drives_reflect_a_case_fan_boost() {
         let base = zones::per_fan_duties(30, 60);
         let mut confirmed = [false; 8];
         confirmed[4] = true;
         let commanded = fault::compensate(base, &confirmed);
         let o = ApplyOutcome::zone(commanded, 50, 65, 50, 64);
-        let (_c, s) = o.control_component();
-        let val = |id: &str| {
-            s.iter()
-                .find(|x| x.id.ends_with(id))
-                .and_then(|x| x.value.clone())
-        };
-        assert_eq!(val("driving.case.duty"), Some(json!(100)));
-        assert_eq!(
-            val("driving.cpu.duty"),
-            Some(json!(30)),
-            "CPU zone unaffected"
-        );
+        let d = fan_drives(&o, Some(60), Some(40), Some(50));
+        assert_eq!(d[2].driving.output, Some(100.0), "case fans boosted");
+        assert_eq!(d[0].driving.output, Some(30.0), "CPU zone unaffected");
+    }
+
+    #[test]
+    fn every_claimed_board_sink_satisfies_the_driving_contract() {
+        // The fan sinks aiolos commands must all carry a complete driving record (CI contract).
+        let o = ApplyOutcome::uniform([55; 8], 66, 64);
+        let drives = fan_drives(&o, Some(64), Some(50), Some(45));
+        let rpms: Vec<(String, Option<i32>)> =
+            (1..=8).map(|n| (format!("FAN{n}"), Some(1200))).collect();
+        let (components, signals) = fan_components(&rpms, None, Some(&drives), &[false; 8]);
+        let report = Report::ok(vec![board_unit()], components, signals);
+        assert!(report.sink_contract_violations().is_empty());
     }
 }

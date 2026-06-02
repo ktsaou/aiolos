@@ -165,23 +165,28 @@ pub enum SinkState {
     Unknown,
 }
 
-/// One driver of a sink: which producer signal contributed, and its value (for "what drives what").
+/// One driver of a sink (an input that contributed to the decision): a human `name`, its value, and
+/// — when known — the source signal id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Provenance {
-    /// The source producer signal's stable `id`.
-    pub signal: String,
+    /// Human label for this driver (e.g. `gpu0`, `cpu`, `max(gpu,nvme)`). Shown in the UI.
+    pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uom: Option<String>,
+    /// The source producer signal's stable `id`, when this driver maps to a single signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
 }
 
 impl Provenance {
-    pub fn new(signal: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Provenance {
-            signal: signal.into(),
+            name: name.into(),
             value: None,
             uom: None,
+            signal: None,
         }
     }
     pub fn value(mut self, value: impl Into<Value>) -> Self {
@@ -190,6 +195,66 @@ impl Provenance {
     }
     pub fn uom(mut self, uom: impl Into<String>) -> Self {
         self.uom = Some(uom.into());
+        self
+    }
+    pub fn signal(mut self, signal: impl Into<String>) -> Self {
+        self.signal = Some(signal.into());
+        self
+    }
+}
+
+/// The actual control decision behind a sink's current value — a GENERIC, domain-agnostic record of
+/// "what is driving this output". Required on every **claimed** sink (CI-checked) so a fan duty, a
+/// power cap, anything aiolos commands, uniformly reports how it was decided:
+/// inputs (`driven_by`) → reduce (`raw`) → smooth (`input`) → curve/policy → `output`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Driving {
+    /// The semantic type of the driving input (open tag): `temperature`, `power-runtime`, …
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The raw reduced input (e.g. `max` of the source temps) before smoothing/deadband.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<f64>,
+    /// The effective input value fed to the curve/policy (e.g. the EMA-smoothed temperature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<f64>,
+    /// Unit of measure of `raw`/`input` (e.g. `C`, `s`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uom: Option<String>,
+    /// The commanded output value this decision produced (mirrors the sink's `value`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<f64>,
+    /// How inputs were reduced / the policy applied: `max`, `uniform`, `zone:cpu`, `policy:on-battery`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub how: Option<String>,
+}
+
+impl Driving {
+    pub fn new() -> Self {
+        Driving::default()
+    }
+    pub fn kind(mut self, v: impl Into<String>) -> Self {
+        self.kind = Some(v.into());
+        self
+    }
+    pub fn raw(mut self, v: f64) -> Self {
+        self.raw = Some(v);
+        self
+    }
+    pub fn input(mut self, v: f64) -> Self {
+        self.input = Some(v);
+        self
+    }
+    pub fn uom(mut self, v: impl Into<String>) -> Self {
+        self.uom = Some(v.into());
+        self
+    }
+    pub fn output(mut self, v: f64) -> Self {
+        self.output = Some(v);
+        self
+    }
+    pub fn how(mut self, v: impl Into<String>) -> Self {
+        self.how = Some(v.into());
         self
     }
 }
@@ -215,6 +280,10 @@ pub struct Control {
     /// What drove the current value (provenance / "what drives what").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub driven_by: Vec<Provenance>,
+    /// The control decision behind the current value. REQUIRED on a claimed sink (CI-checked): every
+    /// sink aiolos actually drives must report how it was decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driving: Option<Driving>,
 }
 
 /// The atom: a producer (read-only) or sink (controllable) within a component.
@@ -435,6 +504,32 @@ impl Report {
     pub fn from_line(line: &str) -> serde_json::Result<Self> {
         serde_json::from_str(line)
     }
+
+    /// The SINK CONTRACT (CI-enforced): every sink aiolos actually drives — `role == Sink` AND
+    /// `control.state == Claimed` — MUST carry a `control.driving` record with at least the driving
+    /// input and the produced output. Returns the ids of any sinks that violate it (empty = ok).
+    /// Released/unknown sinks are exempt (aiolos is not driving them, so there is no decision).
+    pub fn sink_contract_violations(&self) -> Vec<String> {
+        self.signals
+            .iter()
+            .filter(|s| s.role == Role::Sink)
+            .filter(|s| {
+                s.control
+                    .as_ref()
+                    .map(|c| c.state == SinkState::Claimed)
+                    .unwrap_or(false)
+            })
+            .filter(|s| {
+                let driving = s.control.as_ref().and_then(|c| c.driving.as_ref());
+                match driving {
+                    // A claimed sink must declare what drives it (an input) and what it produced.
+                    Some(d) => d.input.is_none() || d.output.is_none(),
+                    None => true,
+                }
+            })
+            .map(|s| s.id.clone())
+            .collect()
+    }
 }
 
 /// Optional one-line greeting a module may emit once at startup (the only unsolicited line).
@@ -548,9 +643,18 @@ mod tests {
                 safe: Some(json!("auto")),
                 direction: Some("up=more-cooling".into()),
                 readback: Some("nvml:GPU-1:fan0:rpm".into()),
-                driven_by: vec![Provenance::new("nvml:GPU-1:temperature:temp")
+                driven_by: vec![Provenance::new("gpu0")
                     .value(json!(27))
-                    .uom("C")],
+                    .uom("C")
+                    .signal("nvml:GPU-1:temperature:temp")],
+                driving: Some(
+                    Driving::new()
+                        .kind("temperature")
+                        .input(27.0)
+                        .uom("C")
+                        .output(32.0)
+                        .how("curve"),
+                ),
             });
         let report = Report::ok(
             vec![Unit::new("nvml:GPU-1").name("gpu0")],
@@ -573,7 +677,36 @@ mod tests {
         let ctrl = s.control.as_ref().unwrap();
         assert_eq!(ctrl.state, SinkState::Claimed);
         assert!(ctrl.needs_claim);
-        assert_eq!(ctrl.driven_by[0].signal, "nvml:GPU-1:temperature:temp");
+        assert_eq!(ctrl.driven_by[0].name, "gpu0");
+        assert_eq!(
+            ctrl.driven_by[0].signal.as_deref(),
+            Some("nvml:GPU-1:temperature:temp")
+        );
+        assert_eq!(ctrl.driving.as_ref().unwrap().output, Some(32.0));
+        // The claimed sink satisfies the contract.
+        assert!(back.sink_contract_violations().is_empty());
+    }
+
+    #[test]
+    fn sink_contract_flags_a_claimed_sink_without_driving() {
+        // A claimed sink that omits driving (or omits input/output) violates the contract.
+        let bad = Signal::sink("u:c:duty", "u:c", "fan-duty")
+            .value(json!(40))
+            .control(Control {
+                state: SinkState::Claimed,
+                ..Default::default()
+            });
+        let r = Report::ok(vec![], vec![], vec![bad]);
+        assert_eq!(r.sink_contract_violations(), vec!["u:c:duty".to_string()]);
+
+        // A released sink is exempt (aiolos is not driving it).
+        let released = Signal::sink("u:c:duty2", "u:c", "fan-duty").control(Control {
+            state: SinkState::Released,
+            ..Default::default()
+        });
+        assert!(Report::ok(vec![], vec![], vec![released])
+            .sink_contract_violations()
+            .is_empty());
     }
 
     #[test]

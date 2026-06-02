@@ -119,7 +119,7 @@ function buildUnits(status) {
     const c = comps[s.component]; if (!c) continue;
     const base = { id: s.id, label: L(s, 'name', s.id), kind: L(s, 'type', ''), value: s.value, unit: s.uom };
     if (s.role === 'sink') {
-      const sk = { ...base, state: s.control ? s.control.state : null, driven_by: s.control ? (s.control.driven_by || []) : [], safe: s.control ? s.control.safe : null };
+      const sk = { ...base, state: s.control ? s.control.state : null, driven_by: s.control ? (s.control.driven_by || []) : [], safe: s.control ? s.control.safe : null, driving: s.control ? s.control.driving : null };
       if (s.labels && s.labels.fault) sk.fault = true;
       c.sinks.push(sk);
     } else c.publishers.push(base);
@@ -521,8 +521,14 @@ function viewFocus(key) {
         g.append(el('div', { class: 'rrow' }, [sizeIcon(kindIcon(p.kind, p.value), 18), el('div', { text: String(p.label || p.id) }), el('div', { class: 'rv', html: `${escapeHtml(String(p.value))}${p.unit ? `<span class="ru">${escapeHtml(p.unit)}</span>` : ''}` })]));
       }
       for (const s of (c.sinks || [])) {
-        const by = (s.driven_by || []).map(x => `${x.from}${x.value != null ? ' ' + fmt(Number(x.value)) + (x.unit || '°') : ''}`).join('  ·  ');
+        const by = (s.driven_by || []).map(x => `${x.name}${x.value != null ? ' ' + fmt(Number(x.value)) + (x.uom || '°') : ''}`).join('  ·  ');
         g.append(el('div', { class: 'rrow' }, [sizeIcon(kindIcon('fan-duty', s.value), 18), el('div', { text: s.label || s.id }), el('div', { class: 'rv' }, [s.value != null ? String(s.value) : '–', s.unit ? el('span', { class: 'ru', text: s.unit }) : null, el('span', { class: 'statepill ' + (s.state || 'unknown').toLowerCase(), text: s.state || 'unknown' })])]));
+        const d = s.driving;
+        if (d && (d.input != null || d.output != null)) {
+          const inp = d.input != null ? `${fmt(Number(d.input))}${d.uom || ''}` : '?';
+          const out = d.output != null ? `${fmt(Number(d.output))}${s.unit || ''}` : '?';
+          g.append(el('div', { class: 'lineage' }, [el('span', { class: 'lh', text: 'driving' }), `${inp} → ${out}${d.how ? '  (' + d.how + ')' : ''}`]));
+        }
         if (by) g.append(el('div', { class: 'lineage' }, [el('span', { class: 'lh', text: 'driven by' }), by]));
       }
       readings.append(g);
@@ -665,7 +671,8 @@ function viewLaw() {
 }
 function moduleOperatingPoint(module) {
   const us = moduleUnits(module);
-  for (const u of us) for (const c of u.components) { let raw = null, temp = null, pct = null; for (const p of c.publishers) { if (p.kind === 'driving-raw-temperature') raw = pnum(p); else if (p.kind === 'driving-temperature') temp = pnum(p); else if (p.kind === 'driving-duty') pct = pnum(p); } if (temp != null || raw != null) return { temp: raw != null ? raw : temp, pct }; }
+  // The operating point now lives on the sinks' driving record (input temp → output duty).
+  for (const u of us) for (const c of u.components) for (const s of (c.sinks || [])) { const d = s.driving; if (d && d.input != null) return { temp: d.raw != null ? d.raw : d.input, pct: d.output }; }
   let temp = null, pct = null; for (const u of us) { const a = unitCtx(u); if (a.temp != null) temp = Math.max(temp ?? -1e9, a.temp); if (a.duty != null) pct = Math.max(pct ?? -1e9, a.duty); } return { temp: temp === -1e9 ? null : temp, pct: pct === -1e9 ? null : pct };
 }
 async function fetchCurve(name) { if (state.curveCache[name] && Date.now() - state.curveCache[name]._t < 15000) return state.curveCache[name]; try { const c = await fetch('/curve.json?module=' + encodeURIComponent(name), { cache: 'no-store' }).then(r => r.json()); c._t = Date.now(); state.curveCache[name] = c; return c; } catch (e) { return { available: false, points: [] }; } }

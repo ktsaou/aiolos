@@ -189,6 +189,15 @@ Decisions agreed by the user 2026-06-01 (numbered for the record):
 4. **D4 — Naming (yes):** `uom` for unit-of-measure (distinct from the `unit` entity); reserved labels
    `type`, `name`, `description` at every level; `role` (producer|sink) + control metadata stay typed
    fields, not labels.
+5. **D5 — Sink driving contract (2026-06-02, user: "generic and accurately represent what is actually
+   happening"):** every sink carries `control.driving` — a GENERIC record of the control decision
+   (`type`/`raw`/`input`/`uom`/`output`/`how`), NOT a per-module producer signal. This fixes three
+   reported defects: (a) a unit's *driving* temperature was being shown as the unit's *own*
+   temperature (now there are no `driving-*` producers, so a unit's temp is its real max sensor);
+   (b) driving was non-uniform (GPUs had none) — now every sink (GPU fan, board fan, power cap)
+   reports it; (c) `driven_by` gained a human `name`, ending the UI's "undefined 67°". **CI-locked:**
+   `Report::sink_contract_violations()` flags any claimed sink missing `driving.input`/`output`, with
+   per-anemos tests (protocol + nvidia + rome2d + it87) so a regression fails the build.
 
 Schema (the agreed shape; authoritative for step 1):
 ```jsonc

@@ -15,8 +15,8 @@
 mod config;
 
 use anemos::{
-    Anemos, Component, Control, Controller, CurveCache, Device, Inputs, ModuleInfo, OpenMode,
-    Provenance, Report, Signal, SinkState, Unit,
+    Anemos, Component, Control, Controller, CurveCache, Device, Driving, Inputs, ModuleInfo,
+    OpenMode, Provenance, Report, Signal, SinkState, Unit,
 };
 use config::It87Config;
 use serde_json::json;
@@ -43,22 +43,6 @@ impl Anemos for It87 {
         match hwmon::chip_path(&cfg.chip) {
             Some(_) => {
                 let (mut components, mut signals) = (Vec::new(), Vec::new());
-                let cc = format!("{BOARD_ID}:control");
-                components.push(
-                    Component::new(&cc, BOARD_ID)
-                        .name("control")
-                        .typed("control"),
-                );
-                signals.push(
-                    Signal::producer(format!("{cc}:driving.temp"), &cc, "driving-temperature")
-                        .uom("C")
-                        .name("driving temperature"),
-                );
-                signals.push(
-                    Signal::producer(format!("{cc}:driving.duty"), &cc, "driving-duty")
-                        .uom("%")
-                        .name("driving duty"),
-                );
                 for ch in cfg.managed_channels() {
                     let fc = format!("{BOARD_ID}:fan{ch}");
                     components.push(
@@ -215,7 +199,7 @@ impl Device for It87Device {
             .get_or_insert_with(|| Zones::for_main_path(ctrl.path()));
         let zone_mode = zones.both_present();
 
-        let (commanded, driving) = if zone_mode {
+        let (commanded, decision) = if zone_mode {
             let (Some(cpu_raw), Some(case_raw)) = (cpu_max, case_raw_opt) else {
                 zones.cpu.reset();
                 zones.case.reset();
@@ -240,13 +224,11 @@ impl Device for It87Device {
             let commanded = self.commanded_zone(cpu_pct, case_pct);
             (
                 commanded,
-                Driving::Zone {
+                Decision::Zone {
                     cpu_raw,
                     cpu_smoothed: cpu_duty.smoothed,
-                    cpu_pct,
                     case_raw,
                     case_smoothed: case_duty.smoothed,
-                    case_pct,
                 },
             )
         } else {
@@ -267,10 +249,9 @@ impl Device for It87Device {
                 .collect();
             (
                 commanded,
-                Driving::Uniform {
+                Decision::Uniform {
                     raw,
                     smoothed: duty.smoothed,
-                    pct,
                 },
             )
         };
@@ -283,10 +264,9 @@ impl Device for It87Device {
         }
         // --- end control path -------------------------------------------------------------------
 
+        // Real CPU temps (the only board temperatures) + the managed fans, each carrying its own
+        // per-zone `driving` record on the sink. No driving-* producer signals.
         let (mut components, mut signals) = cpu_component(&cpu_temps);
-        let (mut cc, mut cs) = driving.control_component();
-        components.append(&mut cc);
-        signals.append(&mut cs);
         for &(ch, pct) in &commanded {
             let fc = format!("{BOARD_ID}:fan{ch}");
             components.push(
@@ -302,6 +282,7 @@ impl Device for It87Device {
                         .name("rpm"),
                 );
             }
+            let cpu_zone = self.cfg.cpu_channels.contains(&ch);
             signals.push(
                 Signal::sink(format!("{fc}:duty"), &fc, "fan-duty")
                     .value(json!(pct))
@@ -317,6 +298,7 @@ impl Device for It87Device {
                         driven_by: driven_by_for_channel(
                             ch, &self.cfg, gpu_max, cpu_max, zone_mode,
                         ),
+                        driving: Some(decision.driving_for(cpu_zone, pct)),
                     }),
             );
         }
@@ -412,128 +394,52 @@ fn cpu_component(cpu_temps: &[(String, i32)]) -> (Vec<Component>, Vec<Signal>) {
 }
 
 /// The control decision carried to the report stage.
-enum Driving {
+enum Decision {
     Uniform {
         raw: i32,
         smoothed: i32,
-        pct: u32,
     },
     Zone {
         cpu_raw: i32,
         cpu_smoothed: i32,
-        cpu_pct: u32,
         case_raw: i32,
         case_smoothed: i32,
-        case_pct: u32,
     },
 }
 
-impl Driving {
-    fn control_component(&self) -> (Vec<Component>, Vec<Signal>) {
-        let cc = format!("{BOARD_ID}:control");
-        let comp = Component::new(&cc, BOARD_ID)
-            .name("control")
-            .typed("control");
-        let p = |id: &str, kind: &str, name: &str, v: serde_json::Value, uom: Option<&str>| {
-            let mut s = Signal::producer(format!("{cc}:{id}"), &cc, kind)
-                .value(v)
-                .name(name);
-            if let Some(u) = uom {
-                s = s.uom(u);
-            }
-            s
-        };
-        let signals = match self {
-            Driving::Uniform { raw, smoothed, pct } => vec![
-                p(
-                    "driving.mode",
-                    "driving-mode",
-                    "driving mode",
-                    json!("uniform"),
-                    None,
-                ),
-                p(
-                    "driving.temp",
-                    "driving-temperature",
-                    "driving temperature",
-                    json!(smoothed),
-                    Some("C"),
-                ),
-                p(
-                    "driving.raw",
-                    "driving-raw-temperature",
-                    "raw driving temperature",
-                    json!(raw),
-                    Some("C"),
-                ),
-                p(
-                    "driving.duty",
-                    "driving-duty",
-                    "driving duty",
-                    json!(pct),
-                    Some("%"),
-                ),
-            ],
-            Driving::Zone {
+impl Decision {
+    /// The generic `driving` record for one managed channel: uniform → max(gpu,cpu); zone → CPU temp
+    /// for a CPU-zone channel, else max(gpu,cpu) for a case channel. `output` is the commanded duty.
+    fn driving_for(&self, cpu_zone: bool, output: u32) -> Driving {
+        match self {
+            Decision::Uniform { raw, smoothed, .. } => Driving::new()
+                .kind("temperature")
+                .raw(*raw as f64)
+                .input(*smoothed as f64)
+                .uom("C")
+                .output(output as f64)
+                .how("uniform: max(gpu,cpu)→curve"),
+            Decision::Zone {
                 cpu_raw,
                 cpu_smoothed,
-                cpu_pct,
                 case_raw,
                 case_smoothed,
-                case_pct,
-            } => vec![
-                p(
-                    "driving.mode",
-                    "driving-mode",
-                    "driving mode",
-                    json!("zone"),
-                    None,
-                ),
-                p(
-                    "driving.cpu.raw",
-                    "driving-raw-temperature",
-                    "cpu raw driving temperature",
-                    json!(cpu_raw),
-                    Some("C"),
-                ),
-                p(
-                    "driving.cpu.temp",
-                    "driving-temperature",
-                    "cpu driving temperature",
-                    json!(cpu_smoothed),
-                    Some("C"),
-                ),
-                p(
-                    "driving.cpu.duty",
-                    "driving-duty",
-                    "cpu driving duty",
-                    json!(cpu_pct),
-                    Some("%"),
-                ),
-                p(
-                    "driving.case.raw",
-                    "driving-raw-temperature",
-                    "case raw driving temperature",
-                    json!(case_raw),
-                    Some("C"),
-                ),
-                p(
-                    "driving.case.temp",
-                    "driving-temperature",
-                    "case driving temperature",
-                    json!(case_smoothed),
-                    Some("C"),
-                ),
-                p(
-                    "driving.case.duty",
-                    "driving-duty",
-                    "case driving duty",
-                    json!(case_pct),
-                    Some("%"),
-                ),
-            ],
-        };
-        (vec![comp], signals)
+                ..
+            } => {
+                let (raw, smoothed, how) = if cpu_zone {
+                    (*cpu_raw, *cpu_smoothed, "zone:cpu")
+                } else {
+                    (*case_raw, *case_smoothed, "zone:case")
+                };
+                Driving::new()
+                    .kind("temperature")
+                    .raw(raw as f64)
+                    .input(smoothed as f64)
+                    .uom("C")
+                    .output(output as f64)
+                    .how(how)
+            }
+        }
     }
 }
 
@@ -701,5 +607,32 @@ mod tests {
         assert_eq!(input_temps_from(Some(&inputs), "nvidia"), vec![63]);
         assert!(input_temps_from(Some(&inputs), "nv").is_empty());
         assert!(input_temps_from(None, "nvidia").is_empty());
+    }
+
+    #[test]
+    fn claimed_it87_sink_satisfies_the_driving_contract() {
+        let dec = Decision::Zone {
+            cpu_raw: 70,
+            cpu_smoothed: 68,
+            case_raw: 60,
+            case_smoothed: 58,
+        };
+        let cpu = dec.driving_for(true, 40);
+        assert_eq!(cpu.input, Some(68.0));
+        assert_eq!(cpu.output, Some(40.0));
+        assert_eq!(cpu.how.as_deref(), Some("zone:cpu"));
+        let case = dec.driving_for(false, 75);
+        assert_eq!(case.input, Some(58.0));
+        assert_eq!(case.how.as_deref(), Some("zone:case"));
+        let sink = Signal::sink("board:fan1:duty", "board:fan1", "fan-duty")
+            .value(json!(40))
+            .control(Control {
+                state: SinkState::Claimed,
+                driving: Some(cpu),
+                ..Default::default()
+            });
+        assert!(Report::ok(vec![], vec![], vec![sink])
+            .sink_contract_violations()
+            .is_empty());
     }
 }

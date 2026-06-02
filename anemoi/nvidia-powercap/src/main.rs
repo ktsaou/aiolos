@@ -11,8 +11,8 @@ mod inputs;
 mod policy;
 
 use anemos::{
-    Anemos, Component, Control, Controller, Device, Inputs, ModuleInfo, OpenMode, Provenance,
-    Report, Signal, SinkState, Unit,
+    Anemos, Component, Control, Controller, Device, Driving, Inputs, ModuleInfo, OpenMode,
+    Provenance, Report, Signal, SinkState, Unit,
 };
 use inputs::power_signal;
 use nvml::{Detector, Gpu};
@@ -211,23 +211,40 @@ impl GpuCap {
         decision: &Decision,
         limit_mw: u32,
     ) -> Report {
-        let mut driven_by = vec![Provenance::new("nut:on_battery").value(json!(sig.on_battery))];
+        let mut driven_by = vec![Provenance::new("on battery").value(json!(sig.on_battery))];
         if let Some(rt) = sig.min_runtime_s {
-            driven_by.push(Provenance::new("nut:runtime").value(json!(rt)).uom("s"));
+            driven_by.push(Provenance::new("UPS runtime").value(json!(rt)).uom("s"));
         }
-        self.report_with(
-            limit_mw,
-            match decision {
-                Decision::Cap(r) => r.as_str(),
-                Decision::Lift => "none",
-            },
-            if self.capped {
-                SinkState::Claimed
+        let reason = match decision {
+            Decision::Cap(r) => r.as_str(),
+            Decision::Lift => "none",
+        };
+        // When capped (claimed), the limit is driven by the binding power constraint.
+        let driving = if self.capped {
+            let mut d = Driving::new()
+                .output(limit_mw as f64)
+                .how(format!("policy: {reason}"));
+            if let Some(rt) = sig.min_runtime_s {
+                d = d
+                    .kind("power-runtime")
+                    .input(rt as f64)
+                    .uom("s")
+                    .raw(rt as f64);
             } else {
-                SinkState::Released
-            },
-            driven_by,
-        )
+                d = d
+                    .kind("power-on-battery")
+                    .input(if sig.on_battery { 1.0 } else { 0.0 });
+            }
+            Some(d)
+        } else {
+            None
+        };
+        let state = if self.capped {
+            SinkState::Claimed
+        } else {
+            SinkState::Released
+        };
+        self.report_with(limit_mw, reason, state, driven_by, driving)
     }
 
     fn report_observed(&mut self, limit_mw: u32) -> Report {
@@ -242,7 +259,17 @@ impl GpuCap {
         } else {
             SinkState::Released
         };
-        self.report_with(limit_mw, "observed", state, Vec::new())
+        // Read-only: a pre-existing cap we adopted but did not decide; describe it minimally so a
+        // claimed sink still satisfies the driving contract.
+        let driving = (state == SinkState::Claimed).then(|| {
+            Driving::new()
+                .kind("power")
+                .input(limit_mw as f64)
+                .uom("mW")
+                .output(limit_mw as f64)
+                .how("adopted")
+        });
+        self.report_with(limit_mw, "observed", state, Vec::new(), driving)
     }
 
     fn report_with(
@@ -251,6 +278,7 @@ impl GpuCap {
         reason: &str,
         state: SinkState,
         driven_by: Vec<Provenance>,
+        driving: Option<Driving>,
     ) -> Report {
         let uid = self.gpu.uuid().to_string();
         let comp = format!("{uid}:power");
@@ -298,6 +326,7 @@ impl GpuCap {
                     state,
                     safe: Some(json!("default")),
                     driven_by,
+                    driving,
                     ..Default::default()
                 }),
         );
