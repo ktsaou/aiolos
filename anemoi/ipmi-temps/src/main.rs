@@ -95,9 +95,10 @@ fn board_unit() -> Unit {
 fn component_for(label: &str) -> (String, String, &'static str) {
     let up = label.to_ascii_uppercase();
     if let Some(rest) = up.strip_prefix("CPU") {
+        // BMC labels are 1-indexed (CPU1/CPU2); name the component to MATCH so the `CPU1` sensor
+        // lands in the `cpu1` group (not `cpu0`). rome2d-fans aligns its k10temp the same way.
         let n: u32 = rest.trim().parse().unwrap_or(1);
-        let idx = n.saturating_sub(1);
-        (format!("cpu{idx}"), format!("cpu{idx}"), "cpu")
+        (format!("cpu{n}"), format!("cpu{n}"), "cpu")
     } else if up.contains("DDR") || up.contains("DIMM") {
         ("dimms".into(), "dimms".into(), "dimm")
     } else if up.contains("LAN") || up.contains("NIC") {

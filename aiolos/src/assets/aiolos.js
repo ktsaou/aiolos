@@ -352,24 +352,23 @@ function onData() {
   let p = 0; for (const u of buildUnits(state.status || {})) p = Math.max(p, instPressure(unitCtx(u)));
   state.pressure = p; render();
 }
-function pressureColor(p) { return p >= 0.8 ? 'var(--bad)' : p >= 0.55 ? 'var(--warn)' : p >= 0.3 ? 'var(--accent)' : 'var(--aether)'; }
+// Continuous pressure colour (calm cyan → green → amber → red), INTERPOLATED so it eases instead of
+// jumping between buckets. The Wind loop feeds it an eased pressure for frame-smooth transitions.
+const PRESS_RAMP = [[0, '#6fd9e4'], [0.35, '#6fdca8'], [0.6, '#ecc873'], [0.8, '#f0bd55'], [1, '#f0706e']];
+function pressureColor(p) {
+  const x = clamp(p ?? 0, 0, 1);
+  if (x <= PRESS_RAMP[0][0]) return PRESS_RAMP[0][1];
+  for (let i = 1; i < PRESS_RAMP.length; i++) if (x <= PRESS_RAMP[i][0]) { const [a, ca] = PRESS_RAMP[i - 1], [b, cb] = PRESS_RAMP[i]; return mix(ca, cb, (x - a) / (b - a)); }
+  return PRESS_RAMP[PRESS_RAMP.length - 1][1];
+}
 
 /* ---------- render pipeline ---------- */
 function render() { syncChrome(); syncStage(); }
+// Per-poll chrome that is NOT pressure-smoothed: the numeric reading + the active lens. The smooth
+// pressure visuals (ring fill, aurora colour, alarm state, wind) are driven frame-by-frame by `Wind`.
 function syncChrome() {
-  const p = state.pressure, col = pressureColor(p);
-  $('pnum').textContent = Math.round(p * 100);
-  $('pnum').style.color = col;
-  // The whole page reacts to pressure: a ring fills the meter, the aurora reddens, and at high
-  // pressure the body goes into an alarm state (vignette + faster winds).
-  const root = document.documentElement.style;
-  root.setProperty('--pressure', p.toFixed(3));
-  root.setProperty('--p-col', col);
-  document.body.classList.toggle('under-pressure', p >= 0.7);
-  document.body.classList.toggle('alarm', p >= 0.85);
+  const pn = $('pnum'); if (pn) pn.textContent = Math.round((state.pressure || 0) * 100);
   for (const b of document.querySelectorAll('.lens')) b.classList.toggle('active', b.dataset.view === state.view.name);
-  let hot = null; for (const u of buildUnits(state.status || {})) { const a = unitCtx(u); if (a.maxTemp != null) hot = Math.max(hot ?? -1e9, a.maxTemp); }
-  const aur = $('aurora'); if (aur) { aur.style.setProperty('--aura', p >= 0.5 ? col : (hot != null ? tempColor(hot) : 'transparent')); aur.style.setProperty('--aura-op', (0.16 + p * 0.62).toFixed(2)); }
 }
 function unitsSig() { return flattenUnits(state.status).map(u => u.key + ':' + u.components.length).join(','); }
 function stageSig() {
@@ -381,7 +380,7 @@ function stageSig() {
 function syncStage() {
   const patchable = state.view.name === 'overview' || state.view.name === 'device';
   const sig = stageSig();
-  if (patchable && sig === state.dom.sig && state.dom.run.length) { for (const f of state.dom.run) f(); return; }
+  if (patchable && sig === state.dom.sig && state.dom.run.length) { for (const f of state.dom.run) f(); if (state.view.name === 'overview') fitHome(); return; }
   const run = []; _reg = run;
   const stage = $('stage'); stage.textContent = '';
   const v = state.view;
@@ -392,6 +391,21 @@ function syncStage() {
   else if (v.name === 'health') stage.append(viewPulse());
   _reg = null;
   state.dom = { sig: patchable ? sig : ' ', run };
+  if (v.name === 'overview') fitHome();
+}
+// Keep the home within one viewport (responsive): scale the constellation to fit the available
+// height, and pull the freed space up so the page doesn't scroll. Floors at 0.6 (then it may scroll).
+function fitHome() {
+  const c = document.querySelector('.constellation'); if (!c) return;
+  c.style.transform = 'none'; c.style.marginBottom = '';
+  const top = c.getBoundingClientRect().top;
+  const avail = window.innerHeight - top - 8, natural = c.scrollHeight;
+  if (natural <= 0) return;
+  const scale = clamp(avail / natural, 0.6, 1);
+  if (scale < 0.997) {
+    c.style.transform = `scale(${scale.toFixed(3)})`;
+    c.style.marginBottom = `-${Math.round(natural * (1 - scale))}px`;
+  }
 }
 function go(name, key) {
   state.view = { name, key: key || null };
@@ -428,7 +442,7 @@ function streamerSvg() {
   return s;
 }
 function fanPip(fan) {
-  const g = sizeIcon(fanGlyph(), 34);
+  const g = sizeIcon(fanGlyph(), 27);
   const dlabel = el('span', { class: 'fan-duty' }), rlabel = el('span', { class: 'fan-rpm' });
   const wrap = el('span', { class: 'fan-pip' }, [g, dlabel, rlabel]);
   wrap.update = (f) => {
@@ -453,7 +467,7 @@ function unitBody(u) {
   const body = el('div', { class: 'body', on: { click: () => go('device', u.key) } });
   const halo = el('div', { class: 'halo' });
   const dot = el('span', { class: 'bdot' });
-  const glyph = primaryGlyph(u); const hero = sizeIcon(glyph.el, 58); hero.classList.add('uhero');
+  const glyph = primaryGlyph(u); const hero = sizeIcon(glyph.el, 50); hero.classList.add('uhero');
   const bvalText = document.createTextNode(''), bvalUnit = el('small');
   const bval = el('div', { class: 'bval' }, [bvalText, bvalUnit]);
   const bname = el('div', { class: 'bname', text: u.inst.name || u.key });
@@ -719,14 +733,34 @@ function viewPulse() {
   logs.append(stream); bodyEl.append(logs); frag.append(bodyEl); return frag;
 }
 
-/* ---------- wind backdrop (speed-driven; paused when hidden) ---------- */
+/* ---------- wind backdrop + smooth pressure reaction (frame-driven; paused when hidden) ---------- */
 const Wind = (() => {
-  let svgEl, lines = [], raf = null, t = 0, w = 0, h = 0, running = false; const N = 22;
+  let svgEl, lines = [], raf = null, t = 0, w = 0, h = 0, running = false, ps = 0; const N = 22;
   function init() { svgEl = $('wind'); resize(); for (let k = 0; k < N; k++) { const p = svg('path', { class: 'wind-path' }); svgEl.append(p); lines.push({ el: p, y: Math.random(), phase: Math.random() * Math.PI * 2, amp: 0.4 + Math.random() * 0.8, speed: 0.5 + Math.random() }); } window.addEventListener('resize', resize); document.addEventListener('visibilitychange', () => document.hidden ? stop() : start()); start(); }
   function resize() { w = window.innerWidth; h = window.innerHeight; if (svgEl) svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`); }
   function start() { if (running) return; running = true; loop(); }
   function stop() { running = false; if (raf) cancelAnimationFrame(raf); raf = null; }
-  function loop() { if (!running) return; const p = state.pressure || 0; t += 0.006 + p * 0.045; svgEl.style.opacity = 0.7; lines.forEach((ln) => { const yy = ln.y * h, amp = (10 + p * 60) * ln.amp, segs = 8; let d = ''; for (let i = 0; i <= segs; i++) { const x = (i / segs) * w; const yv = yy + Math.sin(t * ln.speed + ln.phase + i * 0.6) * amp + Math.sin(t * 0.5 * ln.speed + i * 0.3) * amp * 0.4; d += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + yv.toFixed(1) + ' '; } ln.el.setAttribute('d', d); ln.el.setAttribute('stroke-width', (1.2 * (0.5 + ln.amp)).toFixed(2)); ln.el.setAttribute('stroke-opacity', (0.26 * (0.4 + ln.amp * 0.6)).toFixed(2)); }); raf = requestAnimationFrame(loop); }
+  function loop() {
+    if (!running) return;
+    // Ease the eased-pressure `ps` toward the live pressure so EVERY pressure visual transitions
+    // smoothly (no bucket jumps), even though pressure only updates each poll.
+    const target = state.pressure || 0;
+    ps += (target - ps) * 0.05;
+    if (Math.abs(target - ps) < 0.0008) ps = target;
+    const col = pressureColor(ps), root = document.documentElement.style;
+    root.setProperty('--pressure', ps.toFixed(3));
+    root.setProperty('--p-col', col);
+    const pn = $('pnum'); if (pn) pn.style.color = col;
+    document.body.classList.toggle('under-pressure', ps >= 0.6);
+    document.body.classList.toggle('alarm', ps >= 0.85);
+    const aur = $('aurora'); if (aur) { aur.style.setProperty('--aura', col); aur.style.setProperty('--aura-op', (0.14 + ps * 0.6).toFixed(2)); }
+    // Wind motion: a WIDE spread idle↔pressure — quadratic so calm is a near-still drift and pressure
+    // is an obvious gust (≈0.0022/frame at rest → ≈0.16/frame maxed, ~70×).
+    t += 0.0022 + ps * ps * 0.16;
+    svgEl.style.opacity = (0.4 + ps * 0.45).toFixed(2);
+    lines.forEach((ln) => { const yy = ln.y * h, amp = (7 + ps * ps * 90) * ln.amp, segs = 8; let d = ''; for (let i = 0; i <= segs; i++) { const x = (i / segs) * w; const yv = yy + Math.sin(t * ln.speed + ln.phase + i * 0.6) * amp + Math.sin(t * 0.5 * ln.speed + i * 0.3) * amp * 0.4; d += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + yv.toFixed(1) + ' '; } ln.el.setAttribute('d', d); ln.el.setAttribute('stroke-width', (1.2 * (0.5 + ln.amp)).toFixed(2)); ln.el.setAttribute('stroke-opacity', (0.26 * (0.4 + ln.amp * 0.6)).toFixed(2)); });
+    raf = requestAnimationFrame(loop);
+  }
   return { init };
 })();
 function makeStars() { const host = $('stars'); if (!host) return; for (let k = 0; k < 50; k++) { const s = document.createElement('i'); s.style.left = (Math.random() * 100).toFixed(2) + '%'; s.style.top = (Math.random() * 100).toFixed(2) + '%'; s.style.animationDelay = (Math.random() * 6).toFixed(2) + 's'; host.append(s); } }
@@ -740,6 +774,7 @@ window.addEventListener('DOMContentLoaded', () => {
   initTheme(); applyHash();
   for (const b of document.querySelectorAll('.lens')) b.addEventListener('click', () => go(b.dataset.view));
   window.addEventListener('hashchange', () => { applyHash(); if (state.status) render(); });
+  let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { if (state.view.name === 'overview') fitHome(); }, 120); });
   const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   if (!reduce) { Wind.init(); makeStars(); } else { $('wind').style.display = 'none'; }
   poll();

@@ -6,9 +6,9 @@
 //! reads CPU temps.
 //!
 //! It reports the **motherboard unit** (`id` = `board`, shared with `ipmi-temps` so the BMC temps and
-//! these fans merge into one unit): `fan1..fan8` components (an `rpm` producer + a `duty` sink each),
-//! a `cpu` component (the k10temp CPU sensors that drive the CPU fans), and a `control` component
-//! carrying the driving-decision signals.
+//! these fans merge into one unit): `fan1..fan8` components (an `rpm` producer + a `duty` sink that
+//! carries its own per-zone `driving` record), and per-socket `cpu1`/`cpu2` components from k10temp
+//! (read per instance, so they merge with `ipmi-temps`' CPU1/CPU2 package sensors).
 //!
 //! The control path (read routed temps, compute duties via curve+EMA, drive the 8 fans, fault
 //! detection, release-to-auto fail-safe) is UNCHANGED from v1 — this is a reporting refactor.
@@ -283,8 +283,15 @@ fn cpu_components() -> (Vec<Component>, Vec<Signal>) {
         if chip.temps.is_empty() {
             continue;
         }
-        let cid = format!("{BOARD_ID}:cpu{sock}");
-        components.push(Component::new(&cid, BOARD_ID).name(format!("cpu{sock}")).typed("cpu"));
+        // 1-indexed to match the BMC's CPU1/CPU2 (k10temp instance 0 = socket 0 = CPU1), so the
+        // k10temp cores merge into the same `cpu1`/`cpu2` group as `ipmi-temps`' package sensor.
+        let n = sock + 1;
+        let cid = format!("{BOARD_ID}:cpu{n}");
+        components.push(
+            Component::new(&cid, BOARD_ID)
+                .name(format!("cpu{n}"))
+                .typed("cpu"),
+        );
         for (label, t) in &chip.temps {
             signals.push(
                 Signal::producer(format!("{cid}:{}", slug(label)), &cid, "temperature")

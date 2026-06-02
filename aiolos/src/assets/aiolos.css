@@ -20,6 +20,7 @@ html[data-theme="dark"] {
   --good: #6fdca8; --warn: #f0bd55; --bad: #f0706e;
   --line: rgba(150,175,220,.12); --line-strong: rgba(165,190,235,.24);
   --wind: rgba(150,205,228,.5);
+  --ishadow: rgba(0,0,0,.45);
   color-scheme: dark;
 }
 html[data-theme="light"] {
@@ -30,6 +31,7 @@ html[data-theme="light"] {
   --good: #2f9e6f; --warn: #c2841f; --bad: #c4493f;
   --line: rgba(80,62,30,.14); --line-strong: rgba(80,62,30,.26);
   --wind: rgba(60,120,140,.34);
+  --ishadow: rgba(60,46,18,.14);
   color-scheme: light;
 }
 
@@ -107,17 +109,17 @@ body.alarm::after { animation: alarm 1.5s ease-in-out infinite; }
 .loading { color: var(--ink-soft); font-family: var(--serif); font-size: 1.3rem; padding: 6rem 1rem; text-align: center; letter-spacing: .06em; }
 
 /* ===== THE SKY (overview) — constellations of luminous bodies ===== */
-.constellation { display: flex; flex-direction: column; gap: 3rem; max-width: 1180px; margin: 0 auto; padding: 1.6rem 2rem 6rem; }
-.cluster { display: flex; flex-direction: column; align-items: center; gap: 1.1rem; }
+.constellation { display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-start; gap: .7rem 2rem; max-width: 1340px; margin: 0 auto; padding: .5rem 1.4rem 1rem; transform-origin: top center; }
+.cluster { display: flex; flex-direction: column; align-items: center; gap: .5rem; }
 .cluster-label { display: flex; align-items: center; gap: 1rem; font-family: var(--serif); font-size: .66rem;
   letter-spacing: .46em; text-transform: uppercase; color: var(--ink-faint); }
 .cluster-label::before, .cluster-label::after { content: ""; width: 64px; height: 1px;
   background: linear-gradient(90deg, transparent, var(--line-strong), transparent); }
-.bodies { display: flex; flex-wrap: wrap; justify-content: center; gap: 1rem 2.4rem; }
+.bodies { display: flex; flex-wrap: wrap; justify-content: center; gap: .4rem 1.2rem; }
 
 /* units stick to place — no bobbing; just a subtle hover lift */
-.body { position: relative; width: 232px; min-height: 196px; display: flex; flex-direction: column; align-items: center;
-  justify-content: flex-start; gap: .12rem; padding: 1.7rem .5rem 1.1rem; cursor: pointer; transition: transform var(--t); }
+.body { position: relative; width: 196px; display: flex; flex-direction: column; align-items: center;
+  justify-content: flex-start; gap: .1rem; padding: .85rem .4rem .65rem; cursor: pointer; transition: transform var(--t); }
 .body:hover { transform: translateY(-3px); }
 .body:hover .uhero { transform: scale(1.05); }
 .body:hover .bname { color: var(--accent); }
@@ -139,11 +141,11 @@ body.alarm::after { animation: alarm 1.5s ease-in-out infinite; }
 @keyframes flow { to { stroke-dashoffset: -44; } }
 
 .core { position: relative; z-index: 2; width: 96px; height: 96px; color: var(--ink); transition: transform var(--t);
-  filter: drop-shadow(0 6px 18px rgba(0,0,0,.4)); }
+  filter: drop-shadow(0 6px 18px var(--ishadow)); }
 .bname { position: relative; z-index: 2; font-family: var(--serif); font-size: 1.06rem; letter-spacing: .02em;
   color: var(--ink); text-align: center; transition: color var(--t); margin-top: .3rem; }
 .bsub { position: relative; z-index: 2; font-family: var(--mono); font-size: .58rem; letter-spacing: .06em; color: var(--ink-faint); }
-.bval { position: relative; z-index: 2; font-family: var(--serif); font-size: 2.7rem; line-height: 1; font-variant-numeric: tabular-nums; margin-top: .2rem; }
+.bval { position: relative; z-index: 2; font-family: var(--serif); font-size: 2.1rem; line-height: 1; font-variant-numeric: tabular-nums; margin-top: .1rem; }
 .bval small { font-size: 1rem; color: var(--ink-soft); margin-left: 1px; }
 .bwhisper { position: relative; z-index: 2; font-size: .64rem; letter-spacing: .04em; color: var(--ink-soft); opacity: 0; transition: opacity var(--t); height: .9rem; }
 .body:hover .bwhisper { opacity: 1; }
@@ -161,7 +163,7 @@ body.alarm::after { animation: alarm 1.5s ease-in-out infinite; }
    transform-origin IS the pivot: 50% of the view-box = the blade centre (24,24). spins in place. */
 .ic .blades { transform-box: view-box; transform-origin: 50% 50%; will-change: transform; }
 .ic .glow { filter: blur(2.5px); transition: opacity .8s ease; }
-.uhero { color: var(--ink); filter: drop-shadow(0 8px 20px rgba(0,0,0,.45)); transition: transform var(--t), color .8s ease; }
+.uhero { color: var(--ink); filter: drop-shadow(0 8px 20px var(--ishadow)); transition: transform var(--t), color .8s ease; }
 .fan-glyph { color: var(--aether); }
 .fan-glyph .duty-track { stroke: var(--line-strong); opacity: .5; }
 .fan-glyph .duty-arc { transition: stroke-dasharray .7s ease, stroke .7s ease; filter: drop-shadow(0 0 3px currentColor); }
@@ -251,12 +253,12 @@ body.alarm::after { animation: alarm 1.5s ease-in-out infinite; }
 .trace { width: 100%; height: 64px; display: block; margin-top: 1rem; }
 
 /* unit body: temperature satellites + fan pips (all fans, always) */
-.temp-row { display: flex; flex-wrap: wrap; gap: .3rem .7rem; justify-content: center; margin-top: .35rem; max-width: 230px; }
+.temp-row { display: flex; flex-wrap: wrap; gap: .25rem .6rem; justify-content: center; margin-top: .25rem; max-width: 210px; }
 .temp-chip { display: inline-flex; align-items: center; gap: .25rem; font-size: .64rem; color: var(--ink-soft); }
 .temp-chip .ic { color: var(--aether); }
 .temp-chip .tc-l { color: var(--ink-faint); letter-spacing: .03em; }
 .temp-chip b { font-family: var(--mono); font-weight: 600; }
-.fan-row { display: flex; flex-wrap: wrap; gap: .5rem .7rem; justify-content: center; margin-top: .55rem; max-width: 250px; }
+.fan-row { display: flex; flex-wrap: wrap; gap: .3rem .5rem; justify-content: center; margin-top: .35rem; max-width: 220px; }
 .fan-pip { display: inline-flex; flex-direction: column; align-items: center; gap: 0; }
 .fan-pip.claimed .duty-track { stroke: color-mix(in srgb,var(--accent) 50%,transparent); opacity: .6; }
 .fan-duty { font-family: var(--mono); font-size: .62rem; color: var(--ink); font-variant-numeric: tabular-nums; line-height: 1.1; }
