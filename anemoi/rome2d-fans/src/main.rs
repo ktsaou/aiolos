@@ -112,8 +112,7 @@ impl Device for Rome2dFansDevice {
     fn collect(&mut self, _inputs: Option<&Inputs>) -> Report {
         // Read-only snapshot for `rome2d-fans info`: local CPU sensors plus BMC duty/RPM readbacks.
         // Never claims, sets, or releases the board, so it is safe while another controller owns it.
-        let cpu_temps = hwmon::read_temps("k10temp");
-        let (mut components, mut signals) = cpu_components(&cpu_temps);
+        let (mut components, mut signals) = cpu_components();
 
         let (duty_readback, fan_rpms) = self.board.read_fan_status();
         let (mut fc, mut fs) =
@@ -203,9 +202,9 @@ impl Device for Rome2dFansDevice {
         };
         // --- end control path -------------------------------------------------------------------
 
-        // Report stage: REAL CPU temps (the only board temperatures) + the 8 fans, each carrying its
-        // own per-zone `driving` record. No driving-* producer signals — driving lives on the sinks.
-        let (mut components, mut signals) = cpu_components(&cpu_temps);
+        // Report stage: REAL CPU temps (per socket) + the 8 fans, each carrying its own per-zone
+        // `driving` record. No driving-* producer signals — driving lives on the sinks.
+        let (mut components, mut signals) = cpu_components();
 
         // Observability read AFTER the control decision (short timeout): true per-fan duty + RPM.
         let (duty_readback, fan_rpms) = self.board.read_fan_status();
@@ -272,22 +271,29 @@ fn board_unit() -> Unit {
         .typed("board")
 }
 
-/// Build the `cpu` component + its k10temp producer signals (the sensors driving the CPU fans).
-fn cpu_components(cpu_temps: &[(String, i32)]) -> (Vec<Component>, Vec<Signal>) {
-    if cpu_temps.is_empty() {
-        return (Vec::new(), Vec::new());
+/// Build per-socket `cpu0`/`cpu1` components from k10temp, read PER INSTANCE so a dual-socket board's
+/// two k10temp chips (which report identical Tctl/Tccd labels) land in DISTINCT components with unique
+/// signal ids — and so they merge with `ipmi-temps`'s `cpu0`/`cpu1` (CPU1/CPU2) instead of forming an
+/// awkward second "cpu" group with duplicate ids.
+fn cpu_components() -> (Vec<Component>, Vec<Signal>) {
+    let mut chips = hwmon::read_chip_temps(&["k10temp".to_string()]);
+    chips.sort_by(|a, b| a.instance.cmp(&b.instance)); // stable socket order
+    let (mut components, mut signals) = (Vec::new(), Vec::new());
+    for (sock, chip) in chips.iter().enumerate() {
+        if chip.temps.is_empty() {
+            continue;
+        }
+        let cid = format!("{BOARD_ID}:cpu{sock}");
+        components.push(Component::new(&cid, BOARD_ID).name(format!("cpu{sock}")).typed("cpu"));
+        for (label, t) in &chip.temps {
+            signals.push(
+                Signal::producer(format!("{cid}:{}", slug(label)), &cid, "temperature")
+                    .value(json!(t))
+                    .uom("C")
+                    .name(label.clone()),
+            );
+        }
     }
-    let cid = format!("{BOARD_ID}:cpu");
-    let components = vec![Component::new(&cid, BOARD_ID).name("cpu").typed("cpu")];
-    let signals = cpu_temps
-        .iter()
-        .map(|(label, t)| {
-            Signal::producer(format!("{cid}:{}", slug(label)), &cid, "temperature")
-                .value(json!(t))
-                .uom("C")
-                .name(label.clone())
-        })
-        .collect();
     (components, signals)
 }
 

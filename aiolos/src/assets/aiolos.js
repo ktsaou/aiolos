@@ -501,8 +501,10 @@ function viewFocus(key) {
   const core = sizeIcon(deviceIcon(u0.type, unitCtx(u0)), 150); core.classList.add('core');
   const fvalText = document.createTextNode(''), fvalUnit = el('small');
   const fval = el('div', { class: 'fval' }, [fvalText, fvalUnit]);
-  hero.append(halo, core, fval, el('div', { class: 'fname', text: i.name || u0.key }), el('div', { class: 'fsub', text: `${i.module}:${i.id} · ${className(u0.type)} · ${i.status}` }));
-  hero.append(el('div', {}, [traceSvg(i.module + ':' + i.id, 'var(--aether)')]));
+  // A unit is assembled and has no single module; describe it by its sources + type + status.
+  const fsub = [i.description, className(u0.type), (u0.sources || []).join(' + '), i.status].filter(Boolean).join(' · ');
+  hero.append(halo, core, fval, el('div', { class: 'fname', text: i.name || u0.key }), el('div', { class: 'fsub', text: fsub }));
+  hero.append(el('div', {}, [traceSvg(u0.key, 'var(--aether)')]));
   wrap.append(hero);
   const readings = el('div', { class: 'readings' }); wrap.append(readings);
   frag.append(wrap);
