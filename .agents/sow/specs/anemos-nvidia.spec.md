@@ -4,7 +4,10 @@ Status: design. NVIDIA GPU onboard-fan controller. Conforms to `aiolos-protocol.
 
 ## Purpose
 Per-GPU fan control via NVML. One `run` instance per physical GPU, bound by GPU **UUID**
-(stable across NVML index renumbering and across the GPU dropping/returning on the bus).
+(stable across NVML index renumbering and across the GPU dropping/returning on the bus). When the
+registry wires routed temperature inputs into `nvidia`, the GPU fans follow the maximum of this GPU's
+own temperature and all routed temperature producer values. This can support watercooled GPUs whose
+radiator/fan array also provides useful chassis airflow for CPU/board heat.
 
 ## detect
 - Enumerate GPUs via NVML; emit one `found` per GPU:
@@ -18,9 +21,10 @@ Per-GPU fan control via NVML. One `run` instance per physical GPU, bound by GPU 
 
 ## run <UUID>
 - `nvmlInit`; resolve the device by UUID.
-- On each `apply`: read this GPU's temperature; interpolate the curve from
-  `/opt/aiolos/etc/nvidia.curve.json`; set the GPU's onboard fan(s) via NVML
-  (`SetFanSpeed`-equivalent); report one live `gpu` component:
+- On each `apply`: read this GPU's temperature; scan routed `inputs` for producer signals whose
+  `type`/kind is `temperature`; drive from `max(own GPU temperature, routed temperature inputs)`;
+  interpolate the curve from `/opt/aiolos/etc/nvidia.curve.json`; set the GPU's onboard fan(s) via
+  NVML (`SetFanSpeed`-equivalent); report one live `gpu` component:
   ```json
   {"status":"ok","components":[{
     "id":"gpu","label":"GPU-...","class":"gpu",
@@ -30,9 +34,16 @@ Per-GPU fan control via NVML. One `run` instance per physical GPU, bound by GPU 
       {"id":"fan0.rpm","label":"fan0 RPM","kind":"fan-rpm","value":2200,"unit":"rpm"}],
     "sinks":[{"id":"fans","label":"GPU fans","kind":"fan-duty","value":72,"unit":"%",
       "safe":"auto","needs_claim":true,"state":"claimed",
-      "driven_by":[{"from":"self","publisher":"temp","value":63,"unit":"C"}]}]}]}
+      "driven_by":[{"name":"gpu0","signal":"GPU-...:temperature:temp","value":63,"uom":"C"}],
+      "driving":{"type":"temperature","raw":63,"input":63,"uom":"C","output":72,"how":"self→curve"}}]}]}
   ```
-- `inputs` are ignored (nvidia uses its own GPU temperature).
+- If no routed temperature inputs are present, behavior is unchanged: `nvidia` uses only this GPU's own
+  temperature.
+- If routed temperature inputs are present, non-temperature signals are ignored. Fan duty/RPM signals
+  must never influence the NVIDIA fan decision.
+- Routed temperature inputs are opt-in. A workstation may keep `nvidia` GPU-only when the GPU
+  radiator/fan array does not materially improve board or CPU cooling; board and case fans can still
+  consume `nvidia` temperatures independently.
 - On GPU-lost (NVML error): respond `{"status":"error","error":"gpu lost"}`; the orchestrator
   will reconcile via the next `detect`.
 
@@ -81,7 +92,10 @@ smoother/less spike-sensitive, higher = more responsive) is reloaded every tick.
 
 ## Acceptance criteria
 - Detects all GPUs by UUID; per-GPU `run` instances are independent processes.
-- Fan % tracks the curve for the measured temperature (±ramp lag).
+- Without routed temperature inputs, fan % tracks the curve for the measured GPU temperature (±ramp lag).
+- With routed temperature inputs, fan % tracks the curve for `max(GPU temperature, routed temperature
+  inputs)` and reports that driving temperature in each claimed fan-duty sink's `driving` metadata.
+- Routed non-temperature signals are ignored.
 - A GPU falling off the bus does not affect the other GPU's instance.
 - shutdown/EOF/SIGTERM each restore firmware auto; verified by observing fan policy after exit.
 - A failed control tick (set-fan error or temp-read failure) reverts all fans to firmware default.

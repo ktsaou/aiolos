@@ -11,7 +11,7 @@
 
 use anemos::{
     Anemos, Component, Control, Controller, Device, Driving, Inputs, OpenMode, Provenance, Report,
-    Signal, SinkState, Unit,
+    Role, Signal, SinkState, Unit,
 };
 use nvml::{Detector, Gpu};
 use serde_json::json;
@@ -78,12 +78,11 @@ impl Device for GpuDevice {
             Ok(t) => t,
             Err(e) => return Report::error(e.to_string()),
         };
-        self.report(temp, None, SinkState::Unknown)
+        self.report(temp, None, SinkState::Unknown, temp, temp, &[])
     }
 
-    fn apply(&mut self, _inputs: Option<&Inputs>, ctrl: &mut Controller) -> Report {
-        // nvidia ignores routed inputs — it uses its own GPU temperature.
-        let temp = match self.gpu.temperature() {
+    fn apply(&mut self, inputs: Option<&Inputs>, ctrl: &mut Controller) -> Report {
+        let gpu_temp = match self.gpu.temperature() {
             Ok(t) => t,
             Err(e) => {
                 // A failed read must not leave the GPU manual-but-unregulated: revert to firmware.
@@ -91,9 +90,11 @@ impl Device for GpuDevice {
                 return Report::error(e.to_string());
             }
         };
-        let duty = ctrl.duty(temp);
+        let routed_temps = routed_temperature_inputs(inputs);
+        let driving_temp = driving_temperature(gpu_temp, &routed_temps);
+        let duty = ctrl.duty(driving_temp);
         tracing::info!(gpu = %format!("gpu{}", self.gpu.index()), uuid = %self.gpu.uuid(),
-            temp, commanded_pct = ?duty.pct, fans = self.gpu.num_fans(), "decision: set GPU fans");
+            gpu_temp, driving_temp, commanded_pct = ?duty.pct, fans = self.gpu.num_fans(), "decision: set GPU fans");
         let set = match duty.pct {
             Some(p) => self.gpu.set_all_fans(p),
             None => self.gpu.set_all_default(), // empty curve -> firmware/default control
@@ -107,7 +108,14 @@ impl Device for GpuDevice {
         } else {
             SinkState::Released
         };
-        self.report(temp, duty.pct, state)
+        self.report(
+            gpu_temp,
+            duty.pct,
+            state,
+            duty.raw,
+            duty.smoothed,
+            &routed_temps,
+        )
     }
 
     fn restore(&mut self) {
@@ -120,7 +128,15 @@ impl Device for GpuDevice {
 
 impl GpuDevice {
     /// Live report for THIS GPU (one unit + its components + signals, with values).
-    fn report(&mut self, temp: i32, commanded_pct: Option<u32>, state: SinkState) -> Report {
+    fn report(
+        &mut self,
+        gpu_temp: i32,
+        commanded_pct: Option<u32>,
+        state: SinkState,
+        driving_raw: i32,
+        driving_smoothed: i32,
+        routed_temps: &[TemperatureInput],
+    ) -> Report {
         let uid = self.gpu.uuid().to_string();
         let short = format!("gpu{}", self.gpu.index());
         let temp_sig = format!("{uid}:temperature:temp");
@@ -132,7 +148,7 @@ impl GpuDevice {
             .typed("temperature")];
         let mut signals = vec![
             Signal::producer(format!("{tcomp}:temp"), &tcomp, "temperature")
-                .value(json!(temp))
+                .value(json!(gpu_temp))
                 .uom("C")
                 .name("temperature"),
         ];
@@ -157,7 +173,12 @@ impl GpuDevice {
                 &fcomp,
                 &short,
                 &temp_sig,
-                temp,
+                FanDrive {
+                    gpu_temp,
+                    raw: driving_raw,
+                    smoothed: driving_smoothed,
+                    routed_temps,
+                },
                 commanded_pct,
                 fw,
                 state,
@@ -167,28 +188,89 @@ impl GpuDevice {
     }
 }
 
-/// Build a GPU fan's `duty` sink. Driven by THIS GPU's own temperature; when commanded (apply) it is
-/// CLAIMED and carries the `driving` record (CI-checked); otherwise (read-only info) it reports the
-/// firmware duty with no decision. Pure (no NVML) so the sink contract is unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TemperatureInput {
+    name: String,
+    value: i32,
+    signal: String,
+}
+
+struct FanDrive<'a> {
+    gpu_temp: i32,
+    raw: i32,
+    smoothed: i32,
+    routed_temps: &'a [TemperatureInput],
+}
+
+fn routed_temperature_inputs(inputs: Option<&Inputs>) -> Vec<TemperatureInput> {
+    let mut out = Vec::new();
+    let Some(inputs) = inputs else {
+        return out;
+    };
+    for (source, signals) in inputs {
+        for signal in signals {
+            if signal.role != Role::Producer || signal.kind() != Some("temperature") {
+                continue;
+            }
+            let Some(value) = signal.value_i64() else {
+                continue;
+            };
+            let Ok(value) = i32::try_from(value) else {
+                continue;
+            };
+            let label = signal
+                .labels
+                .get("name")
+                .map(String::as_str)
+                .unwrap_or(signal.id.as_str());
+            out.push(TemperatureInput {
+                name: format!("{source}:{label}"),
+                value,
+                signal: signal.id.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn driving_temperature(gpu_temp: i32, routed_temps: &[TemperatureInput]) -> i32 {
+    routed_temps
+        .iter()
+        .map(|t| t.value)
+        .chain(std::iter::once(gpu_temp))
+        .max()
+        .unwrap_or(gpu_temp)
+}
+
+/// Build a GPU fan's `duty` sink. When commanded (apply) it is CLAIMED and carries the
+/// `driving` record (CI-checked); otherwise (read-only info) it reports the firmware duty with
+/// no decision. Pure (no NVML) so the sink contract is unit-testable.
 fn duty_sink(
     fcomp: &str,
     short: &str,
     temp_sig: &str,
-    temp: i32,
+    drive: FanDrive<'_>,
     commanded_pct: Option<u32>,
     firmware_pct: Option<u32>,
     state: SinkState,
 ) -> Signal {
+    let mut driven_by = vec![Provenance::new(short)
+        .value(json!(drive.gpu_temp))
+        .uom("C")
+        .signal(temp_sig)];
+    driven_by.extend(drive.routed_temps.iter().map(|t| {
+        Provenance::new(&t.name)
+            .value(json!(t.value))
+            .uom("C")
+            .signal(&t.signal)
+    }));
     let mut control = Control {
         needs_claim: true,
         state,
         safe: Some(json!("auto")),
         direction: Some("up=more-cooling".into()),
         readback: Some(format!("{fcomp}:rpm")),
-        driven_by: vec![Provenance::new(short)
-            .value(json!(temp))
-            .uom("C")
-            .signal(temp_sig)],
+        driven_by,
         driving: None,
     };
     let mut sink = Signal::sink(format!("{fcomp}:duty"), fcomp, "fan-duty")
@@ -200,11 +282,15 @@ fn duty_sink(
         control.driving = Some(
             Driving::new()
                 .kind("temperature")
-                .raw(temp as f64)
-                .input(temp as f64)
+                .raw(drive.raw as f64)
+                .input(drive.smoothed as f64)
                 .uom("C")
                 .output(pct as f64)
-                .how("curve"),
+                .how(if drive.routed_temps.is_empty() {
+                    "self→curve"
+                } else {
+                    "max(self,routed)→curve"
+                }),
         );
     } else if let Some(fw) = firmware_pct {
         sink = sink.value(json!(fw));
@@ -277,7 +363,12 @@ mod tests {
             "GPU-x:fan0",
             "gpu0",
             "GPU-x:temperature:temp",
-            64,
+            FanDrive {
+                gpu_temp: 64,
+                raw: 64,
+                smoothed: 64,
+                routed_temps: &[],
+            },
             Some(37),
             None,
             SinkState::Claimed,
@@ -297,6 +388,7 @@ mod tests {
         assert_eq!(d.input, Some(64.0));
         assert_eq!(d.output, Some(37.0));
         assert_eq!(d.kind.as_deref(), Some("temperature"));
+        assert_eq!(d.how.as_deref(), Some("self→curve"));
     }
 
     #[test]
@@ -306,7 +398,12 @@ mod tests {
             "GPU-x:fan0",
             "gpu0",
             "t",
-            50,
+            FanDrive {
+                gpu_temp: 50,
+                raw: 50,
+                smoothed: 50,
+                routed_temps: &[],
+            },
             None,
             Some(40),
             SinkState::Unknown,
@@ -314,5 +411,107 @@ mod tests {
         assert!(Report::ok(vec![], vec![], vec![s])
             .sink_contract_violations()
             .is_empty());
+    }
+
+    fn temp_signal(id: &str, value: i64) -> Signal {
+        Signal::producer(id, "component", "temperature")
+            .value(json!(value))
+            .uom("C")
+            .name("temp")
+    }
+
+    #[test]
+    fn routed_temperature_inputs_extract_only_temperature_producers() {
+        use std::collections::HashMap;
+
+        let mut inputs: Inputs = HashMap::new();
+        inputs.insert(
+            "it87:board".into(),
+            vec![
+                temp_signal("board:cpu:temp", 74),
+                temp_signal("board:impossible:temp", i64::from(i32::MAX) + 1),
+                Signal::producer("board:fan:rpm", "board:fan", "fan-rpm").value(json!(1200)),
+                Signal::sink("board:fan:duty", "board:fan", "fan-duty").value(json!(80)),
+            ],
+        );
+
+        let got = routed_temperature_inputs(Some(&inputs));
+        assert_eq!(
+            got,
+            vec![TemperatureInput {
+                name: "it87:board:temp".into(),
+                value: 74,
+                signal: "board:cpu:temp".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn driving_temperature_uses_gpu_temp_when_inputs_absent_or_lower() {
+        assert_eq!(driving_temperature(62, &[]), 62);
+        assert_eq!(
+            driving_temperature(
+                62,
+                &[TemperatureInput {
+                    name: "it87:board:cpu".into(),
+                    value: 55,
+                    signal: "board:cpu:temp".into(),
+                }]
+            ),
+            62
+        );
+    }
+
+    #[test]
+    fn driving_temperature_uses_higher_routed_temperature() {
+        assert_eq!(
+            driving_temperature(
+                45,
+                &[
+                    TemperatureInput {
+                        name: "it87:board:cpu".into(),
+                        value: 81,
+                        signal: "board:cpu:temp".into(),
+                    },
+                    TemperatureInput {
+                        name: "hwmon-temps:board:vrm".into(),
+                        value: 66,
+                        signal: "board:board:vrm".into(),
+                    },
+                ]
+            ),
+            81
+        );
+    }
+
+    #[test]
+    fn commanded_gpu_fan_sink_reports_routed_driving_source() {
+        let routed = vec![TemperatureInput {
+            name: "it87:board:cpu".into(),
+            value: 82,
+            signal: "board:cpu:temp".into(),
+        }];
+        let s = duty_sink(
+            "GPU-x:fan0",
+            "gpu0",
+            "GPU-x:temperature:temp",
+            FanDrive {
+                gpu_temp: 45,
+                raw: 82,
+                smoothed: 80,
+                routed_temps: &routed,
+            },
+            Some(90),
+            None,
+            SinkState::Claimed,
+        );
+        let control = s.control.as_ref().unwrap();
+        assert_eq!(control.driven_by.len(), 2);
+        assert_eq!(control.driven_by[1].name, "it87:board:cpu");
+        let d = control.driving.as_ref().unwrap();
+        assert_eq!(d.raw, Some(82.0));
+        assert_eq!(d.input, Some(80.0));
+        assert_eq!(d.output, Some(90.0));
+        assert_eq!(d.how.as_deref(), Some("max(self,routed)→curve"));
     }
 }
