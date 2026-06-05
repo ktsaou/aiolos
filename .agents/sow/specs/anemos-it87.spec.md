@@ -8,8 +8,10 @@ discipline, but `/sys/class/hwmon` PWM writes instead of IPMI.
 ## Purpose
 Regulate this board's fans by temperature. One `run` instance (the board). It drives a
 config-declared set of PWM channels, splitting them into a **CPU zone** (the CPU-cooler headers,
-following CPU temperature) and a **case zone** (intake/exhaust, following `max(GPU, CPU)`), each via
-its own curve. GPU temperature is routed in from `nvidia` (`input=nvidia`).
+following CPU temperature) and a **case zone** (intake/exhaust, following
+`max(CPU, routed temperature producers)`), each via its own curve. Useful routed inputs include GPU
+temperature from `nvidia`, board/VRM/DIMM/NIC temperatures from `hwmon-temps`, and NVMe
+temperatures from `nvme`.
 
 ## detect
 - Resolve the configured chip (`it87.conf` `chip=`, default `it8689`) under `/sys/class/hwmon`.
@@ -21,9 +23,11 @@ its own curve. GPU temperature is routed in from `nvidia` (`input=nvidia`).
 Decided LIVE each tick from config (so dropping in / removing a zone curve switches mode next tick):
 - **zone mode** (active iff BOTH `it87.cpu.curve.json` and `it87.case.curve.json` load a non-empty
   curve): CPU-zone channels (`cpu=`, default `1`) follow `coretemp` via the CPU curve; all other
-  managed channels (`case=`, default `3,4`) follow `max(GPU routed inputs, CPU)` via the case curve.
+  managed channels (`case=`, default `3,4`) follow `max(CPU, routed temperature producers)` via the
+  case curve.
   Two internal `anemos::Controller`s (own EMA/deadband/sensitivity).
-- **uniform mode** (fallback): one `it87.curve.json` over `max(GPU, CPU)` for every managed channel.
+- **uniform mode** (fallback): one `it87.curve.json` over `max(CPU, routed temperature producers)`
+  for every managed channel.
 
 Per tick: put each managed channel under manual control (`pwmN_enable=1`) and command its duty
 (`pwmN = round(pct * 255 / 100)`), re-asserting manual every tick to defend against a board EC that
@@ -51,9 +55,10 @@ so the report lists real fans only. The same unmanaged-fan publishers appear in 
 
 If the driving temperature is indeterminable, or the active curve is empty, the module **releases
 every managed channel to firmware/automatic** (`pwmN_enable=2`) and replies `status:error` — it
-never holds manual-but-blind. The case zone follows `max(GPU, CPU)` (NOT GPU-only): a desktop tower
-is a single airflow chamber, so case fans respond to CPU heat too (deliberately unlike the
-directed-airflow server module, where the case zone excludes CPU).
+never holds manual-but-blind. The case zone follows `max(CPU, routed temperature producers)` (NOT
+GPU-only): a desktop tower is a single airflow chamber, so case fans respond to CPU heat and hot
+board/NVMe/DIMM/NIC/GPU sensors. Routed sink signals and non-temperature producers are ignored, so
+fan output cannot feed back into the temperature decision.
 
 ## Fan control mechanism (sysfs)
 Via the level-1 `hwmon` tech crate, addressing the chip's hwmon node:
@@ -82,8 +87,9 @@ value ≥ floor; systemd `ExecStopPost: aiolos restore` (which calls `it87 resto
 
 ## Acceptance criteria
 - `detect` emits the board when the chip is present; empty `found` when absent (never an error).
-- `run` drives CPU-zone channels from CPU temp and case-zone channels from `max(GPU,CPU)` per their
-  curves; verified by reading `pwmN`/`fanN_input` under CPU and GPU load.
+- `run` drives CPU-zone channels from CPU temp and case-zone channels from
+  `max(CPU,routed-temperature-producers)` per their curves; verified by reading `pwmN`/`fanN_input`
+  under CPU, GPU, board, and storage thermal load.
 - `run`/`info`/`collect` also report read-only `fanN.duty` + `fanN.rpm` publishers for every unmanaged
   header that is spinning (RPM > 0), with no sink; empty/unreadable headers are omitted. Verified on
   the reference host: the BIOS-driven CPU fan (`fan1`) appears alongside the managed case fans.

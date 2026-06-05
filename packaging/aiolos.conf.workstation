@@ -9,8 +9,10 @@ status_bind=127.0.0.1:9876          # status page on localhost only (personal wo
 
 # --- control ---
 nvidia                              # RTX 5090 onboard fans (control + GPU temp only)
-it87  input=nvidia                  # board fans via it87 sysfs PWM: CPU zone (ch1) follows coretemp,
-                                    # case zone (ch3 exhaust + ch4 intake) follows max(GPU, CPU)
+it87  input=nvidia input=hwmon-temps input=nvme
+                                    # board fans via it87 sysfs PWM: configured CPU-zone headers
+                                    # follow coretemp; case zone (ch3 exhaust + ch4 intake here)
+                                    # follows max(CPU, GPU, board/VRM/DIMM/NIC, NVMe routed temps)
 nvidia-powercap  input=nut          # cap GPU power on a utility-power event (policy in etc/nvidia-powercap.conf)
 
 # --- monitor (sensor-only; reported on the status page) ---

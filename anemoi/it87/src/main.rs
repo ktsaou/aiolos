@@ -9,14 +9,13 @@
 //! components — managed channels carry an `rpm` producer + a `duty` sink; unmanaged-but-spinning
 //! headers (e.g. a BIOS-driven CPU fan) carry read-only `rpm` + `duty` producers.
 //!
-//! The control path (zone/uniform duty decision, set PWM, fail-safe restore) is UNCHANGED from v1 —
-//! this is a reporting refactor.
+//! Case fans follow CPU plus routed temperature inputs; CPU-zone headers follow CPU only.
 
 mod config;
 
 use anemos::{
     Anemos, Component, Control, Controller, CurveCache, Device, Driving, Inputs, ModuleInfo,
-    OpenMode, Provenance, Report, Signal, SinkState, Unit,
+    OpenMode, Provenance, Report, Role, Signal, SinkState, Unit,
 };
 use config::It87Config;
 use serde_json::json;
@@ -187,12 +186,12 @@ impl Device for It87Device {
     }
 
     fn apply(&mut self, inputs: Option<&Inputs>, ctrl: &mut Controller) -> Report {
-        // --- control path (UNCHANGED from v1) ---------------------------------------------------
-        let gpu_temps = input_temps_from(inputs, "nvidia");
+        // --- control path -----------------------------------------------------------------------
+        let routed_temp_maxes = input_temp_maxes_by_module(inputs);
         let cpu_temps = hwmon::read_temps("coretemp");
-        let gpu_max = gpu_temps.iter().copied().max();
         let cpu_max = cpu_temps.iter().map(|(_, t)| *t).max();
-        let case_raw_opt = [gpu_max, cpu_max].into_iter().flatten().max();
+        let routed_max = routed_temp_maxes.iter().map(|s| s.value).max();
+        let case_raw_opt = [routed_max, cpu_max].into_iter().flatten().max();
 
         let zones = self
             .zones
@@ -215,6 +214,7 @@ impl Device for It87Device {
             tracing::info!(
                 cpu_raw,
                 case_raw,
+                routed_max,
                 cpu_pct,
                 case_pct,
                 cpu_smoothed = cpu_duty.smoothed,
@@ -239,7 +239,7 @@ impl Device for It87Device {
             let Some(pct) = duty.pct else {
                 return self.release_or_error("no usable curve");
             };
-            tracing::info!(gpu_max = ?gpu_max, cpu_max = ?cpu_max, raw_driving = raw,
+            tracing::info!(routed_max = ?routed_max, cpu_max = ?cpu_max, raw_driving = raw,
                 smoothed = duty.smoothed, commanded_pct = pct, "decision: set all board fans (uniform)");
             let commanded: Vec<(u8, u32)> = self
                 .cfg
@@ -264,8 +264,9 @@ impl Device for It87Device {
         }
         // --- end control path -------------------------------------------------------------------
 
-        // Real CPU temps (the only board temperatures) + the managed fans, each carrying its own
-        // per-zone `driving` record on the sink. No driving-* producer signals.
+        // Real CPU temps + managed fans, each carrying its own per-zone `driving` record on the
+        // sink. Routed board/NVMe/etc. temperatures remain owned by their publisher modules and are
+        // referenced only as case-fan provenance.
         let (mut components, mut signals) = cpu_component(&cpu_temps);
         for &(ch, pct) in &commanded {
             let fc = format!("{BOARD_ID}:fan{ch}");
@@ -296,7 +297,11 @@ impl Device for It87Device {
                         direction: Some("up=more-cooling".into()),
                         readback: Some(format!("{fc}:rpm")),
                         driven_by: driven_by_for_channel(
-                            ch, &self.cfg, gpu_max, cpu_max, zone_mode,
+                            ch,
+                            &self.cfg,
+                            &routed_temp_maxes,
+                            cpu_max,
+                            zone_mode,
                         ),
                         driving: Some(decision.driving_for(cpu_zone, pct)),
                     }),
@@ -408,8 +413,9 @@ enum Decision {
 }
 
 impl Decision {
-    /// The generic `driving` record for one managed channel: uniform → max(gpu,cpu); zone → CPU temp
-    /// for a CPU-zone channel, else max(gpu,cpu) for a case channel. `output` is the commanded duty.
+    /// The generic `driving` record for one managed channel: uniform -> max(cpu,routed temps);
+    /// zone -> CPU temp for a CPU-zone channel, else max(cpu,routed temps) for a case channel.
+    /// `output` is the commanded duty.
     fn driving_for(&self, cpu_zone: bool, output: u32) -> Driving {
         match self {
             Decision::Uniform { raw, smoothed, .. } => Driving::new()
@@ -418,7 +424,7 @@ impl Decision {
                 .input(*smoothed as f64)
                 .uom("C")
                 .output(output as f64)
-                .how("uniform: max(gpu,cpu)→curve"),
+                .how("uniform: max(cpu,routed)→curve"),
             Decision::Zone {
                 cpu_raw,
                 cpu_smoothed,
@@ -505,10 +511,16 @@ fn unmanaged_fan_components(dir: &Path, cfg: &It87Config) -> (Vec<Component>, Ve
     (components, signals)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceTempMax {
+    module: String,
+    value: i32,
+}
+
 fn driven_by_for_channel(
     ch: u8,
     cfg: &It87Config,
-    gpu_max: Option<i32>,
+    routed_temp_maxes: &[SourceTempMax],
     cpu_max: Option<i32>,
     zone_mode: bool,
 ) -> Vec<Provenance> {
@@ -518,31 +530,46 @@ fn driven_by_for_channel(
         out.push(Provenance::new("self:cpu").value(json!(v)).uom("C"));
     }
     if !zone_mode || !cpu_zone {
-        if let Some(v) = gpu_max {
-            out.push(Provenance::new("nvidia (max)").value(json!(v)).uom("C"));
-        }
+        out.extend(routed_temp_maxes.iter().map(|s| {
+            Provenance::new(format!("{} (max)", s.module))
+                .value(json!(s.value))
+                .uom("C")
+        }));
     }
     out
 }
 
-/// Extract temperature values only from inputs whose SOURCE MODULE is `src` (keys are `module:id`).
-fn input_temps_from(inputs: Option<&Inputs>, src: &str) -> Vec<i32> {
-    let mut v = Vec::new();
-    if let Some(inputs) = inputs {
-        let prefix = format!("{src}:");
-        for (key, signals) in inputs {
-            if key.starts_with(&prefix) {
-                for s in signals {
-                    if s.kind() == Some("temperature") {
-                        if let Some(t) = s.value_i64() {
-                            v.push(t as i32);
-                        }
-                    }
-                }
+/// Extract one max temperature per routed source module (keys are `module:id`).
+fn input_temp_maxes_by_module(inputs: Option<&Inputs>) -> Vec<SourceTempMax> {
+    let mut by_module = std::collections::BTreeMap::<String, i32>::new();
+    let Some(inputs) = inputs else {
+        return Vec::new();
+    };
+    for (key, signals) in inputs {
+        let module = key
+            .split_once(':')
+            .map(|(module, _)| module)
+            .unwrap_or(key.as_str());
+        for s in signals {
+            if s.role != Role::Producer || s.kind() != Some("temperature") {
+                continue;
             }
+            let Some(value) = s.value_i64() else {
+                continue;
+            };
+            let Ok(value) = i32::try_from(value) else {
+                continue;
+            };
+            by_module
+                .entry(module.to_string())
+                .and_modify(|max| *max = (*max).max(value))
+                .or_insert(value);
         }
     }
-    v
+    by_module
+        .into_iter()
+        .map(|(module, value)| SourceTempMax { module, value })
+        .collect()
 }
 
 #[cfg(test)]
@@ -599,14 +626,69 @@ mod tests {
     }
 
     #[test]
-    fn input_temps_from_partitions_by_source_module() {
+    fn input_temp_maxes_by_module_extracts_temperature_producer_maxes() {
         use std::collections::HashMap;
         let mut inputs: Inputs = HashMap::new();
         inputs.insert("nvidia:GPU-1".into(), vec![temp_signal(63)]);
+        inputs.insert(
+            "hwmon-temps:board".into(),
+            vec![
+                temp_signal(70),
+                temp_signal(66),
+                Signal::producer("board:fan3:rpm", "board:fan3", "fan-rpm").value(json!(1400)),
+                Signal::sink("board:fan3:duty", "board:fan3", "fan-duty").value(json!(70)),
+                temp_signal(i64::from(i32::MAX) + 1),
+            ],
+        );
         inputs.insert("nvme:SER-A".into(), vec![temp_signal(44)]);
-        assert_eq!(input_temps_from(Some(&inputs), "nvidia"), vec![63]);
-        assert!(input_temps_from(Some(&inputs), "nv").is_empty());
-        assert!(input_temps_from(None, "nvidia").is_empty());
+
+        assert_eq!(
+            input_temp_maxes_by_module(Some(&inputs)),
+            vec![
+                SourceTempMax {
+                    module: "hwmon-temps".into(),
+                    value: 70,
+                },
+                SourceTempMax {
+                    module: "nvidia".into(),
+                    value: 63,
+                },
+                SourceTempMax {
+                    module: "nvme".into(),
+                    value: 44,
+                },
+            ]
+        );
+        assert!(input_temp_maxes_by_module(None).is_empty());
+    }
+
+    #[test]
+    fn driven_by_for_channel_keeps_cpu_zone_cpu_only_and_case_zone_all_sources() {
+        let cfg = It87Config {
+            chip: "it8689".into(),
+            cpu_channels: vec![1],
+            case_channels: vec![3, 4],
+        };
+        let routed = vec![
+            SourceTempMax {
+                module: "hwmon-temps".into(),
+                value: 71,
+            },
+            SourceTempMax {
+                module: "nvidia".into(),
+                value: 52,
+            },
+        ];
+
+        let cpu = driven_by_for_channel(1, &cfg, &routed, Some(68), true);
+        assert_eq!(cpu.len(), 1);
+        assert_eq!(cpu[0].name, "self:cpu");
+
+        let case = driven_by_for_channel(3, &cfg, &routed, Some(68), true);
+        assert_eq!(case.len(), 3);
+        assert_eq!(case[0].name, "self:cpu");
+        assert_eq!(case[1].name, "hwmon-temps (max)");
+        assert_eq!(case[2].name, "nvidia (max)");
     }
 
     #[test]
