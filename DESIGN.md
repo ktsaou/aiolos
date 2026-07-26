@@ -79,7 +79,7 @@ rome2d-fans  input=nvidia input=nvme   # feed GPU + NVMe temps into this anemos
 ```
 
 Directives (extensible):
-- `input=<anemos>` — aiolos relays the named anemos's last components into this anemos's `apply`
+- `input=<anemos>` — aiolos relays the named anemos's fresh signals into this anemos's `apply`
   request (keyed by `module:id`). Repeatable and/or comma-listed for multiple sources.
 - `every=<dur>` / `timeout=<dur>` — per-anemos schedule overrides (SOW-0013 decoupled scheduler;
   bare number = seconds). `args=…` is future.
@@ -107,30 +107,33 @@ optional startup `hello`).
 
 **hello** (optional, emitted by the module on startup):
 ```json
-{"hello":{"proto":1,"name":"nvidia","modes":["detect","run"]}}
+{"hello":{"proto":2,"name":"nvidia","modes":["detect","run"]}}
 ```
 
 **detect** (to a `detect` process; re-sent periodically for hotplug):
 ```json
 → {"cmd":"detect"}
-← {"status":"ok","found":[{"id":"GPU-5f2…","type":"GPU","name":"RTX PRO 6000",
-    "components":[{"id":"gpu","label":"GPU","class":"gpu",
-      "publishers":[{"id":"temp","label":"Temperature","kind":"temperature","unit":"C"}]}]}]}
+← {"status":"ok",
+    "units":[{"id":"GPU-5f2…","labels":{"type":"gpu","name":"gpu0"}}],
+    "components":[{"id":"GPU-5f2…:thermal","unit":"GPU-5f2…",
+      "labels":{"type":"temperature","name":"thermal"}}],
+    "signals":[{"id":"GPU-5f2…:thermal:temp","component":"GPU-5f2…:thermal",
+      "role":"producer","uom":"C","labels":{"type":"temperature","name":"temperature"}}]}
 ```
 
 **info / collect** (SDK one-shot companion mode, not used by aiolos heartbeat): `<module> info [ID]`
 opens devices read-only (`OpenMode::Observe`), calls `Device::collect`, and emits the same
-detect-shaped response with live component values. It must not claim, set, release, or restore
+detect-shaped response with live signal values. It must not claim, set, release, or restore
 hardware.
 
 **apply** (to a `run <ID>` process when the anemos is due — aiolos wakes every `base_tick` and
 dispatches each idle, due anemos (SOW-0013); `inputs` present only if `input=` wired —
-each peer id maps to that peer's full components array, relayed uninterpreted):
+each peer id maps to that peer's fresh signal array, relayed uninterpreted):
 ```json
-→ {"cmd":"apply","inputs":{"nvidia:GPU-5f2…":[{"id":"gpu","label":"GPU","class":"gpu",
-    "publishers":[{"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"}]}]}}
-← {"status":"ok","components":[
-     {"id":"board","label":"ROME2D16-2T","class":"board","publishers":[…],"sinks":[…]}]}
+→ {"cmd":"apply","inputs":{"nvidia:GPU-5f2…":[
+     {"id":"GPU-5f2…:thermal:temp","component":"GPU-5f2…:thermal",
+      "role":"producer","value":63,"uom":"C","labels":{"type":"temperature"}}]}}
+← {"status":"ok","units":[…],"components":[…],"signals":[…]}
 ```
 On trouble: `← {"status":"error","error":"device lost"}` (aiolos logs/counts; repeated → restart).
 
@@ -144,17 +147,19 @@ The `run` instance knows its own ID from argv, so `apply` need not repeat it.
 
 ## 6. Data routing (`input=`)
 
-aiolos keeps a **blackboard**: the last `components` reported by every instance. For an anemos
-configured `input=X [Y …]`, aiolos extracts every named source's instances' components and includes
-them as `inputs` (keyed by `module:id`, so the consumer can attribute each component/publisher to
-its source module) in this anemos's next `apply`. aiolos does **not** interpret the values — it only relays.
+aiolos keeps a **blackboard**: the fresh `signals` reported by every instance. For an anemos
+configured `input=X [Y …]`, aiolos extracts every named source instance's signals and includes
+them as `inputs` (keyed by `module:id`, so the consumer can attribute each signal to its source
+module) in this anemos's next `apply`. aiolos does **not** interpret the values — it only relays.
 The consumer decides how to use them (max, per-zone, per-source, …). This is how GPU and NVMe temps
 reach the fan module while aiolos stays agnostic.
 
-Timing: `inputs` carry each source's **last completed** `apply` components (one cycle stale, never
-blocking on a peer) — irrelevant for thermal mass, and it keeps every instance independent (no
-ordering dependency). Under the decoupled scheduler (SOW-0013) sources and consumers run on their
-own cadences; a consumer always sees the most recent values the blackboard holds.
+Timing: `inputs` carry each source's **most recent successful, non-empty completed** `apply` signals
+(one cycle stale, never blocking on a peer) — irrelevant for thermal mass, and it keeps every
+instance independent (no ordering dependency). A source `error`/`fatal` or authoritative
+`ok`-empty report prunes its entry immediately, so consumers see telemetry loss rather than stale
+last-good values. Under the decoupled scheduler (SOW-0013) sources and consumers run on their own
+cadences; a consumer always sees the most recent fresh values the blackboard holds.
 
 ---
 
@@ -192,7 +197,7 @@ default, so "module dies → firmware/BMC reclaims control" is always the *safe*
 
 ## 8. State & status web page
 
-aiolos holds: registry, per-anemos detect results, per-instance last components + status + last
+aiolos holds: registry, per-anemos detect results, per-instance last entities + status + last
 error + restart count + last-seen time, captured stderr tail. It serves a **read-only** HTTP
 status page (bind localhost by default) rendering all of the above — live components, which
 instances are healthy, recent errors. Small, dependency-light (hand-rolled or `tiny_http`).
@@ -262,12 +267,19 @@ The protocol is language-agnostic; any anemos may be written in any language lat
   are 120 mm case fans. User decision: all fans follow the global max (CPU fans speeding up on GPU
   heat is desirable). Default **uniform** duty = curve(driving_temp). *(Open: optional per-fan
   curves later — FAN1/2 by CPU temp, FAN3-8 by max — config supports it; default uniform.)*
+- **Source-matched case overlay (optional):** `rome2d-fans.case.policy.json` can match
+  routed/local numeric producer signals independently in multiple rules, reduce each rule by max,
+  and apply one curve per rule. FAN3–FAN8 use the maximum of their existing baseline and every
+  overlay request; FAN1/FAN2 keep their baseline behavior. The packaged disabled policy demonstrates
+  a required NVMe rule whose
+  `{"50":30,"70":100,"sensitivity":1.0}` curve reaches 100% immediately at 70 C. Configured
+  policy/curve faults or missing required telemetry fail the case fans high to 100%.
 
 **IPMI fan control (verified) — netfn 0x3a, inband /dev/ipmi0:**
 - Claim (all manual): `0x3a 0xd8` + sixteen `0x01`
 - Set duty: `0x3a 0xd6` + sixteen bytes (per-fan %, `0x64`=100, `0x32`=50). **Reliable ONLY when
-  all 16 are manual AND all duty bytes are non-zero.** Bytes 0-7 = FAN1..FAN8; 8-15 unused (set
-  non-zero anyway).
+  all 16 are manual, all duty bytes are non-zero, AND bytes 8–15 exactly mirror FAN1..FAN8 in
+  bytes 0–7.** An `0x01`/low non-mirrored tail is rejected with `0xcc`.
 - Release (fail-safe): `0x3a 0xd8` + sixteen `0x00`  (BMC reclaims auto)
 - Query duty: `0x3a 0xda`
 - Per-fan RPM (SOW-0005): standard IPMI on `FAN1_1..FAN8_1` (sensors `0x60..0x67`) — cache the
@@ -296,6 +308,16 @@ the routed max). Example:
 - **`sensitivity`** (EMA α): lower = smoother / less reactive to noisy spikes; higher = more
   responsive. Live-reloaded each tick (no restart). A single bad reading is diluted to ≈ α·Δ.
 - The file is re-read every tick, so curve and sensitivity edits take effect on the next tick.
+
+Optional case policies for `rome2d-fans` and `it87` live beside the main curve as
+`<anemos>.case.policy.json`. Each rule has exact-list `match` fields (`module`, `instance`,
+signal `id`, `component`, `uom`, `labels`), a relative-basename `curve`, and optional `required`.
+Populated fields are ANDed, alternatives within one list are ORed, and a signal may match multiple
+rules. Rule maxima pass through independent curve/EMA/deadband state; rule duties combine by max,
+then max-compose with the existing case-fan duty. Local signals are matched as `self:self`. Policy
+files and all referenced curves are validated every tick. Unlike baseline curve live edits, a
+configured overlay fault intentionally uses no last-good fallback: affected case fans command 100%
+and the module returns an authoritative warning.
 
 ---
 

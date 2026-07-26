@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "enabled": false,
+  "rules": [
+    {
+      "name": "nvme",
+      "match": {
+        "module": [
+          "nvme"
+        ],
+        "labels": {
+          "type": [
+            "temperature"
+          ]
+        }
+      },
+      "curve": "it87.case.nvme.curve.json",
+      "required": true
+    }
+  ]
+}

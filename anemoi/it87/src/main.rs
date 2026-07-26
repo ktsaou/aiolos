@@ -15,7 +15,7 @@ mod config;
 
 use anemos::{
     Anemos, Component, Control, Controller, CurveCache, Device, Driving, Inputs, ModuleInfo,
-    OpenMode, Provenance, Report, Role, Signal, SinkState, Unit,
+    OpenMode, PolicyOutcome, Provenance, Report, Role, Signal, SignalCurvePolicy, SinkState, Unit,
 };
 use config::It87Config;
 use serde_json::json;
@@ -78,6 +78,7 @@ impl Anemos for It87 {
             dir,
             cfg,
             zones: None,
+            case_policy: None,
             restore_armed: mode == OpenMode::Control,
         }))
     }
@@ -136,6 +137,7 @@ struct It87Device {
     dir: PathBuf,
     cfg: It87Config,
     zones: Option<Zones>,
+    case_policy: Option<SignalCurvePolicy>,
     restore_armed: bool,
 }
 
@@ -192,13 +194,14 @@ impl Device for It87Device {
         let cpu_max = cpu_temps.iter().map(|(_, t)| *t).max();
         let routed_max = routed_temp_maxes.iter().map(|s| s.value).max();
         let case_raw_opt = [routed_max, cpu_max].into_iter().flatten().max();
+        let (_, local_cpu_signals) = cpu_component(&cpu_temps);
 
         let zones = self
             .zones
             .get_or_insert_with(|| Zones::for_main_path(ctrl.path()));
         let zone_mode = zones.both_present();
 
-        let (commanded, decision) = if zone_mode {
+        let (mut commanded, baseline) = if zone_mode {
             let (Some(cpu_raw), Some(case_raw)) = (cpu_max, case_raw_opt) else {
                 zones.cpu.reset();
                 zones.case.reset();
@@ -224,11 +227,12 @@ impl Device for It87Device {
             let commanded = self.commanded_zone(cpu_pct, case_pct);
             (
                 commanded,
-                Decision::Zone {
+                BaselineDecision::Zone {
                     cpu_raw,
                     cpu_smoothed: cpu_duty.smoothed,
                     case_raw,
                     case_smoothed: case_duty.smoothed,
+                    case_pct,
                 },
             )
         } else {
@@ -249,12 +253,40 @@ impl Device for It87Device {
                 .collect();
             (
                 commanded,
-                Decision::Uniform {
+                BaselineDecision::Uniform {
                     raw,
                     smoothed: duty.smoothed,
+                    pct,
                 },
             )
         };
+
+        let case_policy = self
+            .case_policy
+            .get_or_insert_with(|| SignalCurvePolicy::new(case_policy_path(ctrl.path())))
+            .evaluate(inputs, &local_cpu_signals);
+        if let Some(warning) = case_policy.warning() {
+            tracing::warn!(
+                path = %self.case_policy.as_ref().expect("policy initialized").path().display(),
+                %warning,
+                "case-fan overlay failed high"
+            );
+        }
+        apply_case_overlay(
+            &mut commanded,
+            &self.cfg.case_channels,
+            case_policy.overlay_pct(),
+        );
+        let decision = Decision {
+            baseline,
+            case_overlay: case_policy,
+        };
+        tracing::info!(
+            baseline_case_pct = decision.baseline.case_pct(),
+            overlay_pct = ?decision.case_overlay.overlay_pct(),
+            ?commanded,
+            "decision: set board fans (baseline plus case overlay)"
+        );
 
         for &(ch, pct) in &commanded {
             if let Err(e) = hwmon::set_pwm_duty(&self.dir, ch, pct) {
@@ -302,6 +334,7 @@ impl Device for It87Device {
                             &routed_temp_maxes,
                             cpu_max,
                             zone_mode,
+                            &decision,
                         ),
                         driving: Some(decision.driving_for(cpu_zone, pct)),
                     }),
@@ -310,7 +343,12 @@ impl Device for It87Device {
         let (mut uc, mut us) = unmanaged_fan_components(&self.dir, &self.cfg);
         components.append(&mut uc);
         signals.append(&mut us);
-        Report::ok(vec![board_unit(&self.cfg)], components, signals)
+        match decision.warning() {
+            Some(warning) => {
+                Report::ok_warn(vec![board_unit(&self.cfg)], components, signals, warning)
+            }
+            None => Report::ok(vec![board_unit(&self.cfg)], components, signals),
+        }
     }
 
     fn restore(&mut self) {
@@ -398,34 +436,36 @@ fn cpu_component(cpu_temps: &[(String, i32)]) -> (Vec<Component>, Vec<Signal>) {
     (components, signals)
 }
 
-/// The control decision carried to the report stage.
-enum Decision {
+/// Existing fan calculation before optional case-only overlays.
+enum BaselineDecision {
     Uniform {
         raw: i32,
         smoothed: i32,
+        pct: u32,
     },
     Zone {
         cpu_raw: i32,
         cpu_smoothed: i32,
         case_raw: i32,
         case_smoothed: i32,
+        case_pct: u32,
     },
 }
 
-impl Decision {
+impl BaselineDecision {
     /// The generic `driving` record for one managed channel: uniform -> max(cpu,routed temps);
     /// zone -> CPU temp for a CPU-zone channel, else max(cpu,routed temps) for a case channel.
     /// `output` is the commanded duty.
     fn driving_for(&self, cpu_zone: bool, output: u32) -> Driving {
         match self {
-            Decision::Uniform { raw, smoothed, .. } => Driving::new()
+            BaselineDecision::Uniform { raw, smoothed, .. } => Driving::new()
                 .kind("temperature")
                 .raw(*raw as f64)
                 .input(*smoothed as f64)
                 .uom("C")
                 .output(output as f64)
                 .how("uniform: max(cpu,routed)→curve"),
-            Decision::Zone {
+            BaselineDecision::Zone {
                 cpu_raw,
                 cpu_smoothed,
                 case_raw,
@@ -445,6 +485,61 @@ impl Decision {
                     .output(output as f64)
                     .how(how)
             }
+        }
+    }
+
+    fn case_pct(&self) -> u32 {
+        match self {
+            BaselineDecision::Uniform { pct, .. } => *pct,
+            BaselineDecision::Zone { case_pct, .. } => *case_pct,
+        }
+    }
+}
+
+/// The control decision carried to the report stage.
+struct Decision {
+    baseline: BaselineDecision,
+    case_overlay: PolicyOutcome,
+}
+
+impl Decision {
+    fn overlay_drives(&self, cpu_zone: bool) -> bool {
+        !cpu_zone
+            && self
+                .case_overlay
+                .overlay_pct()
+                .is_some_and(|overlay| overlay >= self.baseline.case_pct())
+    }
+
+    fn driving_for(&self, cpu_zone: bool, output: u32) -> Driving {
+        if self.overlay_drives(cpu_zone) {
+            if let Some(mut driving) = self.case_overlay.driving() {
+                driving.output = Some(output as f64);
+                return driving;
+            }
+        }
+        self.baseline.driving_for(cpu_zone, output)
+    }
+
+    fn warning(&self) -> Option<&str> {
+        self.case_overlay.warning()
+    }
+}
+
+fn case_policy_path(main_curve_path: &str) -> String {
+    match main_curve_path.strip_suffix(".curve.json") {
+        Some(stem) => format!("{stem}.case.policy.json"),
+        None => format!("{main_curve_path}.case.policy.json"),
+    }
+}
+
+fn apply_case_overlay(commanded: &mut [(u8, u32)], case_channels: &[u8], overlay_pct: Option<u32>) {
+    let Some(overlay_pct) = overlay_pct else {
+        return;
+    };
+    for (channel, pct) in commanded {
+        if case_channels.contains(channel) {
+            *pct = (*pct).max(overlay_pct);
         }
     }
 }
@@ -523,11 +618,15 @@ fn driven_by_for_channel(
     routed_temp_maxes: &[SourceTempMax],
     cpu_max: Option<i32>,
     zone_mode: bool,
+    decision: &Decision,
 ) -> Vec<Provenance> {
     let mut out = Vec::new();
     let cpu_zone = cfg.cpu_channels.contains(&ch);
     if let Some(v) = cpu_max {
         out.push(Provenance::new("self:cpu").value(json!(v)).uom("C"));
+    }
+    if decision.overlay_drives(cpu_zone) {
+        return decision.case_overlay.driven_by();
     }
     if !zone_mode || !cpu_zone {
         out.extend(routed_temp_maxes.iter().map(|s| {
@@ -601,6 +700,7 @@ mod tests {
                 case_channels: vec![3, 4],
             },
             zones: None,
+            case_policy: None,
             restore_armed: true,
         };
         assert_eq!(dev.commanded_zone(30, 75), vec![(1, 30), (3, 75), (4, 75)]);
@@ -679,12 +779,22 @@ mod tests {
                 value: 52,
             },
         ];
+        let decision = Decision {
+            baseline: BaselineDecision::Zone {
+                cpu_raw: 68,
+                cpu_smoothed: 66,
+                case_raw: 71,
+                case_smoothed: 69,
+                case_pct: 70,
+            },
+            case_overlay: PolicyOutcome::Inactive,
+        };
 
-        let cpu = driven_by_for_channel(1, &cfg, &routed, Some(68), true);
+        let cpu = driven_by_for_channel(1, &cfg, &routed, Some(68), true, &decision);
         assert_eq!(cpu.len(), 1);
         assert_eq!(cpu[0].name, "self:cpu");
 
-        let case = driven_by_for_channel(3, &cfg, &routed, Some(68), true);
+        let case = driven_by_for_channel(3, &cfg, &routed, Some(68), true, &decision);
         assert_eq!(case.len(), 3);
         assert_eq!(case[0].name, "self:cpu");
         assert_eq!(case[1].name, "hwmon-temps (max)");
@@ -693,11 +803,15 @@ mod tests {
 
     #[test]
     fn claimed_it87_sink_satisfies_the_driving_contract() {
-        let dec = Decision::Zone {
-            cpu_raw: 70,
-            cpu_smoothed: 68,
-            case_raw: 60,
-            case_smoothed: 58,
+        let dec = Decision {
+            baseline: BaselineDecision::Zone {
+                cpu_raw: 70,
+                cpu_smoothed: 68,
+                case_raw: 60,
+                case_smoothed: 58,
+                case_pct: 75,
+            },
+            case_overlay: PolicyOutcome::Inactive,
         };
         let cpu = dec.driving_for(true, 40);
         assert_eq!(cpu.input, Some(68.0));
@@ -716,5 +830,49 @@ mod tests {
         assert!(Report::ok(vec![], vec![], vec![sink])
             .sink_contract_violations()
             .is_empty());
+    }
+
+    #[test]
+    fn policy_fail_high_changes_case_channels_but_keeps_cpu_decision() {
+        let decision = Decision {
+            baseline: BaselineDecision::Zone {
+                cpu_raw: 68,
+                cpu_smoothed: 66,
+                case_raw: 60,
+                case_smoothed: 58,
+                case_pct: 40,
+            },
+            case_overlay: PolicyOutcome::FailHigh {
+                warning: "required nvme telemetry missing".into(),
+            },
+        };
+        let cpu = decision.driving_for(true, 45);
+        assert_eq!(cpu.output, Some(45.0));
+        assert_eq!(cpu.how.as_deref(), Some("zone:cpu"));
+
+        let case = decision.driving_for(false, 100);
+        assert_eq!(case.input, Some(1.0));
+        assert_eq!(case.output, Some(100.0));
+        assert_eq!(case.how.as_deref(), Some("case-policy:fail-high"));
+        assert_eq!(decision.warning(), Some("required nvme telemetry missing"));
+    }
+
+    #[test]
+    fn case_overlay_only_raises_configured_case_channels() {
+        let mut commanded = vec![(1, 40), (3, 30), (4, 80), (5, 50)];
+        apply_case_overlay(&mut commanded, &[3, 4, 5], Some(65));
+        assert_eq!(commanded, vec![(1, 40), (3, 65), (4, 80), (5, 65)]);
+
+        let mut unchanged = vec![(1, 40), (3, 30), (4, 80), (5, 50)];
+        apply_case_overlay(&mut unchanged, &[3, 4, 5], None);
+        assert_eq!(unchanged, vec![(1, 40), (3, 30), (4, 80), (5, 50)]);
+    }
+
+    #[test]
+    fn case_policy_path_tracks_the_resolved_main_curve_directory() {
+        assert_eq!(
+            case_policy_path("/tmp/etc/it87.curve.json"),
+            "/tmp/etc/it87.case.policy.json"
+        );
     }
 }

@@ -16,12 +16,14 @@ mod controller;
 mod curve;
 mod damper;
 mod run;
+mod signal_curve_policy;
 mod stdio;
 
 pub use controller::{Controller, Duty};
 pub use curve::{BrokenReason, Curve, CurveCache, ReloadOutcome};
 pub use damper::Damper;
 pub use run::{run, run_with, Anemos, Device, ExtraCmd, ModuleInfo, OpenMode};
+pub use signal_curve_policy::{PolicyDecision, PolicyOutcome, SignalCurvePolicy};
 pub use stdio::{install_shutdown_handlers, shutdown_requested, Event, StdinReader};
 
 // Re-export the wire types so a level-3 anemos needs only `anemos` (+ its tech crates) as deps.

@@ -2,9 +2,10 @@
 
 ## Status
 
-Status: in-progress
+Status: paused
 
-Sub-state: activated 2026-06-01 on branch `schema-v2`. User reviewed a clean-slate schema analysis
+Sub-state: paused on 2026-07-26 by user decision so the thermal-safety SOW-0022 is the sole
+in-progress SOW. Prior state: activated 2026-06-01 on branch `schema-v2`. User reviewed a clean-slate schema analysis
 ("assume aiolos has not been developed; we want the ideal schema") and **agreed** to the label-driven
 model (decisions D1–D4 below). This is the **data-model foundation** of the SOW-0014 v2 umbrella and
 **supersedes SOW-0017's nested `components[] → publishers[] + sinks[]` report schema**. Scope here is the

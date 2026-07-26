@@ -15,6 +15,10 @@ pub struct Curve {
 }
 
 impl Curve {
+    pub(crate) fn from_points(points: BTreeMap<i32, i32>) -> Self {
+        Curve { points }
+    }
+
     pub fn from_json(map: &serde_json::Map<String, Value>) -> Self {
         let mut points = BTreeMap::new();
         for (k, v) in map {
@@ -54,7 +58,8 @@ impl Curve {
                 if lo_t == hi_t {
                     *lo_p
                 } else {
-                    let t = (temp_c - lo_t) as f64 / (*hi_t - *lo_t) as f64;
+                    // Convert before subtracting so valid extreme i32 curve points cannot overflow.
+                    let t = (temp_c as f64 - *lo_t as f64) / (*hi_t as f64 - *lo_t as f64);
                     (*lo_p as f64 + t * (*hi_p as f64 - *lo_p as f64)) as i32
                 }
             }
@@ -218,6 +223,15 @@ mod tests {
     fn empty_curve() {
         assert!(Curve::default().is_empty());
         assert_eq!(Curve::default().eval(50), 0);
+    }
+
+    #[test]
+    fn interpolation_handles_extreme_temperature_points_without_overflow() {
+        let mut points = BTreeMap::new();
+        points.insert(i32::MIN, 0);
+        points.insert(i32::MAX, 100);
+        let curve = Curve::from_points(points);
+        assert_eq!(curve.eval(0), 50);
     }
 
     #[test]

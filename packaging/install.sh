@@ -52,11 +52,18 @@ install_if_absent() {
 install_if_absent packaging/aiolos.conf            "${ETC}/aiolos.conf"
 install_if_absent packaging/nvidia.curve.json      "${ETC}/nvidia.curve.json"
 install_if_absent packaging/rome2d-fans.curve.json "${ETC}/rome2d-fans.curve.json"
-# it87 (consumer board fans): uniform fallback + the two zone curves (zone mode active when both
-# zone curves are present) + the board-wiring template (commented; built-in defaults stand).
+install_if_absent packaging/rome2d-fans.case.policy.json \
+                  "${ETC}/rome2d-fans.case.policy.json"
+install_if_absent packaging/rome2d-fans.case.nvme.curve.json \
+                  "${ETC}/rome2d-fans.case.nvme.curve.json"
+# it87 (consumer board fans): uniform fallback + two zone curves + a disabled source-policy example
+# and its NVMe curve + the board-wiring template (commented; built-in defaults stand).
 install_if_absent packaging/it87.curve.json        "${ETC}/it87.curve.json"
 install_if_absent packaging/it87.cpu.curve.json    "${ETC}/it87.cpu.curve.json"
 install_if_absent packaging/it87.case.curve.json   "${ETC}/it87.case.curve.json"
+install_if_absent packaging/it87.case.policy.json  "${ETC}/it87.case.policy.json"
+install_if_absent packaging/it87.case.nvme.curve.json \
+                  "${ETC}/it87.case.nvme.curve.json"
 install_if_absent packaging/it87.conf              "${ETC}/it87.conf"
 # hwmon-temps (sysfs monitoring): chip-list template (commented; built-in default set stands).
 install_if_absent packaging/hwmon-temps.conf       "${ETC}/hwmon-temps.conf"

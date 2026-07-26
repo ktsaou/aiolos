@@ -2,7 +2,7 @@
 //!
 //! The supervisor is the SOLE writer of `state.instances` for its module's keys (insert on spawn,
 //! remove on vanish/death) — so there is no registration race with the worker threads. It prunes
-//! the blackboard whenever it removes an instance, so stale components are never relayed as inputs.
+//! the blackboard whenever it removes an instance, so stale signals are never relayed as inputs.
 
 use crate::instance::{
     set_nonblocking, write_line_deadline, Instance, InstanceCmd, LineReader, ReadOutcome,
@@ -321,7 +321,7 @@ impl Supervisor {
         let key = self.key(id);
         if let Ok(mut s) = self.state.write() {
             s.instances.remove(&key);
-            // Prune the blackboard so a dead instance's stale components are never relayed.
+            // Prune the blackboard so a dead instance's stale signals are never relayed.
             s.blackboard.remove(&key);
             // Drop the scheduler slot too, so its lifecycle matches the instance's. Otherwise a stale
             // `busy`/`last_dispatch` could survive into a respawn with the same key when the main

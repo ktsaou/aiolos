@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "enabled": false,
+  "rules": [
+    {
+      "name": "nvme",
+      "match": {
+        "module": [
+          "nvme"
+        ],
+        "labels": {
+          "type": [
+            "temperature"
+          ]
+        }
+      },
+      "curve": "rome2d-fans.case.nvme.curve.json",
+      "required": true
+    }
+  ]
+}

@@ -14,62 +14,89 @@ Status: implemented. This is the authoritative wire contract; `DESIGN.md` holds 
 - `<module> run <ID>` — persistent process bound to one detected ID; answers `apply`/`shutdown`.
 - `<module> info [ID]` / `<module> collect [ID]` — one-shot read-only live snapshot. It opens
   devices in observe mode, calls the SDK `collect` path, emits a `detect`-shaped response with live
-  component values, and exits. It MUST NOT claim, set, release, or restore hardware.
+  signal values, and exits. It MUST NOT claim, set, release, or restore hardware.
 - `<module> schema` — one-shot schema-only detect response for humans/tools.
 - `<module> restore` — one-shot: restore every device this module manages to firmware/auto-safe, then exit. Idempotent.
 
 ## hello (optional, module → orchestrator, once at startup)
 ```json
-{"hello":{"proto":1,"name":"nvidia","modes":["detect","run"]}}
+{"hello":{"proto":2,"name":"nvidia","modes":["detect","run"]}}
 ```
-`proto` is the protocol version (`1`). aiolos skips a leading `hello` on detect/run streams.
+`proto` is the protocol version (`2`). aiolos skips a leading `hello` on detect/run streams.
 
 ## Status model
 Every `detect`, `info`/`collect`, and `apply` response carries `status` ∈ {`ok`,`error`,`fatal`}.
-- `ok` — the module did its job; `found`/`components` are authoritative (empty is real). Optional `error` is a non-fatal warning.
+- `ok` — the module did its job; `units`/`components`/`signals` are authoritative (empty is real).
+  An optional `error` is a non-fatal warning, not a failed report.
 - `error` — transient: it could not do the job this time. Not "no devices". aiolos keeps existing instances and retries.
 - `fatal` — cannot work for this ID/host now (wrong hardware, missing capability, invalid startup curve). aiolos surfaces it and retries on long backoff.
 
 Faults MUST be reported explicitly with `status:error`/`fatal` + `error`. Exiting, returning empty, or silence to indicate a fault is non-conformant.
 
-## Component report schema
+## Unit / component / signal report schema
 `detect` schema surfaces, live `info`/`collect` snapshots, and live `apply` reports use the same
-stable component model:
+flat model. Detect omits live `value`; live reports include it when known.
 
 ```json
 {
-  "id":"gpu",
-  "label":"GPU-...",
-  "class":"gpu",
-  "publishers":[{"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"}],
-  "sinks":[{"id":"fans","label":"GPU fans","kind":"fan-duty","value":55,"unit":"%","range":[0,100],"safe":"auto","needs_claim":true,"state":"claimed","driven_by":[{"from":"self","publisher":"temp","value":63,"unit":"C"}]}]
+  "status":"ok",
+  "units":[
+    {"id":"gpu:<stable-id>","labels":{"type":"gpu","name":"gpu0","description":"GPU"}}
+  ],
+  "components":[
+    {"id":"gpu:<stable-id>:thermal","unit":"gpu:<stable-id>",
+     "labels":{"type":"temperature","name":"thermal"}},
+    {"id":"gpu:<stable-id>:fan0","unit":"gpu:<stable-id>",
+     "labels":{"type":"fan","name":"fan0"}}
+  ],
+  "signals":[
+    {"id":"gpu:<stable-id>:thermal:temp","component":"gpu:<stable-id>:thermal",
+     "role":"producer","value":63,"uom":"C",
+     "labels":{"type":"temperature","name":"temperature"}},
+    {"id":"gpu:<stable-id>:fan0:duty","component":"gpu:<stable-id>:fan0",
+     "role":"sink","value":55,"uom":"%","range":[0,100],
+     "labels":{"type":"fan-duty","name":"duty"},
+     "control":{"needs_claim":true,"state":"claimed","safe":"auto",
+       "direction":"up=more-cooling",
+       "driven_by":[{"name":"gpu0","value":63,"uom":"C",
+                     "signal":"gpu:<stable-id>:thermal:temp"}],
+       "driving":{"type":"temperature","raw":63,"input":63,"uom":"C",
+                  "output":55,"how":"self→curve"}}}
+  ]
 }
 ```
 
 Rules:
-- `Component.id`, `Publisher.id`, and `Sink.id` are stable local IDs. They are local to their parent unless documented otherwise.
-- `class` is an open device kind used for UI grouping/icons (`gpu`, `cpu`, `ssd`, `board`, `power`, `nic`, …).
-- Publishers are normalized scalar streams: `{id,label,kind,value?,unit?,range?}`. `value` is absent on schema-only detect surfaces and present on live reports when known.
-- Sinks are controllable outputs: `{id,label,kind,range?,unit?,value?,readback?,safe?,needs_claim,state,direction?,driven_by?}`.
+- `Unit.id`, `Component.id`, and `Signal.id` are stable, system-derived IDs. Components reference
+  their parent through `unit`; signals reference theirs through `component`.
+- Every entity has an open `labels` bag. Reserved cross-project labels are `type`, `name`, and
+  `description`; `type` is an open semantic tag.
+- `Signal.role` is `producer|sink`. Producers are read-only values. Sink-only control semantics live
+  in typed `control`, not labels.
+- `uom` is unit of measure and is distinct from the hardware `Unit` entity.
 - `state` is `released|claimed|diverged|unknown`.
-- Consumers MUST NOT re-publish foreign devices. Consumed values are represented as sink `driven_by` metadata.
-- Extra keys are allowed on components/publishers/sinks for forward compatibility; aiolos relays them verbatim.
+- Every claimed sink must include `control.driving.input` and `.output`; `driven_by` identifies the
+  producer signals which contributed to the decision.
+- Consumers MUST NOT re-publish foreign devices. Consumed values are represented as sink
+  `control.driven_by` metadata.
 
 ## detect
 ```json
 → {"cmd":"detect"}
-← {"status":"ok","found":[{"id":"<stable-id>","type":"GPU","name":"…","components":[{"id":"gpu","label":"GPU","class":"gpu","publishers":[{"id":"temp","label":"Temperature","kind":"temperature","unit":"C"}]}]}]}
+← {"status":"ok","units":[{"id":"<stable-id>","labels":{"type":"gpu","name":"gpu0"}}],
+   "components":[...],"signals":[...]}
 ← {"status":"error","error":"NVML init failed: …"}
 ← {"status":"fatal","error":"no /dev/ipmi0 on this host"}
 ```
-- On `ok`, `found` is authoritative. Empty means genuinely no devices.
-- `id` is stable across re-detect and device drop/return (GPU UUID, NVMe serial, `board`, etc.; never an unstable index).
-- A bare legacy `{"found":[...]}` with no `status` is accepted as `ok`; new modules must include `status`.
+- On `ok`, `units` is authoritative. Aiolos spawns one `run <ID>` per `units[].id`; empty means
+  genuinely no devices.
+- Unit IDs are stable across re-detect and device drop/return (GPU UUID, NVMe serial, `board`, etc.;
+  never an unstable index).
 
 ## info / collect (read-only one-shot)
 ```json
 $ <module> info [ID]
-← {"status":"ok","found":[{"id":"<stable-id>","type":"GPU","name":"…","components":[{"id":"gpu","label":"GPU","class":"gpu","publishers":[{"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"}]}]}]}
+← {"status":"ok","units":[...],"components":[...],"signals":[...]}
 ```
 - `info` and `collect` are aliases in the Rust SDK. They are companion/diagnostic CLI surfaces, not
   orchestrator heartbeat messages.
@@ -77,19 +104,27 @@ $ <module> info [ID]
 - Observe mode MUST NOT claim/set/release hardware, and MUST NOT arm restore-on-drop side effects.
 - With `[ID]`, only that detected ID is reported; an unknown ID returns `fatal`.
 - Non-fatal per-device collect failures may be aggregated in the top-level `error` field while any
-  successfully collected devices still include their components.
+  successfully collected devices still include their entities.
 
 ## apply
 ```json
-→ {"cmd":"apply","inputs":{"nvidia:GPU-...": [{"id":"gpu","label":"GPU","class":"gpu","publishers":[{"id":"temp","label":"Temperature","kind":"temperature","value":63,"unit":"C"}]}]}}
-← {"status":"ok","components":[{"id":"board","label":"ROME2D16-2T","class":"board","publishers":[...],"sinks":[...]}]}
+→ {"cmd":"apply","inputs":{"nvidia:GPU-...":[
+     {"id":"gpu:<stable-id>:thermal:temp","component":"gpu:<stable-id>:thermal",
+      "role":"producer","value":63,"uom":"C","labels":{"type":"temperature"}}
+   ]}}
+← {"status":"ok","units":[...],"components":[...],"signals":[...]}
 ← {"status":"error","error":"device read failed"}
 ← {"status":"fatal","error":"GPU unsupported"}
 ```
 - `inputs` is present only when registry wires `input=<module>` (repeat `input=` or comma-list for multiple sources).
-- `inputs` maps each source instance's **`module:id`** key to that instance's full **component list** from the most recent completed `apply`.
-- aiolos relays inputs verbatim and uninterpreted. Consumers select the publishers/sinks they understand, optionally filtering by source key prefix.
-- On `ok`, `components` is authoritative for this instance's current live report. It replaces the old flat `readings[]` model.
+- `inputs` maps each source instance's **`module:id`** key to that instance's fresh **signal list**
+  from its most recent successful, non-empty `apply`.
+- Aiolos relays signals verbatim and uninterpreted. Consumers select the producer/sink signals they
+  understand, optionally filtering by source key prefix or exact signal fields/labels.
+- A source `error`/`fatal` or authoritative `ok` with an empty signal list immediately removes that
+  source from the routing blackboard. The next consumer dispatch therefore sees telemetry loss
+  rather than a stale last-good value.
+- On `ok`, `units`/`components`/`signals` are authoritative for this instance's current live report.
 - The run process knows its own ID from argv; `apply` does not repeat it.
 - Invalid startup curve for a control module: the module must not regulate, must answer first `apply` with `fatal` explaining the curve problem, then exit non-zero so aiolos retries on long backoff. Sensor-only modules are exempt.
 
@@ -110,11 +145,11 @@ A `run` instance MUST catch SIGTERM/SIGINT and restore itself. The signal handle
 
 ## Conformance checklist
 1. stdout emits only valid one-line JSON; logs only on stderr.
-2. `detect` returns stable IDs and component schema.
-3. `info`/`collect` returns live component values through read-only `collect`, without side effects.
-4. `apply` returns live `components[]`; faults are explicit `error`/`fatal`.
-5. `apply.inputs` consumes component lists keyed by `module:id` when wired.
-6. No module re-publishes foreign devices; use `sink.driven_by` for consumed inputs.
+2. `detect` returns stable unit IDs and flat unit/component/signal schema.
+3. `info`/`collect` returns live signal values through read-only `collect`, without side effects.
+4. `apply` returns live `units[]`/`components[]`/`signals[]`; faults are explicit `error`/`fatal`.
+5. `apply.inputs` consumes fresh signal lists keyed by `module:id` when wired.
+6. No module re-publishes foreign devices; use `sink.control.driven_by` for consumed inputs.
 7. `apply` returns within `timeout` or aiolos can kill it without harming siblings.
 8. `shutdown`, stdin EOF, and SIGTERM/SIGINT restore safe/auto state.
 9. `<module> restore` is idempotent and restores every managed device.

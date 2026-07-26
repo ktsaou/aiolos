@@ -2,9 +2,10 @@
 
 ## Status
 
-Status: in-progress
+Status: paused
 
-Sub-state: activated by the user on 2026-06-06 despite existing SOWs in `.agents/sow/current/`.
+Sub-state: paused on 2026-07-26 by user decision so the thermal-safety SOW-0022 is the sole
+in-progress SOW. Prior state: activated by the user on 2026-06-06 despite existing SOWs in `.agents/sow/current/`.
 The scope is now a best-in-class open-source quality program: eliminate or justify Codacy findings,
 reduce real code complexity and duplication, submit coverage to Codacy, and add durable quality gates.
 

@@ -10,6 +10,7 @@ authors.workspace = true
 # wire-type `protocol` crate; knows nothing about any specific device technology.
 [dependencies]
 protocol = { path = "../protocol" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

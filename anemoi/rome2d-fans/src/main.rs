@@ -10,8 +10,8 @@
 //! carries its own per-zone `driving` record), and per-socket `cpu1`/`cpu2` components from k10temp
 //! (read per instance, so they merge with `ipmi-temps`' CPU1/CPU2 package sensors).
 //!
-//! The control path (read routed temps, compute duties via curve+EMA, drive the 8 fans, fault
-//! detection, release-to-auto fail-safe) is UNCHANGED from v1 — this is a reporting refactor.
+//! The control path reads routed/local temperatures, computes the established baseline plus optional
+//! source-matched case overlays, drives all 8 fans, detects faults, and releases to BMC auto on exit.
 
 mod board;
 mod fault;
@@ -19,7 +19,7 @@ mod zones;
 
 use anemos::{
     Anemos, Component, Control, Controller, Device, Driving, ExtraCmd, Inputs, ModuleInfo,
-    OpenMode, Provenance, Report, Signal, SinkState, Unit,
+    OpenMode, PolicyOutcome, Provenance, Report, Role, Signal, SignalCurvePolicy, SinkState, Unit,
 };
 use board::Board;
 use fault::FanFaultTracker;
@@ -86,6 +86,7 @@ impl Anemos for Rome2dFans {
             board,
             restore_armed: mode == OpenMode::Control,
             zones: None,
+            case_policy: None,
             faults: FanFaultTracker::new(),
         }))
     }
@@ -105,6 +106,7 @@ struct Rome2dFansDevice {
     board: Board,
     restore_armed: bool,
     zones: Option<ZoneControllers>,
+    case_policy: Option<SignalCurvePolicy>,
     faults: FanFaultTracker,
 }
 
@@ -123,23 +125,20 @@ impl Device for Rome2dFansDevice {
     }
 
     fn apply(&mut self, inputs: Option<&Inputs>, ctrl: &mut Controller) -> Report {
-        // --- control path (UNCHANGED from v1) ---------------------------------------------------
-        let gpu_temps = input_temps_from(inputs, "nvidia");
-        let nvme_temps = input_temps_from(inputs, "nvme");
+        // --- control path -----------------------------------------------------------------------
+        let routed_temp_maxes = input_temp_maxes_by_module(inputs);
         let cpu_temps = hwmon::read_temps("k10temp");
-        let gpu_max = gpu_temps.iter().copied().max();
-        let nvme_max = nvme_temps.iter().copied().max();
-        let cpu_max = cpu_temps.iter().map(|(_, t)| *t).max();
+        let (cpu_components_snapshot, local_cpu_signals) = cpu_components();
+        let cpu_max = cpu_temps.iter().map(|(_, value)| *value).max();
         let input_max = input_temps(inputs).into_iter().max();
         let raw_driving = [input_max, cpu_max].into_iter().flatten().max();
-
         let zones = self
             .zones
             .get_or_insert_with(|| ZoneControllers::for_main_path(ctrl.path()));
         let zone_mode = zones.both_present();
         let confirmed = self.faults.confirmed();
 
-        let outcome = if zone_mode {
+        let (baseline, base) = if zone_mode {
             let (Some(cpu_raw), Some(case_raw)) = (cpu_max, input_max) else {
                 self.reset_zone_dampers();
                 return release_or_error(
@@ -153,8 +152,6 @@ impl Device for Rome2dFansDevice {
                 self.reset_zone_dampers();
                 return release_or_error(&mut self.board, "zone mode: no usable curve");
             };
-            let base = zones::per_fan_duties(cpu_pct, case_pct);
-            let commanded = fault::compensate(base, &confirmed);
             tracing::info!(
                 cpu_raw,
                 case_raw,
@@ -162,19 +159,17 @@ impl Device for Rome2dFansDevice {
                 case_smoothed = case_duty.smoothed,
                 cpu_pct,
                 case_pct,
-                ?commanded,
-                ?confirmed,
-                "decision: set board fans (zone mode)"
+                "baseline decision: board fan zones"
             );
-            if let Err(e) = self.board.set_fans_per_fan(&commanded.map(|p| p as i32)) {
-                return Report::error(format!("set fans: {e}"));
-            }
-            ApplyOutcome::zone(
-                commanded,
-                cpu_raw,
-                case_raw,
-                cpu_duty.smoothed,
-                case_duty.smoothed,
+            (
+                BaselineOutcome::Zone {
+                    cpu_raw,
+                    case_raw,
+                    cpu_smoothed: cpu_duty.smoothed,
+                    case_smoothed: case_duty.smoothed,
+                    case_pct,
+                },
+                zones::per_fan_duties(cpu_pct, case_pct),
             )
         } else {
             let Some(raw) = raw_driving else {
@@ -184,27 +179,59 @@ impl Device for Rome2dFansDevice {
             let Some(pct) = duty.pct else {
                 return release_or_error(&mut self.board, "no usable curve");
             };
-            let base = [pct; 8];
-            let commanded = fault::compensate(base, &confirmed);
-            tracing::info!(gpu_max = ?gpu_max, nvme_max = ?nvme_max, cpu_max = ?cpu_max,
+            tracing::info!(routed_temp_maxes = ?routed_temp_maxes, cpu_max = ?cpu_max,
                 raw_driving = raw, smoothed_driving = duty.smoothed,
-                commanded_pct = pct, ?commanded, ?confirmed,
-                "decision: set all board fans (uniform)");
-            let set = if commanded == base {
-                self.board.set_all_fans(pct as i32)
-            } else {
-                self.board.set_fans_per_fan(&commanded.map(|p| p as i32))
-            };
-            if let Err(e) = set {
-                return Report::error(format!("set fans: {e}"));
-            }
-            ApplyOutcome::uniform(commanded, raw, duty.smoothed)
+                commanded_pct = pct, "baseline decision: all board fans (uniform)");
+            (
+                BaselineOutcome::Uniform {
+                    raw,
+                    smoothed: duty.smoothed,
+                    pct,
+                },
+                [pct; 8],
+            )
+        };
+
+        let case_policy = self
+            .case_policy
+            .get_or_insert_with(|| SignalCurvePolicy::new(case_policy_path(ctrl.path())))
+            .evaluate(inputs, &local_cpu_signals);
+        if let Some(warning) = case_policy.warning() {
+            tracing::warn!(
+                path = %self.case_policy.as_ref().expect("policy initialized").path().display(),
+                %warning,
+                "case-fan overlay failed high"
+            );
+        }
+
+        let requested = apply_case_overlay(base, case_policy.overlay_pct());
+        let commanded = fault::compensate(requested, &confirmed);
+        tracing::info!(
+            baseline_case_pct = baseline.case_pct(),
+            overlay_pct = ?case_policy.overlay_pct(),
+            ?commanded,
+            ?confirmed,
+            "decision: set board fans (baseline plus case overlay)"
+        );
+        let set = if commanded.iter().all(|pct| *pct == commanded[0]) {
+            self.board.set_all_fans(commanded[0] as i32)
+        } else {
+            self.board
+                .set_fans_per_fan(&commanded.map(|pct| pct as i32))
+        };
+        if let Err(error) = set {
+            return Report::error(format!("set fans: {error}"));
+        }
+        let outcome = ApplyOutcome {
+            commanded,
+            baseline,
+            case_overlay: case_policy,
         };
         // --- end control path -------------------------------------------------------------------
 
         // Report stage: REAL CPU temps (per socket) + the 8 fans, each carrying its own per-zone
         // `driving` record. No driving-* producer signals — driving lives on the sinks.
-        let (mut components, mut signals) = cpu_components();
+        let (mut components, mut signals) = (cpu_components_snapshot, local_cpu_signals);
 
         // Observability read AFTER the control decision (short timeout): true per-fan duty + RPM.
         let (duty_readback, fan_rpms) = self.board.read_fan_status();
@@ -220,7 +247,7 @@ impl Device for Rome2dFansDevice {
                 );
             }
         }
-        let drives = fan_drives(&outcome, gpu_max, nvme_max, cpu_max);
+        let drives = fan_drives(&outcome, &routed_temp_maxes, cpu_max);
         let (mut fc, mut fs) = fan_components(
             &fan_rpms,
             duty_readback.as_deref(),
@@ -229,7 +256,10 @@ impl Device for Rome2dFansDevice {
         );
         components.append(&mut fc);
         signals.append(&mut fs);
-        Report::ok(vec![board_unit()], components, signals)
+        match outcome.warning() {
+            Some(warning) => Report::ok_warn(vec![board_unit()], components, signals, warning),
+            None => Report::ok(vec![board_unit()], components, signals),
+        }
     }
 
     fn restore(&mut self) {
@@ -318,64 +348,76 @@ fn prov(name: &str, v: Option<i32>) -> Option<Provenance> {
 /// CPU fans (FAN1/2) by CPU temp, case fans (FAN3–8) by the routed (GPU/NVMe) max. Accurate per fan.
 fn fan_drives(
     outcome: &ApplyOutcome,
-    gpu_max: Option<i32>,
-    nvme_max: Option<i32>,
+    routed_temp_maxes: &[SourceTempMax],
     cpu_max: Option<i32>,
 ) -> [FanDrive; 8] {
-    let gpu = prov("gpu (max)", gpu_max);
-    let nvme = prov("nvme (max)", nvme_max);
     let cpu = prov("cpu (max)", cpu_max);
-    match outcome {
-        ApplyOutcome::Uniform {
-            commanded,
-            raw,
-            smoothed,
-            ..
-        } => std::array::from_fn(|i| FanDrive {
-            driven_by: [gpu.clone(), nvme.clone(), cpu.clone()]
-                .into_iter()
-                .flatten()
-                .collect(),
-            driving: Driving::new()
-                .kind("temperature")
-                .raw(*raw as f64)
-                .input(*smoothed as f64)
+    let routed: Vec<Provenance> = routed_temp_maxes
+        .iter()
+        .map(|source| {
+            Provenance::new(format!("{} (max)", source.module))
+                .value(json!(source.value))
                 .uom("C")
-                .output(commanded[i] as f64)
-                .how("uniform: max(gpu,nvme,cpu)→curve"),
-        }),
-        ApplyOutcome::Zone {
-            commanded,
-            cpu_raw,
-            case_raw,
-            cpu_smoothed,
-            case_smoothed,
-        } => std::array::from_fn(|i| {
-            if i < 2 {
-                FanDrive {
-                    driven_by: [cpu.clone()].into_iter().flatten().collect(),
-                    driving: Driving::new()
-                        .kind("temperature")
-                        .raw(*cpu_raw as f64)
-                        .input(*cpu_smoothed as f64)
-                        .uom("C")
-                        .output(commanded[i] as f64)
-                        .how("zone:cpu"),
-                }
-            } else {
-                FanDrive {
-                    driven_by: [gpu.clone(), nvme.clone()].into_iter().flatten().collect(),
-                    driving: Driving::new()
-                        .kind("temperature")
-                        .raw(*case_raw as f64)
-                        .input(*case_smoothed as f64)
-                        .uom("C")
-                        .output(commanded[i] as f64)
-                        .how("zone:case"),
-                }
+        })
+        .collect();
+    std::array::from_fn(|i| {
+        let baseline = match &outcome.baseline {
+            BaselineOutcome::Uniform { raw, smoothed, .. } => FanDrive {
+                driven_by: routed.iter().cloned().chain(cpu.clone()).collect(),
+                driving: Driving::new()
+                    .kind("temperature")
+                    .raw(*raw as f64)
+                    .input(*smoothed as f64)
+                    .uom("C")
+                    .output(outcome.commanded[i] as f64)
+                    .how("uniform: max(routed,cpu)→curve"),
+            },
+            BaselineOutcome::Zone {
+                cpu_raw,
+                cpu_smoothed,
+                ..
+            } if i < 2 => FanDrive {
+                driven_by: [cpu.clone()].into_iter().flatten().collect(),
+                driving: Driving::new()
+                    .kind("temperature")
+                    .raw(*cpu_raw as f64)
+                    .input(*cpu_smoothed as f64)
+                    .uom("C")
+                    .output(outcome.commanded[i] as f64)
+                    .how("zone:cpu"),
+            },
+            BaselineOutcome::Zone {
+                case_raw,
+                case_smoothed,
+                ..
+            } => FanDrive {
+                driven_by: routed.clone(),
+                driving: Driving::new()
+                    .kind("temperature")
+                    .raw(*case_raw as f64)
+                    .input(*case_smoothed as f64)
+                    .uom("C")
+                    .output(outcome.commanded[i] as f64)
+                    .how("zone:case"),
+            },
+        };
+
+        if i >= 2
+            && outcome
+                .case_overlay
+                .overlay_pct()
+                .is_some_and(|overlay| overlay >= outcome.baseline.case_pct())
+        {
+            if let Some(mut driving) = outcome.case_overlay.driving() {
+                driving.output = Some(outcome.commanded[i] as f64);
+                return FanDrive {
+                    driven_by: outcome.case_overlay.driven_by(),
+                    driving,
+                };
             }
-        }),
-    }
+        }
+        baseline
+    })
 }
 
 /// Build the `fan1..fan8` components: an `rpm` producer + a `duty` sink. `drives` present => aiolos
@@ -446,30 +488,52 @@ fn fan_components(
     (components, signals)
 }
 
-/// What the apply tick decided, carried to the report stage.
-enum ApplyOutcome {
+/// Existing fan calculation before optional case-only overlays.
+enum BaselineOutcome {
     Uniform {
-        commanded: [u32; 8],
         raw: i32,
         smoothed: i32,
+        pct: u32,
     },
     Zone {
-        commanded: [u32; 8],
         cpu_raw: i32,
         case_raw: i32,
         cpu_smoothed: i32,
         case_smoothed: i32,
+        case_pct: u32,
     },
 }
 
-impl ApplyOutcome {
-    fn uniform(commanded: [u32; 8], raw: i32, smoothed: i32) -> Self {
-        ApplyOutcome::Uniform {
-            commanded,
-            raw,
-            smoothed,
+impl BaselineOutcome {
+    fn case_pct(&self) -> u32 {
+        match self {
+            BaselineOutcome::Uniform { pct, .. } => *pct,
+            BaselineOutcome::Zone { case_pct, .. } => *case_pct,
         }
     }
+}
+
+/// What the apply tick decided, carried to the report stage.
+struct ApplyOutcome {
+    commanded: [u32; 8],
+    baseline: BaselineOutcome,
+    case_overlay: PolicyOutcome,
+}
+
+impl ApplyOutcome {
+    #[cfg(test)]
+    fn uniform(commanded: [u32; 8], raw: i32, smoothed: i32) -> Self {
+        ApplyOutcome {
+            commanded,
+            baseline: BaselineOutcome::Uniform {
+                raw,
+                smoothed,
+                pct: commanded[0],
+            },
+            case_overlay: PolicyOutcome::Inactive,
+        }
+    }
+    #[cfg(test)]
     fn zone(
         commanded: [u32; 8],
         cpu_raw: i32,
@@ -477,20 +541,23 @@ impl ApplyOutcome {
         cpu_smoothed: i32,
         case_smoothed: i32,
     ) -> Self {
-        ApplyOutcome::Zone {
+        ApplyOutcome {
             commanded,
-            cpu_raw,
-            case_raw,
-            cpu_smoothed,
-            case_smoothed,
+            baseline: BaselineOutcome::Zone {
+                cpu_raw,
+                case_raw,
+                cpu_smoothed,
+                case_smoothed,
+                case_pct: commanded[2],
+            },
+            case_overlay: PolicyOutcome::Inactive,
         }
     }
     fn commanded(&self) -> [u32; 8] {
-        match self {
-            ApplyOutcome::Uniform { commanded, .. } | ApplyOutcome::Zone { commanded, .. } => {
-                *commanded
-            }
-        }
+        self.commanded
+    }
+    fn warning(&self) -> Option<&str> {
+        self.case_overlay.warning()
     }
 }
 
@@ -505,6 +572,15 @@ fn release_or_error(board: &mut Board, why: &str) -> Report {
 
 fn still_armed_after(released_ok: bool) -> bool {
     !released_ok
+}
+
+fn apply_case_overlay(mut baseline: [u32; 8], overlay_pct: Option<u32>) -> [u32; 8] {
+    if let Some(overlay_pct) = overlay_pct {
+        for pct in &mut baseline[2..] {
+            *pct = (*pct).max(overlay_pct);
+        }
+    }
+    baseline
 }
 
 /// Read-only diagnostic: send only `0xda` (query duty) and print the result. Returns an exit code.
@@ -545,40 +621,71 @@ fn slug(label: &str) -> String {
         .to_string()
 }
 
-/// Extract every temperature value from ALL routed peer inputs (source-agnostic; the driving max).
+fn case_policy_path(main_curve_path: &str) -> String {
+    match main_curve_path.strip_suffix(".curve.json") {
+        Some(stem) => format!("{stem}.case.policy.json"),
+        None => format!("{main_curve_path}.case.policy.json"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceTempMax {
+    module: String,
+    value: i32,
+}
+
+/// Extract every temperature value from all routed peer inputs (legacy control reduction).
 fn input_temps(inputs: Option<&Inputs>) -> Vec<i32> {
-    let mut v = Vec::new();
+    let mut values = Vec::new();
     if let Some(inputs) = inputs {
         for signals in inputs.values() {
-            push_temps(signals, &mut v);
+            push_temps(signals, &mut values);
         }
     }
-    v
+    values
 }
 
-/// Extract temperature values only from inputs whose SOURCE MODULE is `src` (keys are `module:id`).
-fn input_temps_from(inputs: Option<&Inputs>, src: &str) -> Vec<i32> {
-    let mut v = Vec::new();
-    if let Some(inputs) = inputs {
-        let prefix = format!("{src}:");
-        for (key, signals) in inputs {
-            if key.starts_with(&prefix) {
-                push_temps(signals, &mut v);
-            }
-        }
-    }
-    v
-}
-
-/// Append the value of every `temperature` producer signal to `out`.
 fn push_temps(signals: &[Signal], out: &mut Vec<i32>) {
-    for s in signals {
-        if s.kind() == Some("temperature") {
-            if let Some(t) = s.value_i64() {
-                out.push(t as i32);
+    for signal in signals {
+        if signal.kind() == Some("temperature") {
+            if let Some(value) = signal.value_i64() {
+                out.push(value as i32);
             }
         }
     }
+}
+
+/// Extract one max temperature per routed source module (keys are `module:id`).
+fn input_temp_maxes_by_module(inputs: Option<&Inputs>) -> Vec<SourceTempMax> {
+    let mut by_module = std::collections::BTreeMap::<String, i32>::new();
+    let Some(inputs) = inputs else {
+        return Vec::new();
+    };
+    for (key, signals) in inputs {
+        let module = key
+            .split_once(':')
+            .map(|(module, _)| module)
+            .unwrap_or(key.as_str());
+        for signal in signals {
+            if signal.role != Role::Producer || signal.kind() != Some("temperature") {
+                continue;
+            }
+            let Some(value) = signal.value_i64() else {
+                continue;
+            };
+            let Ok(value) = i32::try_from(value) else {
+                continue;
+            };
+            by_module
+                .entry(module.to_string())
+                .and_modify(|max| *max = (*max).max(value))
+                .or_insert(value);
+        }
+    }
+    by_module
+        .into_iter()
+        .map(|(module, value)| SourceTempMax { module, value })
+        .collect()
 }
 
 #[cfg(test)]
@@ -602,42 +709,49 @@ mod tests {
     }
 
     #[test]
-    fn input_temps_extracts_all_temps_source_agnostic() {
+    fn input_temp_maxes_extract_all_sources_and_ignore_non_temperature_sinks() {
         let mut inputs: Inputs = HashMap::new();
-        inputs.insert("nvidia:GPU-1".into(), vec![temp_signal("gpu", 63)]);
-        inputs.insert("nvme:SER-A".into(), vec![temp_signal("ssd", 44)]);
-        let mut temps = input_temps(Some(&inputs));
-        temps.sort();
-        assert_eq!(temps, vec![44, 63], "driving max sees every routed source");
-    }
-
-    #[test]
-    fn input_temps_from_partitions_by_source_module() {
-        let mut inputs: Inputs = HashMap::new();
-        inputs.insert("nvidia:GPU-1".into(), vec![temp_signal("gpu", 63)]);
         inputs.insert("nvidia:GPU-2".into(), vec![temp_signal("gpu", 71)]);
         inputs.insert(
             "nvme:SER-A".into(),
-            vec![temp_signal("ssd", 40), temp_signal("ssd", 44)],
+            vec![
+                temp_signal("ssd", 40),
+                temp_signal("ssd", 44),
+                Signal::sink("board:fan3:duty", "board:fan3", "fan-duty").value(json!(100)),
+                temp_signal("ssd", i64::from(i32::MAX) + 1),
+            ],
         );
 
-        let mut gpu = input_temps_from(Some(&inputs), "nvidia");
-        gpu.sort();
-        assert_eq!(gpu, vec![63, 71]);
-        let mut nv = input_temps_from(Some(&inputs), "nvme");
-        nv.sort();
-        assert_eq!(nv, vec![40, 44]);
-        // A short source name must not match a longer module (the `:` guards it); unknown -> empty.
-        assert!(input_temps_from(Some(&inputs), "nv").is_empty());
-        assert!(input_temps_from(Some(&inputs), "other").is_empty());
-        assert!(input_temps_from(None, "nvidia").is_empty());
-        assert!(input_temps(None).is_empty());
+        assert_eq!(
+            input_temp_maxes_by_module(Some(&inputs)),
+            vec![
+                SourceTempMax {
+                    module: "nvidia".into(),
+                    value: 71,
+                },
+                SourceTempMax {
+                    module: "nvme".into(),
+                    value: 44,
+                },
+            ]
+        );
+        assert!(input_temp_maxes_by_module(None).is_empty());
     }
 
     #[test]
     fn uniform_fan_drives_carry_one_curve_decision_on_every_fan() {
         let o = ApplyOutcome::uniform([60; 8], 70, 68);
-        let d = fan_drives(&o, Some(64), Some(50), Some(45));
+        let sources = vec![
+            SourceTempMax {
+                module: "nvidia".into(),
+                value: 64,
+            },
+            SourceTempMax {
+                module: "nvme".into(),
+                value: 50,
+            },
+        ];
+        let d = fan_drives(&o, &sources, Some(45));
         for fd in &d {
             assert_eq!(fd.driving.output, Some(60.0));
             assert_eq!(fd.driving.raw, Some(70.0));
@@ -652,7 +766,17 @@ mod tests {
     fn zone_fan_drives_split_cpu_and_case() {
         let commanded = zones::per_fan_duties(30, 75);
         let o = ApplyOutcome::zone(commanded, 55, 72, 54, 70);
-        let d = fan_drives(&o, Some(64), Some(50), Some(55));
+        let sources = vec![
+            SourceTempMax {
+                module: "nvidia".into(),
+                value: 64,
+            },
+            SourceTempMax {
+                module: "nvme".into(),
+                value: 50,
+            },
+        ];
+        let d = fan_drives(&o, &sources, Some(55));
         // FAN1/2 = cpu zone, driven by cpu only.
         assert_eq!(d[0].driving.output, Some(30.0));
         assert_eq!(d[0].driving.input, Some(54.0));
@@ -672,7 +796,17 @@ mod tests {
         confirmed[4] = true;
         let commanded = fault::compensate(base, &confirmed);
         let o = ApplyOutcome::zone(commanded, 50, 65, 50, 64);
-        let d = fan_drives(&o, Some(60), Some(40), Some(50));
+        let sources = vec![
+            SourceTempMax {
+                module: "nvidia".into(),
+                value: 60,
+            },
+            SourceTempMax {
+                module: "nvme".into(),
+                value: 40,
+            },
+        ];
+        let d = fan_drives(&o, &sources, Some(50));
         assert_eq!(d[2].driving.output, Some(100.0), "case fans boosted");
         assert_eq!(d[0].driving.output, Some(30.0), "CPU zone unaffected");
     }
@@ -681,11 +815,75 @@ mod tests {
     fn every_claimed_board_sink_satisfies_the_driving_contract() {
         // The fan sinks aiolos commands must all carry a complete driving record (CI contract).
         let o = ApplyOutcome::uniform([55; 8], 66, 64);
-        let drives = fan_drives(&o, Some(64), Some(50), Some(45));
+        let sources = vec![
+            SourceTempMax {
+                module: "nvidia".into(),
+                value: 64,
+            },
+            SourceTempMax {
+                module: "nvme".into(),
+                value: 50,
+            },
+        ];
+        let drives = fan_drives(&o, &sources, Some(45));
         let rpms: Vec<(String, Option<i32>)> =
             (1..=8).map(|n| (format!("FAN{n}"), Some(1200))).collect();
         let (components, signals) = fan_components(&rpms, None, Some(&drives), &[false; 8]);
         let report = Report::ok(vec![board_unit()], components, signals);
         assert!(report.sink_contract_violations().is_empty());
+    }
+
+    #[test]
+    fn policy_fail_high_changes_case_fans_but_keeps_cpu_fans_on_baseline() {
+        let outcome = ApplyOutcome {
+            commanded: [45, 45, 100, 100, 100, 100, 100, 100],
+            baseline: BaselineOutcome::Zone {
+                cpu_raw: 68,
+                case_raw: 60,
+                cpu_smoothed: 66,
+                case_smoothed: 58,
+                case_pct: 40,
+            },
+            case_overlay: PolicyOutcome::FailHigh {
+                warning: "required nvme telemetry missing".into(),
+            },
+        };
+        let drives = fan_drives(&outcome, &[], Some(68));
+        assert_eq!(drives[0].driving.output, Some(45.0));
+        assert_eq!(drives[0].driving.how.as_deref(), Some("zone:cpu"));
+        assert_eq!(drives[2].driving.output, Some(100.0));
+        assert_eq!(
+            drives[2].driving.how.as_deref(),
+            Some("case-policy:fail-high")
+        );
+        assert_eq!(drives[2].driven_by.len(), 1);
+        assert_eq!(outcome.warning(), Some("required nvme telemetry missing"));
+
+        let rpms: Vec<(String, Option<i32>)> =
+            (1..=8).map(|n| (format!("FAN{n}"), Some(1200))).collect();
+        let (components, signals) = fan_components(&rpms, None, Some(&drives), &[false; 8]);
+        assert!(Report::ok(vec![board_unit()], components, signals)
+            .sink_contract_violations()
+            .is_empty());
+    }
+
+    #[test]
+    fn case_overlay_only_raises_all_six_case_fans() {
+        assert_eq!(
+            apply_case_overlay([40, 45, 30, 50, 65, 70, 80, 90], Some(65)),
+            [40, 45, 65, 65, 65, 70, 80, 90]
+        );
+        assert_eq!(
+            apply_case_overlay([40, 45, 70, 70, 70, 70, 70, 70], None),
+            [40, 45, 70, 70, 70, 70, 70, 70]
+        );
+    }
+
+    #[test]
+    fn case_policy_path_tracks_the_resolved_main_curve_directory() {
+        assert_eq!(
+            case_policy_path("/tmp/etc/rome2d-fans.curve.json"),
+            "/tmp/etc/rome2d-fans.case.policy.json"
+        );
     }
 }

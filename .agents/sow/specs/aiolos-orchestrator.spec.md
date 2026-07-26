@@ -17,8 +17,8 @@ nvidia                       every=500ms timeout=3
 nvme
 rome2d-fans  input=nvidia input=nvme
 ```
-- `input=<module>`: relay that module's instances' last `components` arrays into this module's
-  `apply.inputs` (component lists keyed by `module:id`). **Multiple sources** are allowed — repeat `input=` and/or
+- `input=<module>`: relay that module's instances' fresh `signals` arrays into this module's
+  `apply.inputs` (signal lists keyed by `module:id`). **Multiple sources** are allowed — repeat `input=` and/or
   use a comma list (`input=nvidia input=nvme` ≡ `input=nvidia,nvme`); order preserved, duplicates
   dropped. Unknown module directives are preserved but ignored (forward-compat). Unknown globals are
   warned + ignored.
@@ -43,13 +43,13 @@ rome2d-fans  input=nvidia input=nvme
 1. **Start:** read registry → spawn one `detect` process per module.
 2. **Detect/reconcile** (every `detect_every`, default 10 s): send `detect`; react to the module's
    declared `status` (it is never inferred from empty/exit/silence):
-   - `ok` → `found` is authoritative; diff against running instances → spawn new `run <id>`, shut
-     down vanished ones (empty `found` legitimately tears all down).
+   - `ok` → `units` is authoritative; diff IDs against running instances → spawn new `run <id>`,
+     shut down vanished ones (empty `units` legitimately tears all down).
    - `error` → keep the current instances (a transient fault is NOT "no devices"), surface the
      reason, recycle the detect process, retry next cycle.
    - `fatal` → keep instances, surface loudly, retry only on a long backoff (the `max_backoff` cap).
    - **unresponsive/crashed** (no reply / dead detect process) — backstop only: recycle it, keep
-     instances (last good `found` is retained so reconcile never tears down on a detect outage).
+     instances (last good `units` is retained so reconcile never tears down on a detect outage).
    A `detect` process that exits is respawned. NVML/IPMI handles are initialised once per process
    (re-initialising per cycle leaks fds → EMFILE).
 3. **Scheduler** (SOW-0013 — replaces the lockstep heartbeat). The main loop wakes every `base_tick`
@@ -70,14 +70,17 @@ rome2d-fans  input=nvidia input=nvme
    sibling (the isolation guarantee). A response line larger than 256 KiB is a protocol violation and
    killed. A leading optional `hello` line is consumed/skipped. No instance ever blocks the scheduler
    or another instance: the loop never waits on a reply.
-4. **apply result handling:** `ok` → store components (+ blackboard), record latency, mark idle.
+4. **apply result handling:** `ok` → store the authoritative entities, record latency, mark idle;
+   a non-empty signal list replaces that instance's routing blackboard entry. `error`/`fatal` and
+   authoritative `ok` with no signals remove the routing entry immediately, so consumers see
+   telemetry loss instead of stale last-good signals.
    `error` → keep the instance, surface the reason, retry next time it is due. `fatal`
    (module-declared) → respawn on a **long backoff** (jumps straight to the `max_backoff` cap).
    Missed `timeout` / process exit / protocol violation → `SIGKILL` if needed and respawn with per-id
    **exponential** crash-loop backoff (2,4,8,… seconds, capped at `max_backoff`; backstop). aiolos
    **never gives up** — it retries forever, only ever slowing to the cap. The module's own
    shutdown/EOF path performs the device-safe restore. When an instance is removed (vanished or dead)
-   its blackboard entry **and its scheduler slot** are pruned, so stale components are never relayed as
+   its blackboard entry **and its scheduler slot** are pruned, so stale signals are never relayed as
    `inputs`.
    - A **control module that cannot load a usable curve at startup** declares this `fatal` on its
      first `apply` (so the reason reaches the status page) and exits non-zero, leaving its device
@@ -105,17 +108,20 @@ rome2d-fans  input=nvidia input=nvme
   Keeps the unit config-agnostic (no module names in the unit file).
 
 ## Data routing (blackboard)
-The orchestrator keeps each instance's last `components`. For a module configured `input=X [Y …]`, it
-includes every named source's instances' components (keyed by `module:id`, so the consumer can
-attribute each component/publisher to its source module and keys never collide across sources) as `inputs` in
-this module's next `apply`. Values are relayed verbatim and uninterpreted (orchestrator stays
-agnostic). Under the SOW-0013 scheduler each consumer receives the producer's **most recent
-completed** components as of the consumer's own dispatch (built from the live blackboard at dispatch
-time) — producers and consumers run on independent cadences, so there is no within-tick ordering
-dependency.
+The orchestrator keeps each instance's signal list from its most recent successful, non-empty
+report. For a module configured `input=X [Y …]`, it includes every named source instance's signals
+(keyed by `module:id`, so the consumer can attribute each signal to its source module and keys never
+collide across sources) as `inputs` in this module's next `apply`. Values are relayed verbatim and
+uninterpreted (orchestrator stays agnostic).
+
+A source `error`/`fatal` or authoritative `ok` with no signals prunes that source entry immediately;
+the next consumer dispatch receives no values for it. Under the SOW-0013 scheduler each consumer
+otherwise receives the producer's **most recent successful, non-empty completed** signals as of its
+own dispatch (built from the live blackboard at dispatch time) — producers and consumers run on
+independent cadences, so there is no within-tick ordering dependency.
 
 ## State & status web page
-Holds: registry, per-module detect results, per-instance last components + status + last error +
+Holds: registry, per-module detect results, per-instance last entities + status + last error +
 restart count + last-seen, captured stderr tail, and per-instance **scheduler state** (SOW-0013:
 busy/idle, last dispatch, last `apply` latency, and the delay-not-skip `skipped_busy` counter, kept
 in `AppState.sched` for the status page / metrics to surface). Serves a **read-only** HTTP status

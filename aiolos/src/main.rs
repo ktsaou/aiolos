@@ -425,14 +425,19 @@ fn apply_results(s: &mut AppState, reports: Vec<TickReport>) {
             }
             if is_ok && !result.signals.is_empty() {
                 s.blackboard.insert(key, result.signals);
+            } else {
+                // Routing is freshness-sensitive: a failed report or an explicit ok-empty report
+                // means this producer has no fresh values for this tick. Keeping the previous
+                // blackboard entry would silently route stale temperatures to safety policies.
+                s.blackboard.remove(&key);
             }
         }
     }
 }
 
-/// For each instance, if its module has `input=<peer...>`, gather every named peer's instances'
-/// last components from the blackboard into this module's `apply.inputs`. Keyed by the full
-/// `module:id` blackboard key (not the bare peer id) so the consumer can attribute each component to
+/// For each instance, if its module has `input=<peer...>`, gather every named peer instance's fresh
+/// signals from the blackboard into this module's `apply.inputs`. Keyed by the full
+/// `module:id` blackboard key (not the bare peer id) so the consumer can attribute each signal to
 /// its SOURCE MODULE (e.g. tell GPU temps from NVMe temps) and so keys never collide across
 /// sources. Uninterpreted, one heartbeat stale.
 fn build_inputs(
@@ -727,6 +732,60 @@ mod tests {
     }
 
     #[test]
+    fn apply_results_prunes_routing_on_failed_or_ok_empty_source_report() {
+        let mut s = AppState::default();
+        let (tx, _rx) = mpsc::channel();
+        s.instances.insert(
+            "nvme:a".into(),
+            InstanceEntry {
+                module_name: "nvme".into(),
+                id: "a".into(),
+                name: "a".into(),
+                unit_type: "ssd".into(),
+                last_status: "ok".into(),
+                last_error: None,
+                last_units: Vec::new(),
+                last_components: Vec::new(),
+                last_signals: vec![temp_signal(60)],
+                restart_count: 0,
+                last_seen: Instant::now(),
+                cmd_tx: tx,
+                stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            },
+        );
+        s.blackboard.insert("nvme:a".into(), vec![temp_signal(60)]);
+
+        apply_results(
+            &mut s,
+            vec![report("nvme:a", 0, TickStatus::Error, Vec::new())],
+        );
+        assert!(
+            !s.blackboard.contains_key("nvme:a"),
+            "a failed source report must immediately prune its routed values"
+        );
+
+        s.blackboard.insert("nvme:a".into(), vec![temp_signal(61)]);
+        apply_results(
+            &mut s,
+            vec![report("nvme:a", 0, TickStatus::Ok, Vec::new())],
+        );
+        assert!(
+            !s.blackboard.contains_key("nvme:a"),
+            "an ok-empty source report must immediately prune its routed values"
+        );
+
+        apply_results(
+            &mut s,
+            vec![report("nvme:a", 0, TickStatus::Ok, vec![temp_signal(62)])],
+        );
+        assert_eq!(
+            s.blackboard["nvme:a"][0].value_i64(),
+            Some(62),
+            "a later fresh successful report must restore routing"
+        );
+    }
+
+    #[test]
     fn apply_results_discards_a_stale_generation_report() {
         // A slow predecessor's late result (generation 0) must NOT touch the respawned instance
         // (generation 1): no components stored, and its legitimately-busy slot stays busy.
@@ -890,7 +949,7 @@ mod tests {
         let (s, map) = consumer(vec!["nvidia".into(), "nvme".into()]);
         assert!(build_inputs(&s, &map)["rome2d-fans:board"].is_none());
 
-        // (b) two sources, only one has components -> only the present source is routed.
+        // (b) two sources, only one has signals -> only the present source is routed.
         let (mut s, map) = consumer(vec!["nvidia".into(), "nvme".into()]);
         s.blackboard
             .insert("nvidia:GPU-1".into(), vec![temp_signal(70)]);
@@ -901,7 +960,7 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         assert!(inputs.contains_key("nvidia:GPU-1"));
 
-        // (c) a source instance with an EMPTY components list is skipped (never routed as empty).
+        // (c) a source instance with an EMPTY signal list is skipped (never routed as empty).
         let (mut s, map) = consumer(vec!["nvme".into()]);
         s.blackboard.insert("nvme:SER-A".into(), Vec::new());
         assert!(build_inputs(&s, &map)["rome2d-fans:board"].is_none());

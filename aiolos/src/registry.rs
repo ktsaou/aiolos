@@ -9,7 +9,7 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegistryEntry {
     pub module_name: String,
-    /// `input=<peer>` sources: relay each named peer module's last components into this module's
+    /// `input=<peer>` sources: relay each named peer module's fresh signals into this module's
     /// `apply.inputs`. Empty when no `input=` is wired.
     pub inputs: Vec<String>,
     /// Any directives we don't yet interpret (kept so a future field doesn't silently vanish).

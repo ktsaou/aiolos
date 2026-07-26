@@ -15,10 +15,9 @@ also reads its own CPU/board sensors. One `run` instance (the board).
 - Inband interface: `/dev/ipmi0`.
 
 ## detect
-- Emit exactly one board ID: `{"id":"board","type":"board","name":"ROME2D16-2T"}`.
-- The entry includes one schema component: `id="board"`, `class="board"`, CPU/driving
-  temperature publishers, driving-duty publisher, and eight `fan-duty` sinks (`fan1..fan8`) with
-  `safe:"auto"` and `needs_claim:true`.
+- Emit exactly one board unit with stable `id="board"`.
+- Emit one component per fan (`board:fan1` through `board:fan8`) and one `fan-duty` sink per
+  component with `safe:"auto"` and `needs_claim:true`; detect carries schema only (no live values).
 
 ## run <board>
 - Driving temperature = `max(` all routed `inputs` temps, own CPU temps `)`. Routed temps arrive
@@ -28,16 +27,15 @@ also reads its own CPU/board sensors. One `run` instance (the board).
   **`k10temp` sysfs** (`/sys/class/hwmon/*` where `name == k10temp`), reading every `tempN_input`
   across **both** EPYC sockets (labeled via `tempN_label` where present).
 - NVMe temps are relayed by the `nvme` sensor anemos (`input=nvme`): hot SSDs raise the board fans.
-  Routed temps are `temperature` publishers in the source components relayed in `inputs`.
+  Routed temps are producer signals with `labels.type="temperature"` relayed in `inputs`.
 - *Board/DIMM IPMI SDR temps (`TEMP_MB1/2`, `TEMP_CARD_SIDE1`, `TEMP_DDR4_*`) remain a planned
   enhancement; they are not in the driving max — CPU + GPU + NVMe dominate cooling demand here.*
-- Interpolate the curve and set the 8 fans (uniform OR per-zone, see **Fan model** below); then
-  (observability only, read AFTER the control decision) report one board component:
-  - publishers: local CPU temperatures, driving mode/raw/smoothed/duty, per-fan duty readbacks
-    (`fanN.duty`), and per-fan RPM (`fanN.rpm`) when the tachometer is readable;
-  - sinks: eight `fan-duty` sinks with current commanded value, duty readback publisher, safe state
-    `auto`, state `claimed`, and `driven_by` metadata for the local/routed inputs that drove the
-    decision.
+- Interpolate the baseline curve, max-compose optional source-matched case overlays, and set the 8
+  fans (see **Fan model** below); then (observability only, read AFTER the control decision) report the board
+  unit, per-socket CPU components/signals, and one component per fan:
+  - producer: `fanN.rpm` when the tachometer is readable;
+  - sink: `fanN.duty` with current commanded value, safe state `auto`, state `claimed`,
+    `control.driven_by`, and the generic `control.driving` decision.
   Routed GPU/NVMe/IPMI temperatures are **not** re-published as board temps; they appear only in
   sink `driven_by` metadata to avoid duplicate devices on the status page.
 - **Per-fan RPM (SOW-0005):** read via standard IPMI sensor commands on `FAN1_1..FAN8_1` (sensor
@@ -61,7 +59,8 @@ also reads its own CPU/board sensors. One `run` instance (the board).
     - **Case zone** — FAN3..FAN8 (120 mm case fans) driven by `max(all routed inputs)` (GPU + NVMe +
       any future routed source) via `rome2d-fans.case.curve.json`. **CPU temp is deliberately
       excluded from the case max** so a CPU-only spike does not blast the case fans.
-  - The per-fan duties go out through the same `0xd6` command (bytes 0–7 = FAN1..FAN8; see the
+  - The per-fan duties go out through the same `0xd6` command (bytes 0–7 = FAN1..FAN8 and bytes
+    8–15 mirror them exactly; see the
     critical rule below). The mode is re-decided **live every tick** from the presence of the two
     zone files (a pure config read; no control side effects), so zoning can be enabled/disabled
     without a restart. The two zone files sit next to the main curve, derived by suffix from the
@@ -69,9 +68,29 @@ also reads its own CPU/board sensors. One `run` instance (the board).
     sets all 8 fans at once, if EITHER zone has no driving temp or no usable curve the WHOLE board
     releases to BMC auto (identical to the uniform fail-safe — we cannot release one zone and hold
     the other).
+- **Optional source-matched case policy (SOW-0022):**
+  - `rome2d-fans.case.policy.json` adds demands to FAN3..FAN8 only. FAN1/FAN2 retain the baseline
+    selected above. The baseline always runs; each case fan uses
+    `max(baseline duty, policy duties)`.
+  - No policy file at process startup, or a valid file with `"enabled":false`, preserves the
+    baseline exactly. Once an enabled policy has loaded, deleting or breaking it commands the case
+    fans to 100%; intentional disablement requires a valid `"enabled":false` document.
+  - Every rule independently sees every matching numeric producer signal, so one signal may
+    influence multiple curves. Match fields are exact-list `module`, `instance`, signal `id`,
+    `component`, `uom`, and signal `labels`; populated fields are ANDed and values within one list
+    are ORed.
+    Local CPU signals use source `module="self", instance="self"`.
+  - Each rule reduces matching values by maximum, applies its referenced curve with independent
+    EMA/deadband state, and the highest requested rule duty is max-composed with the existing case
+    duty. Equal rule duties use configuration order only for deterministic provenance. A `required`
+    rule with no fresh match commands the case fans to 100%.
+  - Policy and every referenced curve are re-read and strictly validated every apply. Any
+    unreadable/missing/invalid policy or curve commands the case fans to 100% immediately, retains
+    no last-good policy, and returns `status:"ok"` with a warning so the commanded result remains
+    authoritative.
 - **Duty is always clamped non-zero** (≥1%) so a valid-but-low temperature can never send a zero
-  byte (the `0xcc` claimed-but-undutied minimum trap). In a per-fan `0xd6`, the 8 unused tach slots
-  (bytes 8–15) are held at `0x01`.
+  byte (the `0xcc` claimed-but-undutied minimum trap). In a per-fan `0xd6`, bytes 8–15 must mirror
+  bytes 0–7 exactly; an `0x01`/low tail was hardware-proven to fail with `0xcc`.
 
 ### Fan-fault detection (SOW-0008)
 Module-local stall detection using the per-fan RPM already read each tick. A fan is *faulted* when,
@@ -93,16 +112,16 @@ commanded ≥ `FAULT_MIN_DUTY` (20 %) yet its tachometer reads a **present** RPM
 | Action | Command |
 |---|---|
 | Claim (all manual) | `0x3a 0xd8` + sixteen `0x01` |
-| Set duty | `0x3a 0xd6` + sixteen bytes (per-fan %, `0x64`=100, `0x32`=50) |
+| Set duty | `0x3a 0xd6` + sixteen bytes (bytes 0–7 per-fan %, bytes 8–15 exact mirror) |
 | Release (auto) | `0x3a 0xd8` + sixteen `0x00` |
 | Query duty | `0x3a 0xda` → sixteen bytes |
 | Get fan reading | `0x04 0x2d <sensor>` → `[raw, status, …]` (sensor `0x60..0x67`) |
 | Get fan factors | `0x04 0x23 <sensor> 0x00` → `[next, M_lsb, M_msb/tol, B_lsb, B_msb/acc, acc/dir, Rexp/Bexp]` |
 
-**Critical rule:** `0xd6` is accepted **only when all 16 fans are in manual mode AND all 16 duty
-bytes are non-zero.** Partial-manual or any zero byte → `0xcc invalid data field` (and unreliable
-partial application). Bytes 0–7 = FAN1..FAN8; bytes 8–15 are unused tach slots (set non-zero
-anyway). Manual mode without a valid duty drops a fan to its ~10–20% minimum.
+**Critical rule:** `0xd6` is accepted **only when all 16 fans are in manual mode, all 16 duty bytes
+are non-zero, AND bytes 8–15 exactly mirror FAN1..FAN8 in bytes 0–7.** Partial-manual, any zero
+byte, or an `0x01`/low non-mirrored tail → `0xcc invalid data field` (and unreliable partial
+application). Manual mode without a valid duty drops a fan to its ~10–20% minimum.
 
 ## Modes
 `detect` · `info [id]` / `collect [id]` · `run <board>` · `restore` (one-shot: release all fans to BMC auto and exit; idempotent;
@@ -161,6 +180,33 @@ fans. The decision is live (re-read each tick), so adding/removing the files tog
 restart. Paths derive from the resolved main-curve path by suffix, so `$AIOLOS_ETC_DIR` is honoured.
 Example CPU-zone curve (Noctuas can floor lower than the case fans): `{"40":30,"75":100,"sensitivity":0.5}`.
 
+### Optional source-matched case policy (SOW-0022)
+The policy path is `rome2d-fans.case.policy.json`, next to the resolved main curve. Curve references
+must be relative basenames in that same directory; absolute paths, separators, and parent traversal
+are invalid. Exact selector fields are optional; all populated fields must match.
+
+The packaged policy is disabled by default and contains one NVMe overlay rule. Its enabled form is
+shown below; enable it only after the registry routes `nvme`:
+```json
+{
+  "version": 1,
+  "enabled": true,
+  "rules": [
+    {
+      "name": "nvme",
+      "match": {"module": ["nvme"], "labels": {"type": ["temperature"]}},
+      "curve": "rome2d-fans.case.nvme.curve.json",
+      "required": true
+    }
+  ]
+}
+```
+The shipped NVMe curve is `{"50":30,"70":100,"sensitivity":1.0}`. It takes the hottest
+temperature producer across every routed NVMe instance and commands 100% on the same apply at
+70 C. At 60 C it requests 65%; the final case duty can only rise because it is the maximum of this
+request and the existing baseline. Policy curves reject duplicate normalized temperatures,
+decreasing duty, duty outside 0..100%, and invalid sensitivity.
+
 ## Implementation note (language/binding)
 Rust, IPMI via raw `/dev/ipmi0` ioctl — zero extra deps (user decision SOW-0001 #6). The Linux
 char interface is asynchronous: `IPMICTL_SEND_COMMAND` (`_IOR(IPMI_IOC_MAGIC,13,struct ipmi_req)`
@@ -191,3 +237,7 @@ asserts, and the two ioctl numbers are asserted against the values above. CPU te
 - **Fan-fault (SOW-0008):** a fan commanded ≥ 20 % reading ≈0 RPM for 3 consecutive ticks (past a
   2-tick spin-up grace) is flagged `"fault":true` on its sink + warned, and its surviving zone
   siblings are boosted to 100 %; an unreadable tach or a lightly-commanded fan never false-positives.
+- **Source policy (SOW-0022):** an enabled NVMe rule reduces all routed NVMe temperature producers
+  by max and drives FAN3–FAN8 to 100% immediately at 70 C while FAN1/FAN2 retain baseline behavior.
+  Required telemetry loss or any configured policy/curve fault drives FAN3–FAN8 to 100% and reports
+  an authoritative warning; sink provenance identifies rule maxima and the winning rule/signal.

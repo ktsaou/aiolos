@@ -23,39 +23,45 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
   byte on stdout desyncs the stream — this is the #1 conformance bug.
 - **Strict half-duplex.** aiolos writes one request, reads exactly one response line before the
   next. A module never writes to stdout unsolicited (sole exception: one `hello` line at startup).
-- **Messages:** `detect → {status,found:[{id,type,name,components:[…],…}]}`; `apply{inputs?} →
-  {status,components:[…]}`; `shutdown → {status:"ok"}`. `id`s from `detect` MUST be stable across
-  re-detect and device drop/return (e.g. GPU UUID, NVMe serial, `board`; never NVML index).
+- **Messages:** `detect → {status,units:[…],components:[…],signals:[…]}`; `apply{inputs?} →
+  {status,units:[…],components:[…],signals:[…]}`; `shutdown → {status:"ok"}`. `units[].id` from
+  `detect` MUST be stable across re-detect and device drop/return (e.g. GPU UUID, NVMe serial,
+  `board`; never NVML index).
 - **SDK companion modes:** `<module> info [ID]` and `<module> collect [ID]` are read-only one-shots.
-  They emit a `detect`-shaped response with live component values by opening devices with
+  They emit a `detect`-shaped response with live signal values by opening devices with
   `OpenMode::Observe` and calling `Device::collect`. They MUST NOT call `apply`, claim/set/release
   hardware, or arm restore-on-drop side effects. `<module> schema` emits a schema-only detect once.
-- **Component schema:** reports are `components[]`; each component has stable local `id`, `label`,
-  open `class`, `publishers[]` scalar streams (`id,label,kind,value?,unit?,range?`), and `sinks[]`
-  controllable outputs (`id,label,kind,value?,readback?,safe?,needs_claim,state,driven_by?`).
-  Detect may omit publisher/sink live values; live apply reports include values when known.
+- **Flat entity schema (protocol v2):** reports carry `units[]`, `components[]`, and `signals[]`.
+  A component references its parent `unit`; a signal references its parent `component`. Every
+  entity has stable `id` + open `labels` (`type`/`name`/`description` reserved). A signal has typed
+  `role:producer|sink`, `value?`, `uom?`, `range?`; sinks carry typed `control` metadata. Detect
+  omits live values; live reports include them when known. Every claimed sink needs
+  `control.driving.input` and `.output`.
 - **Status taxonomy (every detect/info/collect/apply reply):** `status` ∈ {`ok`,`error`,`fatal`}.
-  `ok` = did the job (`found`/`components` authoritative; empty is real; an `error` field = non-fatal
-  warning). `error` = transient fault, could NOT do the job (NOT "no devices") → supervisor keeps
+  `ok` = did the job (`units`/`components`/`signals` authoritative; empty is real; an `error` field =
+  non-fatal warning). `error` = transient fault, could NOT do the job (NOT "no devices") → supervisor keeps
   instances + retries. `fatal` = cannot work on this host → supervisor surfaces + long-backoff retry.
 - **Report faults EXPLICITLY, never by exiting/empty/silence.** A module that crashes, returns an
-  empty `found`, or goes quiet to signal a problem forces the supervisor to decide blind — that is a
+  empty `units` report to signal a fault, or goes quiet forces the supervisor to decide blind — that is a
   bug. Say what's wrong with `status:error`/`fatal` + a reason. (Crash/timeout is only the
   orchestrator's last-resort backstop, surfaced as "unresponsive/crashed".)
 - **Init device libraries ONCE per process** (NVML/IPMI open fds); re-initialising every detect
   cycle leaks fds → EMFILE → the module silently stops working.
 - **`inputs` shape:** when present, `apply.inputs` maps each source instance's **`module:id`** key
-  to **that peer's full components array** (e.g. a `nvidia:<uuid>` GPU component with a
-  `temperature` publisher, or an `nvme:<serial>` SSD component with temperature publishers).
-  Keying by `module:id` lets the consumer attribute each component/publisher to its source module
+  to **that peer's flat signal array** (e.g. a `nvidia:<uuid>` temperature producer or an
+  `nvme:<serial>` SSD temperature producer).
+  Keying by `module:id` lets the consumer attribute each signal to its source module
   and keeps keys unique across sources. A consumer may wire **multiple** sources (repeat `input=` or
   comma-list, e.g. `input=nvidia input=nvme`); all are merged into one `inputs` map. aiolos relays
-  verbatim and uninterpreted — the consumer selects what it needs (typically `kind:"temperature"`
-  publishers, optionally filtered by the `module:` key prefix). The `inputs` key is omitted entirely
-  when no `input=` is wired (never `null`). `Request::Apply.inputs` is `Option`, serialized with
-  `skip_serializing_if`.
+  verbatim and uninterpreted — the consumer selects what it needs (typically numeric producer
+  signals with `labels.type:"temperature"`, optionally filtered by source key or exact signal
+  fields/labels). A source `error`/`fatal` or authoritative `ok` with empty `signals` is removed
+  from the routing blackboard immediately; consumers must treat its absence as telemetry loss.
+  The `inputs` key is omitted entirely when nothing fresh is routed. `Request::Apply.inputs` is
+  `Option`, serialized with `skip_serializing_if`.
 - **No foreign-device duplication:** a device is published by one owner only. Consumers must not
-  re-publish routed GPU/NVMe/UPS/etc. components; consumed values belong in sink `driven_by`.
+  re-publish routed GPU/NVMe/UPS/etc. entities; consumed values belong in
+  `sink.control.driven_by`.
 - **`hello` is consumed by aiolos:** a module MAY emit one `hello` line at startup; the
   orchestrator skips a leading `hello` on both streams, so it never desyncs. Emitting it is
   optional (the shipped modules don't).
@@ -96,14 +102,14 @@ Do not use for: orchestrator-internal concerns unrelated to module I/O (web page
 ## Workflow Checklist
 1. Re-read `aiolos-protocol.spec.md`.
 2. Confirm stdout carries only JSON; route all logs to stderr.
-3. Implement/verify detect (stable ids), read-only `info`/`collect` via `Device::collect`, apply
+3. Implement/verify detect (stable unit ids), read-only `info`/`collect` via `Device::collect`, apply
    (within timeout), shutdown + EOF + SIGTERM (device restore), and the `restore` one-shot. Use
    `anemos::StdinReader` + `install_shutdown_handlers`.
 4. Test with a one-line stdin → one-line stdout harness and with the orchestrator's mock/timeout.
 
 ## Validation Checklist
 - Golden request→response lines round-trip; malformed input is rejected without crashing.
-- `<module> info` returns live component values without changing ownership/control state.
+- `<module> info` returns live signal values without changing ownership/control state.
 - A `SIGKILL` mid-apply leaves the device safe (or auto-reclaimed by firmware).
 - shutdown, stdin-EOF, AND SIGTERM each restore the device (verified by reading device state after
   exit; the integration suite holds stdin open and SIGTERMs to prove the signal path specifically).

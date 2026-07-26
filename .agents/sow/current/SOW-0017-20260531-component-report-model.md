@@ -2,9 +2,10 @@
 
 ## Status
 
-Status: in-progress
+Status: paused
 
-Sub-state: activated 2026-05-31. User approved implementation after clarifying that this SOW must freeze the detect/report schema for SOW-0014; SOW-0014 should change apply/command methodology only. The live `info`/`collect` companion surface is implemented through an SDK read-only `collect` path and `OpenMode::Observe`, not by calling state-changing `apply`. D8 charting path accepted as hand-rolled SVG for zero runtime dependencies. Production service cutover remains a separate operator-approved action. This SOW pulls **SOW-0014's data model forward
+Sub-state: paused on 2026-07-26 by user decision so the thermal-safety SOW-0022 is the sole
+in-progress SOW. Prior state: activated 2026-05-31. User approved implementation after clarifying that this SOW must freeze the detect/report schema for SOW-0014; SOW-0014 should change apply/command methodology only. The live `info`/`collect` companion surface is implemented through an SDK read-only `collect` path and `OpenMode::Observe`, not by calling state-changing `apply`. D8 charting path accepted as hand-rolled SVG for zero runtime dependencies. Production service cutover remains a separate operator-approved action. This SOW pulls **SOW-0014's data model forward
 without its centralized engine** — anemoi report a structured `components[] → publishers[] + sinks[]`
 shape, and this shape is intended to be the **stable detect/report schema SOW-0014 builds on**. SOW-0014
 should change the **apply methodology** (aiolos computes and commands sinks) without major detect/report
