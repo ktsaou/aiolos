@@ -92,7 +92,7 @@ impl Anemos for It87 {
         let mut failed = false;
         for ch in cfg.managed_channels() {
             if let Err(e) = hwmon::set_pwm_auto(&dir, ch) {
-                eprintln!("restore FAILED (pwm{ch}): {e}");
+                anemos::elog!("restore FAILED (pwm{ch}): {e}");
                 failed = true;
             }
         }
@@ -369,7 +369,7 @@ impl Device for It87Device {
                 tracing::info!("managed channels restored to firmware/automatic");
                 self.restore_armed = false;
             }
-            Err(e) => eprintln!("WARNING: pwm restore failed (will retry on drop): {e}"),
+            Err(e) => anemos::elog!("WARNING: pwm restore failed (will retry on drop): {e}"),
         }
     }
 }

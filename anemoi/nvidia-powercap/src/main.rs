@@ -91,7 +91,7 @@ impl Anemos for NvidiaPowercap {
 
     fn restore_all(&mut self) {
         if let Err(e) = nvml::restore_all_power() {
-            eprintln!("restore FAILED: {e}");
+            anemos::elog!("restore FAILED: {e}");
             std::process::exit(2);
         }
     }
@@ -159,7 +159,9 @@ impl Device for GpuCap {
                 self.applied_cap_mw = None;
                 self.restore_armed = false;
             }
-            Err(e) => eprintln!("WARNING: power-limit restore failed (will retry on drop): {e}"),
+            Err(e) => {
+                anemos::elog!("WARNING: power-limit restore failed (will retry on drop): {e}")
+            }
         }
     }
 }

@@ -15,6 +15,7 @@
 mod controller;
 mod curve;
 mod damper;
+mod elog;
 mod log_gate;
 mod run;
 mod signal_curve_policy;

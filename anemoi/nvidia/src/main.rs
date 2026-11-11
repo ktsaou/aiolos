@@ -65,7 +65,7 @@ impl Anemos for Nvidia {
 
     fn restore_all(&mut self) {
         if let Err(e) = nvml::restore_all() {
-            eprintln!("restore FAILED: {e}");
+            anemos::elog!("restore FAILED: {e}");
             std::process::exit(2);
         }
     }
@@ -128,7 +128,7 @@ impl Device for GpuDevice {
     fn restore(&mut self) {
         match self.gpu.restore_fans() {
             Ok(()) => tracing::info!("GPU fans restored to firmware default"),
-            Err(e) => eprintln!("WARNING: fan restore failed: {e}"),
+            Err(e) => anemos::elog!("WARNING: fan restore failed: {e}"),
         }
     }
 }

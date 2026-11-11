@@ -96,7 +96,7 @@ impl Anemos for Rome2dFans {
         match (|| -> anyhow::Result<()> { Board::open()?.release_auto() })() {
             Ok(()) => tracing::info!("fans released to BMC auto"),
             Err(e) => {
-                eprintln!("restore FAILED: {e}");
+                anemos::elog!("restore FAILED: {e}");
                 std::process::exit(2);
             }
         }
@@ -281,7 +281,7 @@ impl Device for Rome2dFansDevice {
         let result = (|| -> anyhow::Result<()> { Board::open()?.release_auto() })();
         match &result {
             Ok(()) => tracing::info!("released BMC auto control"),
-            Err(e) => eprintln!("WARNING: BMC release failed (will retry on drop): {e}"),
+            Err(e) => anemos::elog!("WARNING: BMC release failed (will retry on drop): {e}"),
         }
         self.restore_armed = still_armed_after(result.is_ok());
     }
@@ -607,12 +607,12 @@ fn query_mode() -> i32 {
                 0
             }
             Err(e) => {
-                eprintln!("0xda query FAILED: {e}");
+                anemos::elog!("0xda query FAILED: {e}");
                 2
             }
         },
         Err(e) => {
-            eprintln!("open /dev/ipmi0 FAILED: {e}");
+            anemos::elog!("open /dev/ipmi0 FAILED: {e}");
             3
         }
     }
