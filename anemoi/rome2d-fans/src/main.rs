@@ -88,6 +88,7 @@ impl Anemos for Rome2dFans {
             zones: None,
             case_policy: None,
             faults: FanFaultTracker::new(),
+            log_gate: anemos::LogGate::new(),
         }))
     }
 
@@ -108,6 +109,8 @@ struct Rome2dFansDevice {
     zones: Option<ZoneControllers>,
     case_policy: Option<SignalCurvePolicy>,
     faults: FanFaultTracker,
+    /// Logs per-tick decisions only when the commanded outcome changes (plus a heartbeat).
+    log_gate: anemos::LogGate,
 }
 
 impl Device for Rome2dFansDevice {
@@ -152,15 +155,17 @@ impl Device for Rome2dFansDevice {
                 self.reset_zone_dampers();
                 return release_or_error(&mut self.board, "zone mode: no usable curve");
             };
-            tracing::info!(
-                cpu_raw,
-                case_raw,
-                cpu_smoothed = cpu_duty.smoothed,
-                case_smoothed = case_duty.smoothed,
-                cpu_pct,
-                case_pct,
-                "baseline decision: board fan zones"
-            );
+            if self.log_gate.due("zone", &format!("{cpu_pct}/{case_pct}")) {
+                tracing::info!(
+                    cpu_raw,
+                    case_raw,
+                    cpu_smoothed = cpu_duty.smoothed,
+                    case_smoothed = case_duty.smoothed,
+                    cpu_pct,
+                    case_pct,
+                    "baseline decision: board fan zones"
+                );
+            }
             (
                 BaselineOutcome::Zone {
                     cpu_raw,
@@ -179,9 +184,11 @@ impl Device for Rome2dFansDevice {
             let Some(pct) = duty.pct else {
                 return release_or_error(&mut self.board, "no usable curve");
             };
-            tracing::info!(routed_temp_maxes = ?routed_temp_maxes, cpu_max = ?cpu_max,
-                raw_driving = raw, smoothed_driving = duty.smoothed,
-                commanded_pct = pct, "baseline decision: all board fans (uniform)");
+            if self.log_gate.due("uniform", &pct.to_string()) {
+                tracing::info!(routed_temp_maxes = ?routed_temp_maxes, cpu_max = ?cpu_max,
+                    raw_driving = raw, smoothed_driving = duty.smoothed,
+                    commanded_pct = pct, "baseline decision: all board fans (uniform)");
+            }
             (
                 BaselineOutcome::Uniform {
                     raw,
@@ -206,13 +213,18 @@ impl Device for Rome2dFansDevice {
 
         let requested = apply_case_overlay(base, case_policy.overlay_pct());
         let commanded = fault::compensate(requested, &confirmed);
-        tracing::info!(
-            baseline_case_pct = baseline.case_pct(),
-            overlay_pct = ?case_policy.overlay_pct(),
-            ?commanded,
-            ?confirmed,
-            "decision: set board fans (baseline plus case overlay)"
-        );
+        if self
+            .log_gate
+            .due("final", &format!("{commanded:?}{confirmed:?}"))
+        {
+            tracing::info!(
+                baseline_case_pct = baseline.case_pct(),
+                overlay_pct = ?case_policy.overlay_pct(),
+                ?commanded,
+                ?confirmed,
+                "decision: set board fans (baseline plus case overlay)"
+            );
+        }
         let set = if commanded.iter().all(|pct| *pct == commanded[0]) {
             self.board.set_all_fans(commanded[0] as i32)
         } else {

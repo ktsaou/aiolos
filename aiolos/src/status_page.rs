@@ -891,7 +891,7 @@ fn json_str(s: &str) -> String {
 /// Strip ANSI/VT escape sequences (CSI `\x1b[...m` etc. and bare control chars) defensively, so no
 /// terminal control codes ever reach the UI or metrics — belt-and-suspenders alongside the SDK's
 /// `.with_ansi(false)`.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

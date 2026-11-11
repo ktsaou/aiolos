@@ -57,7 +57,10 @@ impl Anemos for Nvidia {
             OpenMode::Observe => Gpu::open(id)?.without_fan_restore_on_drop(),
             OpenMode::Control => Gpu::open(id)?,
         };
-        Ok(Box::new(GpuDevice { gpu }))
+        Ok(Box::new(GpuDevice {
+            gpu,
+            log_gate: anemos::LogGate::new(),
+        }))
     }
 
     fn restore_all(&mut self) {
@@ -70,6 +73,8 @@ impl Anemos for Nvidia {
 
 struct GpuDevice {
     gpu: Gpu,
+    /// Logs the per-tick decision only when the commanded duty changes (plus a heartbeat).
+    log_gate: anemos::LogGate,
 }
 
 impl Device for GpuDevice {
@@ -93,8 +98,10 @@ impl Device for GpuDevice {
         let routed_temps = routed_temperature_inputs(inputs);
         let driving_temp = driving_temperature(gpu_temp, &routed_temps);
         let duty = ctrl.duty(driving_temp);
-        tracing::info!(gpu = %format!("gpu{}", self.gpu.index()), uuid = %self.gpu.uuid(),
-            gpu_temp, driving_temp, commanded_pct = ?duty.pct, fans = self.gpu.num_fans(), "decision: set GPU fans");
+        if self.log_gate.due("fans", &format!("{:?}", duty.pct)) {
+            tracing::info!(gpu = %format!("gpu{}", self.gpu.index()), uuid = %self.gpu.uuid(),
+                gpu_temp, driving_temp, commanded_pct = ?duty.pct, fans = self.gpu.num_fans(), "decision: set GPU fans");
+        }
         let set = match duty.pct {
             Some(p) => self.gpu.set_all_fans(p),
             None => self.gpu.set_all_default(), // empty curve -> firmware/default control

@@ -15,6 +15,7 @@
 mod controller;
 mod curve;
 mod damper;
+mod log_gate;
 mod run;
 mod signal_curve_policy;
 mod stdio;
@@ -22,6 +23,7 @@ mod stdio;
 pub use controller::{Controller, Duty};
 pub use curve::{BrokenReason, Curve, CurveCache, ReloadOutcome};
 pub use damper::Damper;
+pub use log_gate::{LogGate, DEFAULT_HEARTBEAT};
 pub use run::{run, run_with, Anemos, Device, ExtraCmd, ModuleInfo, OpenMode};
 pub use signal_curve_policy::{PolicyDecision, PolicyOutcome, SignalCurvePolicy};
 pub use stdio::{install_shutdown_handlers, shutdown_requested, Event, StdinReader};

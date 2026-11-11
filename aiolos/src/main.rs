@@ -6,6 +6,7 @@
 
 mod config;
 mod instance;
+mod log_gate;
 mod module;
 mod registry;
 mod status_page;
@@ -48,6 +49,8 @@ pub type StderrTail = Arc<Mutex<VecDeque<String>>>;
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr) // logs to stderr -> journal; never collides with anything
+        // Plain text only: ANSI escapes make journald store the message as a binary blob.
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -126,6 +129,8 @@ fn main() -> Result<()> {
     let base_tick = cfg.base_tick;
     let mut next_wake = Instant::now() + base_tick;
     let mut wake_count: u64 = 0;
+    // Per-tick lines (apply results, routing) are logged on change + heartbeat, not every wake.
+    let mut log_gate = log_gate::LogGate::new();
 
     loop {
         if SHUTDOWN_FLAG.load(Ordering::Acquire) {
@@ -150,8 +155,8 @@ fn main() -> Result<()> {
 
         // (1) Drain any results workers posted since the last wake (async rendezvous), then
         // (2) dispatch a fresh apply to every instance that is due and idle. Both are non-blocking.
-        reap_results(&state, &results_rx, wake_count);
-        dispatch_due(&state, &input_map, &cfg, wake_count);
+        reap_results(&state, &results_rx, wake_count, &mut log_gate);
+        dispatch_due(&state, &input_map, &cfg, wake_count, &mut log_gate);
     }
 
     info!("aiolos exiting");
@@ -284,6 +289,7 @@ fn dispatch_due(
     input_map: &HashMap<String, Vec<String>>,
     cfg: &Config,
     wake_count: u64,
+    log_gate: &mut log_gate::LogGate,
 ) {
     let now = Instant::now();
     let mut s = state.write().unwrap_or_else(|e| e.into_inner());
@@ -332,7 +338,12 @@ fn dispatch_due(
 
     for (key, inputs, cmd_tx, timeout) in to_send {
         if let Some(ref inp) = inputs {
-            info!(wake = wake_count, to = %key, inputs = %summarize_inputs(inp), "routing inputs");
+            // Key on the routed source set (not the jittering values); values appear on change/heartbeat.
+            let mut sources: Vec<&str> = inp.keys().map(String::as_str).collect();
+            sources.sort_unstable();
+            if log_gate.due(&format!("route:{key}"), &sources.join(",")) {
+                info!(wake = wake_count, to = %key, inputs = %summarize_inputs(inp), "routing inputs");
+            }
         }
         if cmd_tx.send(InstanceCmd::Tick { timeout, inputs }).is_err() {
             // The worker is gone (it exited between snapshot and send). Clear busy so the slot isn't
@@ -358,6 +369,7 @@ fn reap_results(
     state: &Arc<RwLock<AppState>>,
     results_rx: &mpsc::Receiver<TickReport>,
     wake_count: u64,
+    log_gate: &mut log_gate::LogGate,
 ) {
     // Collect everything currently queued without blocking.
     let reports: Vec<TickReport> = results_rx.try_iter().collect();
@@ -367,6 +379,15 @@ fn reap_results(
 
     // Log each result (outside the write lock) so the journal shows components the parent received.
     for r in &reports {
+        // Key on status + error so a healthy steady state is quiet and any flip is logged at once.
+        let outcome = format!(
+            "{}|{}",
+            r.result.status.as_str(),
+            r.result.error.as_deref().unwrap_or("")
+        );
+        if !log_gate.due(&format!("apply:{}", r.key), &outcome) {
+            continue;
+        }
         info!(
             wake = wake_count,
             instance = %r.key,

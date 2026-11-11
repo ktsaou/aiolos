@@ -426,6 +426,8 @@ impl Supervisor {
             thread::spawn(move || {
                 let reader = std::io::BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
+                    // Modules may be written in any language: never let control bytes reach the journal.
+                    let line = crate::status_page::strip_ansi(&line);
                     tracing::info!(target: "anemos", module=%module, id=%id_for_log, "{line}");
                     if let Ok(mut t) = tail.lock() {
                         if t.len() == TAIL_CAP {

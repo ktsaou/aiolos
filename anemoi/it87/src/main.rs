@@ -80,6 +80,7 @@ impl Anemos for It87 {
             zones: None,
             case_policy: None,
             restore_armed: mode == OpenMode::Control,
+            log_gate: anemos::LogGate::new(),
         }))
     }
 
@@ -139,6 +140,8 @@ struct It87Device {
     zones: Option<Zones>,
     case_policy: Option<SignalCurvePolicy>,
     restore_armed: bool,
+    /// Logs per-tick decisions only when the commanded outcome changes (plus a heartbeat).
+    log_gate: anemos::LogGate,
 }
 
 impl Device for It87Device {
@@ -214,16 +217,18 @@ impl Device for It87Device {
                 zones.case.reset();
                 return self.release_or_error("zone mode: no usable curve");
             };
-            tracing::info!(
-                cpu_raw,
-                case_raw,
-                routed_max,
-                cpu_pct,
-                case_pct,
-                cpu_smoothed = cpu_duty.smoothed,
-                case_smoothed = case_duty.smoothed,
-                "decision: set board fans (zone mode)"
-            );
+            if self.log_gate.due("zone", &format!("{cpu_pct}/{case_pct}")) {
+                tracing::info!(
+                    cpu_raw,
+                    case_raw,
+                    routed_max,
+                    cpu_pct,
+                    case_pct,
+                    cpu_smoothed = cpu_duty.smoothed,
+                    case_smoothed = case_duty.smoothed,
+                    "decision: set board fans (zone mode)"
+                );
+            }
             let commanded = self.commanded_zone(cpu_pct, case_pct);
             (
                 commanded,
@@ -243,8 +248,10 @@ impl Device for It87Device {
             let Some(pct) = duty.pct else {
                 return self.release_or_error("no usable curve");
             };
-            tracing::info!(routed_max = ?routed_max, cpu_max = ?cpu_max, raw_driving = raw,
-                smoothed = duty.smoothed, commanded_pct = pct, "decision: set all board fans (uniform)");
+            if self.log_gate.due("uniform", &pct.to_string()) {
+                tracing::info!(routed_max = ?routed_max, cpu_max = ?cpu_max, raw_driving = raw,
+                    smoothed = duty.smoothed, commanded_pct = pct, "decision: set all board fans (uniform)");
+            }
             let commanded: Vec<(u8, u32)> = self
                 .cfg
                 .managed_channels()
@@ -281,12 +288,14 @@ impl Device for It87Device {
             baseline,
             case_overlay: case_policy,
         };
-        tracing::info!(
-            baseline_case_pct = decision.baseline.case_pct(),
-            overlay_pct = ?decision.case_overlay.overlay_pct(),
-            ?commanded,
-            "decision: set board fans (baseline plus case overlay)"
-        );
+        if self.log_gate.due("final", &format!("{commanded:?}")) {
+            tracing::info!(
+                baseline_case_pct = decision.baseline.case_pct(),
+                overlay_pct = ?decision.case_overlay.overlay_pct(),
+                ?commanded,
+                "decision: set board fans (baseline plus case overlay)"
+            );
+        }
 
         for &(ch, pct) in &commanded {
             if let Err(e) = hwmon::set_pwm_duty(&self.dir, ch, pct) {
@@ -702,6 +711,7 @@ mod tests {
             zones: None,
             case_policy: None,
             restore_armed: true,
+            log_gate: anemos::LogGate::new(),
         };
         assert_eq!(dev.commanded_zone(30, 75), vec![(1, 30), (3, 75), (4, 75)]);
     }
