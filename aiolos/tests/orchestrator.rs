@@ -31,6 +31,15 @@ impl Harness {
     /// `modules`: registry lines (e.g. "sensor", "fan input=sensor"). `env`: extra MOCK_* vars.
     /// `extra_conf`: extra global config lines (besides the fast tick/timeout/detect defaults).
     fn start(modules: &[&str], env: &[(&str, &str)], extra_conf: &[&str]) -> Harness {
+        Self::start_with_stderr(modules, env, extra_conf, Stdio::null())
+    }
+
+    fn start_with_stderr(
+        modules: &[&str],
+        env: &[(&str, &str)],
+        extra_conf: &[&str],
+        stderr: Stdio,
+    ) -> Harness {
         let uniq = UNIQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("aiolos-it-{}-{}", std::process::id(), uniq));
         let bin = dir.join("bin");
@@ -65,7 +74,7 @@ impl Harness {
             .env("AIOLOS_BIN_DIR", &bin)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(stderr);
         // Every mock instance writes its markers under WORKDIR; set it per module.
         for line in modules {
             let name = line.split_whitespace().next().unwrap();
@@ -364,6 +373,27 @@ fn detect_error_keeps_instances() {
     );
 
     assert!(h.shutdown(Duration::from_secs(6)));
+}
+
+#[test]
+fn unwritable_stderr_does_not_crash_or_fail_shutdown() {
+    // Regression: when journald's stream disappears (system shutdown), every log write fails. tracing
+    // reported that via `eprintln!`, which panicked the main thread -> exit 101. aiolos must keep
+    // running and still exit 0 on SIGTERM. `/dev/full` makes every write fail (ENOSPC).
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut h =
+        Harness::start_with_stderr(&["sensor"], &[("RUST_LOG", "info")], &[], Stdio::from(full));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        h.child.try_wait().unwrap().is_none(),
+        "aiolos died when stderr became unwritable"
+    );
+    assert!(h.shutdown(Duration::from_secs(6)));
+    let status = h.child.wait().unwrap();
+    assert!(status.success(), "aiolos exited {status:?} on SIGTERM");
 }
 
 #[test]

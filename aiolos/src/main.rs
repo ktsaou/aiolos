@@ -51,6 +51,9 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr) // logs to stderr -> journal; never collides with anything
         // Plain text only: ANSI escapes make journald store the message as a binary blob.
         .with_ansi(false)
+        // A failed stderr write must never panic the orchestrator: tracing otherwise reports it with
+        // `eprintln!`, which panics on the same broken stream (journald gone at shutdown -> exit 101).
+        .log_internal_errors(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),

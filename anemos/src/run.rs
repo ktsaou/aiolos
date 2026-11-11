@@ -402,6 +402,8 @@ fn init_logging() {
         // terminal — emit plain text so no ANSI colour escapes (`\x1b[2m` …) leak into the captured
         // tail. (tracing's default auto-detect can still enable them here; force them off.)
         .with_ansi(false)
+        // Same reason as the orchestrator: a broken stderr pipe must not panic a module mid-restore.
+        .log_internal_errors(false)
         .init();
 }
 
